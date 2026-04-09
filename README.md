@@ -4,6 +4,14 @@ MCP server that gives AI agents full debugger control over running Java applicat
 
 **Built on the foundations of [mcp-jdwp-java](https://github.com/NicolasVautrin/mcp-jdwp-java) by [Nicolas Vautrin](https://github.com/NicolasVautrin)** — the original project that provided core JDI connectivity, thread/stack/variable inspection, stepping, and basic breakpoint management. Everything described below as "beyond standard JDWP" was built on top of that base.
 
+## Security & trust
+
+This MCP server runs **entirely on your local machine**:
+
+- **No network calls** — the server communicates with Claude Code over STDIO and with the target JVM over a local JDWP socket. It makes zero outbound HTTP/internet requests. No telemetry, no analytics, no phone-home.
+- **Built from source** — the JAR is compiled locally on your machine from the source code in this repository (either via the plugin auto-build hook or manually with `mvn clean package`). No pre-built binaries are downloaded or distributed.
+- **Auditable** — the full source is here. The server is a standard Spring Boot application with no obfuscation or native code.
+
 ## Why this exists
 
 Raw JDWP/JDI gives you threads, stack frames, and variables. That's enough for a human with IntelliJ — but an AI agent needs more:
