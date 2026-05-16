@@ -44,12 +44,12 @@ class JDIConnectionServiceCollectionViewLiveTest {
 	}
 
 	/**
-	 * FINDING-1: {@code getMapEntries} must walk a {@link java.util.HashMap}'s {@code table[]}
-	 * bucket array (and follow each {@code Node.next} chain) to render entries. Verifies that
-	 * the entries appear under the {@code Entries:} header for the mocked HashMap.
+	 * {@code getMapEntries} must walk a {@link java.util.HashMap}'s {@code table[]} bucket array
+	 * (and follow each {@code Node.next} chain) to render entries. Verifies that the entries
+	 * appear under the {@code Entries:} header for the mocked HashMap.
 	 */
 	@Test
-	void shouldRenderEmptyEntriesForHashMap_FINDING_1() throws Exception {
+	void shouldRenderEntriesForHashMap() throws Exception {
 		ObjectReference map = mock(ObjectReference.class);
 		ReferenceType refType = mock(ReferenceType.class);
 		Field sizeField = mock(Field.class);
@@ -83,12 +83,12 @@ class JDIConnectionServiceCollectionViewLiveTest {
 	}
 
 	/**
-	 * FINDING-1 (TreeMap variant): {@code TreeMap} stores its sorted entries in a red-black tree
-	 * rooted at {@code root}; entries link via {@code left}/{@code right}. The fix must walk the
-	 * tree in-order so the user sees the entries.
+	 * {@code TreeMap} stores its sorted entries in a red-black tree rooted at {@code root};
+	 * entries link via {@code left}/{@code right}. The walk must traverse the tree in-order so the
+	 * user sees the entries.
 	 */
 	@Test
-	void shouldRenderEmptyEntriesForTreeMap_FINDING_1() throws Exception {
+	void shouldRenderEntriesForTreeMap() throws Exception {
 		ObjectReference map = mock(ObjectReference.class);
 		ReferenceType refType = mock(ReferenceType.class);
 		Field sizeField = mock(Field.class);
@@ -117,11 +117,11 @@ class JDIConnectionServiceCollectionViewLiveTest {
 	}
 
 	/**
-	 * FINDING-2: {@code getListElements} must walk LinkedList's {@code first} → {@code next}
-	 * chain reading the {@code item} field of each node. Verifies the elements appear in order.
+	 * {@code getListElements} must walk LinkedList's {@code first} → {@code next} chain reading
+	 * the {@code item} field of each node. Verifies the elements appear in order.
 	 */
 	@Test
-	void shouldRenderEmptyElementsForLinkedList_FINDING_2() throws Exception {
+	void shouldRenderElementsForLinkedList() throws Exception {
 		ObjectReference list = mock(ObjectReference.class);
 		ReferenceType refType = mock(ReferenceType.class);
 		Field sizeField = mock(Field.class);
@@ -151,12 +151,12 @@ class JDIConnectionServiceCollectionViewLiveTest {
 	}
 
 	/**
-	 * FINDING-3 (TreeSet): {@code getSetElements} must fall back to {@code fieldByName("m")}
-	 * when the {@code map} field is missing — TreeSet's backing field is named {@code m}.
-	 * Asserts the resulting set elements (extracted from the backing TreeMap's keys) appear.
+	 * {@code getSetElements} must fall back to {@code fieldByName("m")} when the {@code map}
+	 * field is missing — TreeSet's backing field is named {@code m}. Asserts the resulting set
+	 * elements (extracted from the backing TreeMap's keys) appear.
 	 */
 	@Test
-	void shouldRenderEmptyElementsForTreeSet_FINDING_3() throws Exception {
+	void shouldRenderElementsForTreeSet() throws Exception {
 		ObjectReference set = mock(ObjectReference.class);
 		ReferenceType refType = mock(ReferenceType.class);
 		Field sizeField = mock(Field.class);
@@ -193,12 +193,12 @@ class JDIConnectionServiceCollectionViewLiveTest {
 	}
 
 	/**
-	 * FINDING-3 (HashSet): once FINDING-1 is fixed, the recursive {@code getMapEntries} call on
-	 * the backing HashMap walks the {@code table[]} bucket chain and returns the keys, so HashSet
-	 * elements should render. Verifies the elements appear under the {@code Elements:} header.
+	 * The recursive {@code getMapEntries} call on the backing HashMap walks the {@code table[]}
+	 * bucket chain and returns the keys, so HashSet elements render via the same path. Verifies
+	 * the elements appear under the {@code Elements:} header.
 	 */
 	@Test
-	void shouldRenderEmptyElementsForHashSet_FINDING_3() throws Exception {
+	void shouldRenderElementsForHashSet() throws Exception {
 		ObjectReference set = mock(ObjectReference.class);
 		ReferenceType refType = mock(ReferenceType.class);
 		Field sizeField = mock(Field.class);

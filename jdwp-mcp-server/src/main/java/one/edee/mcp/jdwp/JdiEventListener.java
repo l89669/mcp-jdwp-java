@@ -36,6 +36,11 @@ import java.util.Map;
  * connect (via {@code configureCompilerClasspath} → {@code discoverClasspath} → {@code getVM}),
  * which is safe because the BP thread is already suspended at a method-invocation event —
  * JDI permits {@code invokeMethod} on threads in that state.
+ * <p>
+ * Chain handling: after every BP, exception, or auto-resumed logpoint hit,
+ * {@link #applyChainEffectsAfterHit} arms any dependent BPs waiting on the firing BP and
+ * re-disarms one-shot dependents — the firing event itself is unchanged; chain side-effects
+ * are an additive concern.
  */
 @Service
 public class JdiEventListener {
@@ -62,6 +67,67 @@ public class JdiEventListener {
         this.eventHistory = eventHistory;
         this.expressionEvaluator = expressionEvaluator;
         this.evaluationGuard = evaluationGuard;
+    }
+
+    /**
+     * Applies chain-of-breakpoints side effects after the BP identified by {@code firingBpId} hits.
+     * Two things happen here:
+     * <ol>
+     *   <li>If the firing BP is itself a one-shot dependent, disarm it again so the next trigger
+     *       fire re-arms it (IntelliJ-style behaviour, opt-in via {@code oneShot=true}).</li>
+     *   <li>For every dependent waiting on this firing BP as their trigger, enable their JDI
+     *       request and emit a {@code CHAIN_ARMED} event so the user sees the activation in
+     *       {@code jdwp_get_events}.</li>
+     * </ol>
+     * Best-effort: any {@code setEnabled} failure (e.g., dependent already removed mid-event)
+     * is swallowed and recorded as a debug log entry rather than escalated — the chain handler
+     * is in the JDI listener hot path and must never throw, otherwise it breaks unrelated events.
+     */
+    private void applyChainEffectsAfterHit(int firingBpId, @Nullable EventRequest firingRequest) {
+        // Remember that this trigger has fired at least once — even if no dependents are currently
+        // waiting, a chained dependent that comes up later (via pending → active promotion) needs
+        // to see the historical fire and come up armed instead of being penalised for arriving late.
+        breakpointTracker.markTriggerFired(firingBpId);
+
+        // 1. One-shot disarm self. Requires the firing request — skip the self-disarm if absent
+        // (e.g. synthesised event with no request); dependents-arm below is unaffected.
+        // Re-disarm only in one-shot mode; sticky dependents intentionally stay armed so subsequent
+        // hits go through without waiting on the trigger again.
+        final BreakpointTracker.TriggerLink selfLink = breakpointTracker.getDependencyOfDependent(firingBpId);
+        if (selfLink != null && selfLink.oneShot() && firingRequest != null) {
+            try {
+                firingRequest.setEnabled(false);
+                eventHistory.record(new EventHistory.DebugEvent("CHAIN_DISARMED",
+                    String.format("BP #%d disarmed (one-shot); waiting on trigger BP #%d",
+                        firingBpId, selfLink.triggerId()),
+                    Map.of("breakpointId", String.valueOf(firingBpId),
+                        "triggerId", String.valueOf(selfLink.triggerId()))));
+            } catch (Exception e) {
+                log.debug("[JDI] Failed to disarm one-shot BP #{}: {}", firingBpId, e.getMessage());
+            }
+        }
+
+        // 2. Arm dependents waiting on this BP.
+        for (Integer depId : breakpointTracker.getDependentsOfTrigger(firingBpId)) {
+            final EventRequest depReq = breakpointTracker.getEventRequestById(depId);
+            if (depReq == null) {
+                continue;
+            }
+            try {
+                // Guard avoids emitting CHAIN_ARMED when the dependent is already armed
+                // (sticky dependent that fired once before the trigger re-fires).
+                if (!depReq.isEnabled()) {
+                    depReq.setEnabled(true);
+                    eventHistory.record(new EventHistory.DebugEvent("CHAIN_ARMED",
+                        String.format("BP #%d armed by trigger BP #%d", depId, firingBpId),
+                        Map.of("breakpointId", String.valueOf(depId),
+                            "triggerId", String.valueOf(firingBpId))));
+                }
+            } catch (Exception e) {
+                log.debug("[JDI] Failed to arm dependent BP #{} on trigger #{}: {}",
+                    depId, firingBpId, e.getMessage());
+            }
+        }
     }
 
     /**
@@ -152,7 +218,7 @@ public class JdiEventListener {
                         log.info("[JDI] VM disconnected/died, stopping event listener");
                         eventHistory.record(new EventHistory.DebugEvent("VM_DEATH", "VM disconnected/died"));
                         // Wake any caller parked on jdwp_resume_until_event so they detect the dead
-                        // VM promptly instead of timing out (FINDING-7).
+                        // VM promptly instead of timing out.
                         breakpointTracker.fireNextEvent();
                         running = false;
                         return;
@@ -174,7 +240,7 @@ public class JdiEventListener {
             } catch (VMDisconnectedException e) {
                 log.info("[JDI] VM disconnected, stopping event listener");
                 // Wake any caller parked on jdwp_resume_until_event so they detect the dead VM
-                // promptly instead of timing out (FINDING-7).
+                // promptly instead of timing out.
                 breakpointTracker.fireNextEvent();
                 break;
             } catch (Exception e) {
@@ -196,6 +262,10 @@ public class JdiEventListener {
      * - Untracked breakpoints (defensive — shouldn't happen but we err on the side of inspection).
      * - Plain breakpoints with no condition or with a true condition.
      * - Any internal error during evaluation.
+     * <p>
+     * Chain effects (arm dependents, re-disarm one-shot self) are applied on every real BP hit and
+     * on logpoint hits, but suppressed when a condition evaluates to false — a skipped condition is
+     * not a meaningful trigger.
      */
     private boolean handleBreakpointEvent(BreakpointEvent event) {
         try {
@@ -244,9 +314,12 @@ public class JdiEventListener {
                 if (condition != null && !evaluateCondition(event, condition)) {
                     log.debug("[JDI] Conditional logpoint {} at {}:{} — condition false, skipping",
                         bpId, className, lineNumber);
+                    // Condition-false counts as "this is not the hit the user cares about" —
+                    // do NOT propagate the chain trigger.
                     return false;
                 }
                 evaluateLogpoint(event, bpId, logpointExpr, className, lineNumber, threadName);
+                applyChainEffectsAfterHit(bpId, request);
                 return false;
             }
 
@@ -256,6 +329,7 @@ public class JdiEventListener {
                 if (!conditionResult) {
                     log.debug("[JDI] Conditional breakpoint {} at {}:{} — condition false, resuming",
                         bpId, className, lineNumber);
+                    // Same rationale as the logpoint branch — condition-false is not a chain trigger.
                     return false;
                 }
             }
@@ -268,6 +342,7 @@ public class JdiEventListener {
 
             log.info("[JDI] Breakpoint {} hit on thread {} at {}:{}", bpId, threadName, className, lineNumber);
             breakpointTracker.fireNextEvent();
+            applyChainEffectsAfterHit(bpId, request);
             return true;
 
         } catch (Exception e) {
@@ -344,6 +419,10 @@ public class JdiEventListener {
      *       the sentinel BP id {@code -1} so {@code jdwp_get_current_thread} can locate it, fires
      *       the resume-until-event latch, and returns {@code true}.</li>
      * </ul>
+     * <p>
+     * Both the log-only and the suspending paths additionally propagate chain effects for the
+     * firing exception BP via {@link #applyChainEffectsAfterHit} when its synthetic ID is
+     * recoverable from {@code event.request()}.
      */
     private boolean handleExceptionEvent(ExceptionEvent event) {
         // Reentrancy guard — see contract above.
@@ -377,13 +456,18 @@ public class JdiEventListener {
 
             // Look up the firing BP record so we can decide between log-only and suspending mode.
             // event.request() may be null on synthesised events (defensive — JDI normally fills it).
-            final BreakpointTracker.ExceptionBreakpointInfo info =
-                event.request() instanceof ExceptionRequest exReq
-                    ? breakpointTracker.findExceptionInfoByRequest(exReq) : null;
+            final ExceptionRequest firingRequest = event.request() instanceof ExceptionRequest exReq ? exReq : null;
+            final BreakpointTracker.ExceptionBreakpointInfo info = firingRequest != null
+                ? breakpointTracker.findExceptionInfoByRequest(firingRequest) : null;
+            final Integer firingId = firingRequest != null
+                ? breakpointTracker.findExceptionIdByRequest(firingRequest) : null;
 
             if (info != null && info.isLogOnly()) {
                 evaluateExceptionLogpoint(event, info, exception, exceptionType,
                     throwInfo, catchInfo, threadName);
+                if (firingId != null) {
+                    applyChainEffectsAfterHit(firingId, firingRequest);
+                }
                 return false;
             }
 
@@ -398,6 +482,10 @@ public class JdiEventListener {
 
             log.info("[JDI] Exception {} thrown at {}, caught at {} on thread {}",
                 exceptionType, throwInfo, catchInfo, threadName);
+
+            if (firingId != null) {
+                applyChainEffectsAfterHit(firingId, firingRequest);
+            }
         } catch (Exception e) {
             log.warn("[JDI] Error handling exception event: {}", e.getMessage());
         }
@@ -545,6 +633,9 @@ public class JdiEventListener {
      * class. After promotion, deletes the {@link ClassPrepareRequest} for this class if no other
      * pending items still reference it — keeping a stale CPR around would deliver duplicate events
      * for unrelated classes that happen to share the same name pattern.
+     * <p>
+     * Chained pending BPs are promoted disarmed via {@link BreakpointTracker#disarmIfChained} so
+     * the very first event after class load cannot fire before the trigger has.
      */
     private void handleClassPrepareEvent(ClassPrepareEvent event) {
         try {
@@ -583,6 +674,9 @@ public class JdiEventListener {
                     final BreakpointRequest bpRequest = erm.createBreakpointRequest(location);
                     bpRequest.setSuspendPolicy(pending.getSuspendPolicy());
                     bpRequest.enable();
+                    // If this BP was chained while still pending, it must come up disarmed —
+                    // otherwise the very first event could fire before the trigger ever has.
+                    breakpointTracker.disarmIfChained(id, bpRequest);
 
                     breakpointTracker.promotePendingToActive(id, bpRequest);
                     log.info("[JDI] Deferred breakpoint {} activated at {}:{}", id, className, pending.getLineNumber());
@@ -607,6 +701,7 @@ public class JdiEventListener {
                     // invokeMethod for the expression eval.
                     exReq.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
                     exReq.enable();
+                    breakpointTracker.disarmIfChained(id, exReq);
                     breakpointTracker.promotePendingExceptionToActive(id, exReq);
                     log.info("[JDI] Deferred exception breakpoint {} activated for {}", id, className);
                 } catch (Exception e) {

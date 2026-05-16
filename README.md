@@ -9,7 +9,7 @@ MCP server that gives AI agents full debugger control over running Java applicat
 This MCP server runs **entirely on your local machine**:
 
 - **No network calls** — the server communicates with Claude Code over STDIO and with the target JVM over a local JDWP socket. It makes zero outbound HTTP/internet requests. No telemetry, no analytics, no phone-home.
-- **Built from source** — the JAR is compiled locally on your machine from the source code in this repository (either via the plugin auto-build hook or manually with `mvn clean package`). No pre-built binaries are downloaded or distributed.
+- **Built from source** — the JAR is compiled locally on your machine from the source code in this repository (either via the plugin auto-build hook or manually with `./mvnw clean package`). No pre-built binaries are downloaded or distributed.
 - **Auditable** — the full source is here. The server is a standard Spring Boot application with no obfuscation or native code.
 
 ## Why this exists
@@ -20,20 +20,22 @@ Raw JDWP/JDI gives you threads, stack frames, and variables. That's enough for a
 - **Logpoints** — evaluate an expression and log the result *without* stopping, for non-intrusive tracing
 - **Deferred breakpoints** — set breakpoints on classes that haven't loaded yet; they activate automatically
 - **Exception breakpoints** — catch exceptions at the throw site, not after they've unwound the stack
+- **Chained breakpoints** — disable a breakpoint until another fires first, so a hit is only meaningful when reached via a specific code path (one-shot or sticky)
 - **Expression evaluation** — compile and execute arbitrary Java at any breakpoint, with full classpath
 - **Value mutation** — change local variables and object fields at runtime to test hypotheses
 - **Recursive breakpoint protection** — expression evaluation is safe even when it re-enters the breakpointed line
 - **Smart filtering** — JVM internal threads and framework noise frames are hidden by default
 - **Blocking resume** — `resume_until_event` eliminates the "resume → poll → poll" dance
 
-40 MCP tools, exposed over STDIO. Your agent gets the same power as IntelliJ's debugger.
+44 MCP tools, exposed over STDIO. Your agent gets the same power as IntelliJ's debugger.
 
 ## Quick start
 
 ### Prerequisites
 
 - **JDK 17+** (must be a JDK, not a JRE — JDI lives in `jdk.jdi`)
-- **Maven 3.8+** (wrapper included)
+
+No separate Maven install is required — the repository ships with the Maven Wrapper (`./mvnw`), which downloads a pinned Maven 3.9.x into `~/.m2/wrapper/` on first use. The SessionStart hook and every build command in this README use the wrapper.
 
 ### 1. Install the plugin
 
@@ -46,7 +48,7 @@ Installs the MCP server, the `java-debug` skill (debugging workflows, recipes, g
 /plugin install jdwp-debugging@mcp-jdwp-java
 ```
 
-The server JAR is built automatically on first session start (requires JDK 17+ and Maven on PATH). Restart Claude Code to pick up the plugin.
+The server JAR is built automatically on first session start via the bundled `./mvnw` wrapper (requires JDK 17+ on PATH — no Maven install needed). Restart Claude Code to pick up the plugin.
 
 <details>
 <summary><strong>Alternative: manual MCP registration (without plugin)</strong></summary>
@@ -58,7 +60,7 @@ If you prefer to register the MCP server directly without the plugin (no skill, 
 ```bash
 git clone https://github.com/FgForrest/mcp-jdwp-java.git
 cd mcp-jdwp-java
-mvn clean package -DskipTests
+./mvnw clean package -DskipTests   # use mvnw.cmd on Windows
 ```
 
 **2. Register with Claude Code:**
@@ -300,6 +302,36 @@ jdwp_set_exception_breakpoint(
 
 Each hit records an `EXCEPTION_LOG` entry to `jdwp_get_events`; failures during evaluation surface as `EXCEPTION_LOG_ERROR` so the listener never throws. A non-null `expression` implies `logOnly=true`. Use this to trace exception flows in long-running services without stopping them.
 
+### Chained breakpoints
+
+```
+jdwp_set_breakpoint(
+  className="com.example.OrderProcessor",
+  lineNumber=87,
+  triggerBreakpointId=12,
+  oneShot=true
+)
+```
+
+Make one breakpoint depend on another. The dependent BP stays disabled until its trigger fires; from then on it's armed and behaves normally. Use this when a hit is uninteresting unless reached via a specific code path — e.g., suspend at the order-pricing line only after a "VIP customer" path has been entered, or break inside a generic utility only when called from a specific feature.
+
+Two modes:
+
+- **Sticky** (default, `oneShot=false`) — once the trigger fires, the dependent stays armed forever. Use when you want to filter by an early gate but observe every subsequent hit.
+- **One-shot** (`oneShot=true`) — the dependent self-disarms after firing, so the next hit requires the trigger to fire again. Matches IntelliJ's "Remove once hit" behavior.
+
+Chains compose: a trigger BP can itself be a dependent of an earlier trigger. Cycles are rejected at registration time with the offending path in the error message. Pending (not-yet-loaded) BPs are first-class participants — a chained dependent registered against a class that hasn't loaded yet is promoted with the chain bit intact, so the very first event after class load can't fire before the trigger has. Trigger fires that happen while the dependent is still pending are remembered, so a deferred dependent isn't penalised for arriving late.
+
+Both line breakpoints and exception breakpoints can be chain dependents and chain triggers; mix them freely.
+
+Manage chains with:
+
+- `jdwp_set_breakpoint_dependency(dependentId, triggerId, oneShot?)` — add an edge between two existing BPs (active or pending)
+- `jdwp_clear_breakpoint_dependency(dependentId)` — detach the edge and re-arm the dependent
+- `jdwp_disarm_until_trigger(dependentId)` — manually re-disable a dependent without changing its trigger (e.g., after a one-shot fired and you want another round)
+
+When the trigger BP is removed, every dependent is automatically armed and a `CHAIN_BROKEN` event is recorded for each — `jdwp_get_events` shows exactly which BPs lost their guard. `jdwp_diagnose` recognises the "every armed BP is waiting on a trigger that hasn't fired" state and tells you why no BP is currently firing, including any pending dependents waiting on class load.
+
 ### Expression evaluation
 
 ```
@@ -384,7 +416,7 @@ jdwp_get_breakpoint_context(maxFrames=5, includeThisFields=true)
 
 Returns thread info, top stack frames, locals at frame 0, and `this` fields in a single call — replaces the four-call sequence `get_current_thread → get_stack → get_locals → get_fields(this)` that an agent would otherwise need at every breakpoint hit.
 
-## Tool reference (40 tools)
+## Tool reference (44 tools)
 
 ### Connection (3)
 
@@ -423,15 +455,23 @@ Returns thread info, top stack frames, locals at frame 0, and `this` fields in a
 
 | Tool                              | Parameters                                                | Description                                         |
 |-----------------------------------|-----------------------------------------------------------|-----------------------------------------------------|
-| `jdwp_set_breakpoint`             | `className`, `lineNumber`, `suspendPolicy?`, `condition?` | Set breakpoint (supports conditions and deferred)   |
+| `jdwp_set_breakpoint`             | `className`, `lineNumber`, `suspendPolicy?`, `condition?`, `triggerBreakpointId?`, `oneShot?` | Set breakpoint (supports conditions, deferred, and trigger chaining) |
 | `jdwp_set_logpoint`               | `className`, `lineNumber`, `expression`, `condition?`     | Non-stopping breakpoint that logs expression result |
 | `jdwp_clear_breakpoint`           | `className`, `lineNumber`                                 | Remove breakpoint by location                       |
 | `jdwp_clear_breakpoint_by_id`     | `breakpointId`                                            | Remove breakpoint by ID                             |
-| `jdwp_list_breakpoints`           | —                                                         | List all breakpoints (active, pending, failed)      |
+| `jdwp_list_breakpoints`           | —                                                         | List all breakpoints (active, pending, failed; chain status rendered inline) |
 | `jdwp_clear_all_breakpoints`      | —                                                         | Remove all breakpoints                              |
-| `jdwp_set_exception_breakpoint`   | `exceptionClass`, `caught?`, `uncaught?`, `logOnly?`, `expression?` | Break on exception throw (supports deferred and log-only with `$exception` binding) |
+| `jdwp_set_exception_breakpoint`   | `exceptionClass`, `caught?`, `uncaught?`, `logOnly?`, `expression?`, `triggerBreakpointId?`, `oneShot?` | Break on exception throw (supports deferred, log-only with `$exception` binding, and trigger chaining) |
 | `jdwp_clear_exception_breakpoint` | `breakpointId`                                            | Remove exception breakpoint                         |
-| `jdwp_list_exception_breakpoints` | —                                                         | List exception breakpoints (active and pending)     |
+| `jdwp_list_exception_breakpoints` | —                                                         | List exception breakpoints (active and pending; chain status rendered inline) |
+
+### Breakpoint chains (3)
+
+| Tool                               | Parameters                            | Description                                                                   |
+|------------------------------------|---------------------------------------|-------------------------------------------------------------------------------|
+| `jdwp_set_breakpoint_dependency`   | `dependentId`, `triggerId`, `oneShot?` | Make `dependentId` depend on `triggerId` firing first; cycles are rejected    |
+| `jdwp_clear_breakpoint_dependency` | `dependentId`                          | Remove the chain edge and re-arm the dependent                                |
+| `jdwp_disarm_until_trigger`        | `dependentId`                          | Re-disable a dependent that already has a chain (e.g., after a one-shot fired) |
 
 ### Expression evaluation and mutation (4)
 
@@ -446,8 +486,14 @@ Returns thread info, top stack frames, locals at frame 0, and `this` fields in a
 
 | Tool                | Parameters | Description                                               |
 |---------------------|------------|-----------------------------------------------------------|
-| `jdwp_get_events`   | `count?`   | Recent events (breakpoints, steps, exceptions, logpoints, exception logs) |
+| `jdwp_get_events`   | `count?`   | Recent events (breakpoints, steps, exceptions, logpoints, exception logs, chain events) |
 | `jdwp_clear_events` | —          | Clear event history                                       |
+
+### Diagnostics (1)
+
+| Tool            | Parameters | Description                                                                                                                                            |
+|-----------------|------------|--------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `jdwp_diagnose` | —          | Snapshot of active vs pending BPs, recent events, last suspending event, and an interpretation hint — recognises the chain-stuck state where every armed BP is WAITING on a non-fired trigger |
 
 ### Watchers (6)
 
@@ -522,7 +568,7 @@ The `jdwp-sandbox` module includes a deterministic scenario (`one.edee.jdwp.sand
 
 ```bash
 # Terminal 1 — launch sandbox, suspended on port 5005
-mvn -pl jdwp-sandbox test -Dtest=RecursiveCalculatorTest -DskipTests=false -Dmaven.surefire.debug
+./mvnw -pl jdwp-sandbox test -Dtest=RecursiveCalculatorTest -DskipTests=false -Dmaven.surefire.debug
 
 # From Claude Code:
 jdwp_wait_for_attach()
@@ -547,9 +593,9 @@ The server is `SYNC` mode, `web-application-type=none` — JSON over STDIO, no H
 
 | Component                | Role                                                                                                                                               |
 |--------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------|
-| **JDWPTools**            | 40 `@McpTool` methods — the MCP surface. Thin orchestration over services below.                                                                   |
+| **JDWPTools**            | 44 `@McpTool` methods — the MCP surface. Thin orchestration over services below.                                                                   |
 | **JDIConnectionService** | Singleton `VirtualMachine` connection. Object cache (`ConcurrentHashMap<Long, ObjectReference>`), smart collection rendering, classpath discovery. |
-| **BreakpointTracker**    | Breakpoint registry with synthetic IDs. Tracks pending/deferred state, conditions, logpoint expressions, exception breakpoints.                    |
+| **BreakpointTracker**    | Breakpoint registry with synthetic IDs. Tracks pending/deferred state, conditions, logpoint expressions, exception breakpoints, and chain dependencies (with cycle detection and trigger-fire memory across pending → active promotion). |
 | **JdiEventListener**     | Daemon thread consuming the JDI event queue. Routes events, evaluates conditions/logpoints, handles recursive suppression.                         |
 | **EvaluationGuard**      | Per-thread reentrancy guard preventing deadlocks during expression evaluation.                                                                     |
 | **EventHistory**         | Ring buffer of the last 100 JDWP events (including suppressed).                                                                                    |
@@ -593,7 +639,7 @@ mcp-jdwp-java/
 │   ├── pom.xml
 │   └── src/main/java/one/edee/mcp/jdwp/
 │       ├── JDWPMcpServerApplication.java
-│       ├── JDWPTools.java               # 40 @McpTool methods
+│       ├── JDWPTools.java               # 44 @McpTool methods
 │       ├── JDIConnectionService.java    # JDI connection + object cache
 │       ├── BreakpointTracker.java       # Breakpoint registry + deferred state
 │       ├── JdiEventListener.java        # JDI event consumer
@@ -629,7 +675,7 @@ mcp-jdwp-java/
 |-------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `tools.jar not found` / `jdk.jdi not available` | Ensure `JAVA_HOME` points to a JDK, not a JRE. Launch with `--add-modules jdk.jdi`.                                                                                 |
 | Connection refused                              | Verify target JVM has `-agentlib:jdwp=...address=*:5005`. Check port matches `-DJVM_JDWP_PORT`.                                                                     |
-| MCP server doesn't respond                      | Rebuild: `mvn clean package -DskipTests`. Check jar path. Restart Claude Code.                                                                                      |
+| MCP server doesn't respond                      | Rebuild: `./mvnw clean package -DskipTests`. Check jar path. Restart Claude Code.                                                                                   |
 | MCP server times out on startup                 | JVM startup takes several seconds. Ensure `MCP_TIMEOUT=30000` (or higher) is set in the MCP registration — the default is too short for a Spring Boot Java process. |
 | "Thread is not suspended"                       | The thread must be stopped at a breakpoint for stack/locals/expression tools.                                                                                       |
 | Expression evaluation timeout                   | First evaluation is slow (classpath discovery). Increase `MCP_TOOL_TIMEOUT`. Subsequent evaluations use cache.                                                      |

@@ -19,6 +19,8 @@ import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -430,6 +432,26 @@ class BreakpointTrackerExceptionAndMetadataTest {
 			assertThat(tracker.getAllBreakpoints()).isEmpty();
 		}
 
+		/**
+		 * Verifies {@link BreakpointTracker#clearAll(EventRequestManager)} also wipes chain
+		 * state — without this, a fresh session could observe stale dependency edges across a
+		 * {@code jdwp_reset} / {@code jdwp_clear_all_breakpoints} call.
+		 */
+		@Test
+		void shouldClearChainStateOnClearAll() {
+			BreakpointRequest bp1 = mock(BreakpointRequest.class);
+			BreakpointRequest bp2 = mock(BreakpointRequest.class);
+			int triggerId = tracker.registerBreakpoint(bp1);
+			int dependentId = tracker.registerBreakpoint(bp2);
+			tracker.registerDependency(dependentId, triggerId, false);
+
+			EventRequestManager erm = mock(EventRequestManager.class);
+			tracker.clearAll(erm);
+
+			assertThat(tracker.getDependencyOfDependent(dependentId)).isNull();
+			assertThat(tracker.getDependentsOfTrigger(triggerId)).isEmpty();
+		}
+
 		private void doThrowOn(EventRequestManager erm, BreakpointRequest bp) {
 			org.mockito.Mockito.doThrow(new RuntimeException("simulated"))
 				.when(erm).deleteEventRequest(bp);
@@ -480,19 +502,104 @@ class BreakpointTrackerExceptionAndMetadataTest {
 			assertThat(promoted).isZero();
 			assertThat(tracker.getPendingBreakpoint(id)).isNotNull();
 		}
+
+		/**
+		 * When a pending line BP is promoted and it has a chain edge already registered, the
+		 * promoted {@link BreakpointRequest} must come up DISABLED — otherwise the very first
+		 * event could fire before the trigger has ever fired, defeating the whole chain.
+		 */
+		@Test
+		void shouldDisarmPromotedLineBpWhenChained() throws Exception {
+			JDIConnectionService service = mock(JDIConnectionService.class);
+			VirtualMachine vm = mock(VirtualMachine.class);
+			EventRequestManager erm = mock(EventRequestManager.class);
+			ReferenceType refType = mock(ReferenceType.class);
+			Location loc = mock(Location.class);
+			BreakpointRequest bp = mock(BreakpointRequest.class);
+			when(service.getRawVM()).thenReturn(vm);
+			when(vm.eventRequestManager()).thenReturn(erm);
+			when(service.findOrForceLoadClass(eq("com.example.Foo"), any())).thenReturn(refType);
+			when(refType.locationsOfLine(42)).thenReturn(java.util.List.of(loc));
+			when(erm.createBreakpointRequest(loc)).thenReturn(bp);
+
+			int triggerId = tracker.registerBreakpoint(mock(BreakpointRequest.class));
+			int pendingId = tracker.registerPendingBreakpoint("com.example.Foo", 42, 2, "ALL");
+			tracker.registerDependency(pendingId, triggerId, false);
+
+			int promoted = tracker.tryPromotePending(service, null);
+
+			assertThat(promoted).isEqualTo(1);
+			verify(bp).setEnabled(false);
+		}
+
+		/**
+		 * When a pending exception BP is promoted and it has a chain edge already registered,
+		 * the promoted {@link ExceptionRequest} must come up DISABLED so the trigger gates the
+		 * very first delivery.
+		 */
+		@Test
+		void shouldDisarmPromotedExceptionBpWhenChained() throws Exception {
+			JDIConnectionService service = mock(JDIConnectionService.class);
+			VirtualMachine vm = mock(VirtualMachine.class);
+			EventRequestManager erm = mock(EventRequestManager.class);
+			ReferenceType refType = mock(ReferenceType.class);
+			ExceptionRequest exReq = mock(ExceptionRequest.class);
+			when(service.getRawVM()).thenReturn(vm);
+			when(vm.eventRequestManager()).thenReturn(erm);
+			when(service.findOrForceLoadClass(eq("com.example.MyException"), any())).thenReturn(refType);
+			when(erm.createExceptionRequest(refType, true, true)).thenReturn(exReq);
+
+			int triggerId = tracker.registerBreakpoint(mock(BreakpointRequest.class));
+			int pendingId = tracker.registerPendingExceptionBreakpoint(
+				ExceptionBreakpointSpec.suspending("com.example.MyException", true, true));
+			tracker.registerDependency(pendingId, triggerId, false);
+
+			int promoted = tracker.tryPromotePending(service, null);
+
+			assertThat(promoted).isEqualTo(1);
+			verify(exReq).setEnabled(false);
+		}
+
+		/**
+		 * Conversely, a pending BP without a chain edge must come up ENABLED. Asserts that the
+		 * disarm branch in {@link BreakpointTracker#tryPromotePending} only fires when a chain
+		 * edge is present — otherwise we would silently break every non-chained pending BP.
+		 */
+		@Test
+		void shouldPromoteWithoutDisarmingWhenNoChain() throws Exception {
+			JDIConnectionService service = mock(JDIConnectionService.class);
+			VirtualMachine vm = mock(VirtualMachine.class);
+			EventRequestManager erm = mock(EventRequestManager.class);
+			ReferenceType refType = mock(ReferenceType.class);
+			Location loc = mock(Location.class);
+			BreakpointRequest bp = mock(BreakpointRequest.class);
+			when(service.getRawVM()).thenReturn(vm);
+			when(vm.eventRequestManager()).thenReturn(erm);
+			when(service.findOrForceLoadClass(eq("com.example.Foo"), any())).thenReturn(refType);
+			when(refType.locationsOfLine(42)).thenReturn(java.util.List.of(loc));
+			when(erm.createBreakpointRequest(loc)).thenReturn(bp);
+
+			tracker.registerPendingBreakpoint("com.example.Foo", 42, 2, "ALL");
+
+			int promoted = tracker.tryPromotePending(service, null);
+
+			assertThat(promoted).isEqualTo(1);
+			// enable() is called (from the production code itself), but setEnabled(false) must NOT.
+			verify(bp, org.mockito.Mockito.never()).setEnabled(false);
+		}
 	}
 
 	@Nested
 	@DisplayName("Metadata cleanup and last-breakpoint pair atomicity")
-	class KnownLimitations {
+	class MetadataCleanupAndAtomicPair {
 
 		/**
-		 * FINDING-8: removing a breakpoint by ID must also clear its entry in
-		 * {@code breakpointMetadata} so condition/logpoint expressions do not leak across the
-		 * lifetime of the synthetic ID.
+		 * Removing a breakpoint by ID must also clear its entry in {@code breakpointMetadata} so
+		 * condition/logpoint expressions cannot leak across the lifetime of the synthetic ID — a
+		 * freshly minted BP that reuses the deleted ID would otherwise inherit the old condition.
 		 */
 		@Test
-		void shouldLeakConditionMetadataAfterRemoveBreakpoint_FINDING_8() {
+		void shouldClearConditionMetadataAfterRemoveBreakpoint() {
 			BreakpointRequest bp = mock(BreakpointRequest.class);
 			VirtualMachine vm = mock(VirtualMachine.class);
 			EventRequestManager erm = mock(EventRequestManager.class);
@@ -507,11 +614,12 @@ class BreakpointTrackerExceptionAndMetadataTest {
 		}
 
 		/**
-		 * FINDING-8 (variant): {@code unregisterByRequest} must also clear the metadata associated
-		 * with the removed request's synthetic ID.
+		 * {@code unregisterByRequest} must also clear the metadata associated with the removed
+		 * request's synthetic ID — same lifetime invariant as {@link #shouldClearConditionMetadataAfterRemoveBreakpoint}
+		 * applied to the request-identity removal path.
 		 */
 		@Test
-		void shouldLeakConditionMetadataAfterUnregisterByRequest_FINDING_8() {
+		void shouldClearConditionMetadataAfterUnregisterByRequest() {
 			BreakpointRequest bp = mock(BreakpointRequest.class);
 			int id = tracker.registerBreakpoint(bp);
 			tracker.setCondition(id, "x > 5");
@@ -522,12 +630,12 @@ class BreakpointTrackerExceptionAndMetadataTest {
 		}
 
 		/**
-		 * FINDING-9: {@link BreakpointTracker#getLastBreakpoint()} must publish the
-		 * {@code (thread, id)} pair as a single atomic snapshot so callers can read both halves
-		 * without observing a torn pair from two different writes.
+		 * {@link BreakpointTracker#getLastBreakpoint()} must publish the {@code (thread, id)}
+		 * pair as a single atomic snapshot so callers can read both halves without observing a torn
+		 * pair from two different writes.
 		 */
 		@Test
-		void shouldExposeLastBreakpointPairViaSeparateUnsynchronisedGetters_FINDING_9() {
+		void shouldExposeLastBreakpointPairAtomically() {
 			com.sun.jdi.ThreadReference t1 = mock(com.sun.jdi.ThreadReference.class);
 			com.sun.jdi.ThreadReference t2 = mock(com.sun.jdi.ThreadReference.class);
 
@@ -549,7 +657,7 @@ class BreakpointTrackerExceptionAndMetadataTest {
 		 * With atomic publication via a single record field, no mismatch can occur.
 		 */
 		@Test
-		void shouldNeverObserveTornLastBreakpointPair_FINDING_9() throws Exception {
+		void shouldNeverObserveTornLastBreakpointPair() throws Exception {
 			com.sun.jdi.ThreadReference t1 = mock(com.sun.jdi.ThreadReference.class);
 			com.sun.jdi.ThreadReference t2 = mock(com.sun.jdi.ThreadReference.class);
 			java.util.concurrent.atomic.AtomicInteger mismatches = new java.util.concurrent.atomic.AtomicInteger();

@@ -122,8 +122,7 @@ public class JDIConnectionService {
     /**
      * Classifies a JDK collection type by its concrete class name. Uses explicit equality checks
      * rather than substring matching so future additions like {@code ConcurrentSkipListMap}
-     * (which contains both "List" and "Map") cannot accidentally route to the wrong branch
-     * (FINDING-13).
+     * (which contains both "List" and "Map") cannot accidentally route to the wrong branch.
      */
     private static CollectionKind collectionKind(String typeName) {
         return switch (typeName) {

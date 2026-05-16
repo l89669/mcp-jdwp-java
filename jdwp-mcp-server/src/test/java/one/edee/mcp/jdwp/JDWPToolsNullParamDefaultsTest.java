@@ -1,7 +1,5 @@
 package one.edee.mcp.jdwp;
 
-import com.sun.jdi.ThreadReference;
-import com.sun.jdi.VirtualMachine;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
 import one.edee.mcp.jdwp.watchers.WatcherManager;
 import org.junit.jupiter.api.BeforeEach;
@@ -10,6 +8,7 @@ import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -83,9 +82,12 @@ class JDWPToolsNullParamDefaultsTest {
 		void shouldDefaultCaughtAndUncaughtToTrue() throws Exception {
 			// With no VM connected, the call will fail with "Error: ..." but the defaults
 			// are applied before the VM access, so we simply verify no NPE on the Boolean unboxing.
+			// Use a non-NPE exception class name so the `doesNotContain("NullPointerException")`
+			// assertion is unambiguous (the input string would otherwise echo through the error
+			// path and trivially match).
 			when(jdiService.getVM()).thenThrow(new IllegalStateException("Not connected"));
 
-			String result = tools.jdwp_set_exception_breakpoint("java.lang.NullPointerException", null, null, null, null);
+			String result = tools.jdwp_set_exception_breakpoint("com.example.MyException", null, null, null, null, null, null);
 			// Should get an error about connection, not a NullPointerException on auto-unboxing.
 			assertThat(result).contains("Error");
 			assertThat(result).doesNotContain("NullPointerException");
@@ -116,11 +118,14 @@ class JDWPToolsNullParamDefaultsTest {
 			// breakpointTracker.getLastBreakpointId() instead of NPE-ing.
 			when(jdiService.getVM()).thenThrow(new IllegalStateException("Not connected"));
 
-			// Passing null for breakpointId must NOT throw NPE — it should produce
-			// an error about the VM connection, not about the parameter itself.
-			String result = tools.jdwp_evaluate_watchers(1L, "current_frame", null);
-			assertThat(result).contains("Error");
-			assertThat(result).doesNotContain("NullPointerException");
+			// Passing null for breakpointId must NOT throw — wrap in assertThatCode so the
+			// no-throw contract is explicit (the old `doesNotContain("NullPointerException")`
+			// check was brittle: an unrelated mention of NPE in the error path would also
+			// pass).
+			final String[] holder = new String[1];
+			assertThatCode(() -> holder[0] = tools.jdwp_evaluate_watchers(1L, "current_frame", null))
+				.doesNotThrowAnyException();
+			assertThat(holder[0]).startsWith("Error");
 		}
 
 		@Test

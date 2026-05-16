@@ -128,10 +128,10 @@ class EvaluationGuardTest {
 	@Test
 	@DisplayName("exit succeeds with an id whose ThreadReference has died")
 	void shouldAllowExitAfterThreadDeath() {
-		// FINDING-X: if the target thread dies mid-evaluation, exit() must still clean up via
-		// the pre-captured id. Simulate this by calling enter with a captured id, then having
-		// any subsequent ThreadReference lookup for that id throw (as JDI would via
-		// ObjectCollectedException). The exit path must never touch a ThreadReference.
+		// If the target thread dies mid-evaluation, exit() must still clean up via the pre-captured
+		// id. Simulate this by calling enter with a captured id, then having any subsequent
+		// ThreadReference lookup for that id throw (as JDI would via ObjectCollectedException). The
+		// exit path must never touch a ThreadReference.
 		EvaluationGuard guard = new EvaluationGuard();
 		long capturedId = 9000L;
 

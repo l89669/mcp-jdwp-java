@@ -78,6 +78,12 @@ public class BreakpointTracker {
      */
     private final ConcurrentHashMap<ExceptionRequest, ExceptionBreakpointInfo> exceptionInfoByRequest = new ConcurrentHashMap<>();
     /**
+     * Reverse index from JDI {@link ExceptionRequest} to its synthetic ID. Mirrors
+     * {@link #breakpointIdsByRequest} so chain handlers can recover the user-facing ID from the
+     * firing request without scanning {@link #exceptionBreakpointsById}.
+     */
+    private final ConcurrentHashMap<ExceptionRequest, Integer> exceptionIdsByRequest = new ConcurrentHashMap<>();
+    /**
      * Exception breakpoints awaiting class load; promoted via {@link #promotePendingExceptionToActive}.
      */
     private final ConcurrentHashMap<Integer, PendingExceptionBreakpoint> pendingExceptionBreakpointsById = new ConcurrentHashMap<>();
@@ -86,7 +92,7 @@ public class BreakpointTracker {
      * Atomic snapshot of the last suspending JDI event: the firing {@link ThreadReference} paired
      * with the synthetic breakpoint ID (or {@code -1} sentinel for non-breakpoint events such as
      * exceptions). Stored in a single volatile field so readers cannot observe a torn pair from
-     * two different writes (FINDING-9). {@code null} until the first event lands or after a reset.
+     * two different writes. {@code null} until the first event lands or after a reset.
      */
     @Nullable
     private volatile LastBreakpoint lastBreakpoint;
@@ -104,6 +110,32 @@ public class BreakpointTracker {
      */
     @Nullable
     private volatile CountDownLatch nextEventLatch;
+
+    /**
+     * Dependent → trigger relationship for chained breakpoints. A dependent BP is registered with
+     * {@code setEnabled(false)} and stays disarmed until its trigger fires. With {@code oneShot=false}
+     * (the default, "sticky" mode) the dependent stays armed forever after the first trigger fire;
+     * with {@code oneShot=true} the dependent disarms again after each hit so the next trigger fire
+     * re-arms it (IntelliJ-style). Re-engaging the chain after a sticky fire is done via
+     * {@code jdwp_disarm_until_trigger} which simply disables the dependent again.
+     */
+    private final ConcurrentHashMap<Integer, TriggerLink> dependencyByDependent = new ConcurrentHashMap<>();
+    /**
+     * Reverse index for {@link #dependencyByDependent}: trigger ID → set of dependents waiting on
+     * it. Hot path: the JDI listener queries this on every BP/exception event to decide who to arm.
+     * Maintained in lockstep with the primary map; a {@link ConcurrentHashMap#newKeySet()} backed
+     * set provides safe concurrent reads without contending with mutators.
+     */
+    private final ConcurrentHashMap<Integer, Set<Integer>> dependentsByTrigger = new ConcurrentHashMap<>();
+    /**
+     * BPs that have fired at least once since attach. Populated by {@link #markTriggerFired} from
+     * the JDI listener after every BP/exception hit and queried by the pending → active promotion
+     * path so a chained dependent whose trigger ALREADY fired comes up armed instead of disarmed.
+     * Without this memory, a dependent that was registered while still pending would silently miss
+     * its trigger's earlier fires. Cleared by {@link #reset} / {@link #clearAll} so a session-level
+     * wipe resets the chain memory; per-BP cleanup is handled inline (see {@link #removeBreakpoint}).
+     */
+    private final Set<Integer> triggersFiredAtLeastOnce = ConcurrentHashMap.newKeySet();
 
     // ── Active breakpoint operations ──
 
@@ -138,8 +170,10 @@ public class BreakpointTracker {
 
     /**
      * Remove a breakpoint by ID — checks active first, then pending. Also clears any condition or
-     * logpoint metadata associated with the synthetic ID so it does not leak after removal
-     * (FINDING-8).
+     * logpoint metadata associated with the synthetic ID, the chain edge that references the
+     * removed BP as a dependent, and the "trigger has fired" flag if the removed BP was itself a
+     * trigger — when the trigger goes away, its fire history must not influence future dependents
+     * that happen to reuse the same synthetic ID.
      *
      * @return true if found and removed
      */
@@ -154,6 +188,8 @@ public class BreakpointTracker {
                 // VM may already be disconnected
             }
             breakpointMetadata.remove(id);
+            clearDependency(id);
+            triggersFiredAtLeastOnce.remove(id);
             return true;
         }
 
@@ -162,6 +198,8 @@ public class BreakpointTracker {
         if (pending != null) {
             cleanupClassPrepareRequestIfNeeded(pending.getClassName());
             breakpointMetadata.remove(id);
+            clearDependency(id);
+            triggersFiredAtLeastOnce.remove(id);
             return true;
         }
 
@@ -170,7 +208,9 @@ public class BreakpointTracker {
 
     /**
      * Removes the in-memory tracking entry for the given JDI request via identity comparison and
-     * clears any condition / logpoint metadata associated with its synthetic ID (FINDING-8).
+     * clears any condition / logpoint metadata associated with its synthetic ID, so a freshly
+     * minted BP that reuses the deleted ID cannot inherit the previous BP's condition or logpoint
+     * expression.
      * <p>
      * Does NOT call `EventRequestManager.deleteEventRequest`. Callers (currently
      * {@link JDWPTools#jdwp_clear_breakpoint}) are responsible for deleting the underlying JDI request
@@ -181,6 +221,7 @@ public class BreakpointTracker {
         if (id != null) {
             breakpointsById.remove(id);
             breakpointMetadata.remove(id);
+            clearDependency(id);
         }
     }
 
@@ -229,24 +270,34 @@ public class BreakpointTracker {
         for (BreakpointRequest bp : breakpointsById.values()) {
             deleteQuietly(erm, bp);
         }
-        breakpointsById.clear();
-        breakpointIdsByRequest.clear();
-
-        pendingBreakpointsById.clear();
-        breakpointMetadata.clear();
-
         for (ClassPrepareRequest cpr : classPrepareRequests.values()) {
             deleteQuietly(erm, cpr);
         }
-        classPrepareRequests.clear();
-
         for (ExceptionBreakpointInfo info : exceptionBreakpointsById.values()) {
             deleteQuietly(erm, info.request);
         }
+        clearAllInMemoryStateLocked();
+    }
+
+    /**
+     * Wipes every in-memory map and resets the ID counter. Shared between {@link #clearAll} and
+     * {@link #reset}; the only difference between the two is whether the underlying JDI requests
+     * are deleted before the wipe. Caller MUST hold the tracker's intrinsic lock — both call sites
+     * are {@code synchronized} methods so the helper does not re-acquire it.
+     */
+    private void clearAllInMemoryStateLocked() {
+        breakpointsById.clear();
+        breakpointIdsByRequest.clear();
+        pendingBreakpointsById.clear();
+        breakpointMetadata.clear();
+        classPrepareRequests.clear();
         exceptionBreakpointsById.clear();
         exceptionInfoByRequest.clear();
+        exceptionIdsByRequest.clear();
         pendingExceptionBreakpointsById.clear();
-
+        dependencyByDependent.clear();
+        dependentsByTrigger.clear();
+        triggersFiredAtLeastOnce.clear();
         lastBreakpoint = null;
         idCounter.set(1);
     }
@@ -278,6 +329,10 @@ public class BreakpointTracker {
 
     /**
      * Removes a pending breakpoint by ID and cleans up its ClassPrepareRequest if no longer needed.
+     * Also drops any chain edge that referenced this BP as a dependent and any condition / logpoint
+     * metadata recorded against its synthetic ID, so a direct removal of a pending BP leaves no
+     * ghost state behind. Mirrors the cleanup performed by {@link #removeBreakpoint} for active
+     * line BPs.
      *
      * @return true if found and removed
      */
@@ -285,6 +340,8 @@ public class BreakpointTracker {
         final PendingBreakpoint removed = pendingBreakpointsById.remove(id);
         if (removed != null) {
             cleanupClassPrepareRequestIfNeeded(removed.getClassName());
+            breakpointMetadata.remove(id);
+            clearDependency(id);
             return true;
         }
         return false;
@@ -439,6 +496,7 @@ public class BreakpointTracker {
         final ExceptionBreakpointInfo info = new ExceptionBreakpointInfo(spec, req);
         exceptionBreakpointsById.put(id, info);
         exceptionInfoByRequest.put(req, info);
+        exceptionIdsByRequest.put(req, id);
         return id;
     }
 
@@ -454,9 +512,21 @@ public class BreakpointTracker {
     }
 
     /**
+     * Returns the synthetic ID for a given JDI {@link ExceptionRequest}. O(1) via the reverse
+     * index — used by chain handlers in {@link JdiEventListener} to recover the user-facing ID
+     * from the firing request without scanning {@link #exceptionBreakpointsById}.
+     */
+    @Nullable
+    public Integer findExceptionIdByRequest(ExceptionRequest req) {
+        return exceptionIdsByRequest.get(req);
+    }
+
+    /**
      * Removes an exception breakpoint by ID — checks active first, then pending. Active removals
      * also delete the underlying JDI `ExceptionRequest`; pending removals additionally clean up the
      * `ClassPrepareRequest` if no other pending item still references the same exception class.
+     * Also forgets the "trigger has fired" flag for the removed ID so a future BP that reuses the
+     * synthetic ID does not inherit the previous BP's fire history.
      *
      * @return `true` if found and removed, `false` if no entry exists for the given ID
      */
@@ -464,16 +534,21 @@ public class BreakpointTracker {
         final ExceptionBreakpointInfo info = exceptionBreakpointsById.remove(id);
         if (info != null) {
             exceptionInfoByRequest.remove(info.request);
+            exceptionIdsByRequest.remove(info.request);
             try {
                 info.request.virtualMachine().eventRequestManager().deleteEventRequest(info.request);
             } catch (Exception e) {
                 // VM may already be disconnected
             }
+            clearDependency(id);
+            triggersFiredAtLeastOnce.remove(id);
             return true;
         }
         final PendingExceptionBreakpoint pending = pendingExceptionBreakpointsById.remove(id);
         if (pending != null) {
             cleanupClassPrepareRequestIfNeeded(pending.getExceptionClass());
+            clearDependency(id);
+            triggersFiredAtLeastOnce.remove(id);
             return true;
         }
         return false;
@@ -526,6 +601,7 @@ public class BreakpointTracker {
             final ExceptionBreakpointInfo info = new ExceptionBreakpointInfo(pending.getSpec(), req);
             exceptionBreakpointsById.put(id, info);
             exceptionInfoByRequest.put(req, info);
+            exceptionIdsByRequest.put(req, id);
         }
     }
 
@@ -601,6 +677,7 @@ public class BreakpointTracker {
                 final BreakpointRequest bp = erm.createBreakpointRequest(locations.get(0));
                 bp.setSuspendPolicy(pending.getSuspendPolicy());
                 bp.enable();
+                disarmIfChained(id, bp);
                 promotePendingToActive(id, bp);
                 promoted++;
                 log.info("[Tracker] Opportunistically promoted pending breakpoint {} for {}:{}",
@@ -634,6 +711,7 @@ public class BreakpointTracker {
                 // Auto-resume happens in JdiEventListener.handleExceptionEvent.
                 exReq.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
                 exReq.enable();
+                disarmIfChained(id, exReq);
                 promotePendingExceptionToActive(id, exReq);
                 promoted++;
                 log.info("[Tracker] Opportunistically promoted pending exception breakpoint {} for {}",
@@ -646,6 +724,228 @@ public class BreakpointTracker {
         return promoted;
     }
 
+    // ── Chain (dependency) operations ──
+
+    /**
+     * Registers a chain edge: {@code dependentId} is only armed after {@code triggerId} fires.
+     * Stores the relationship in both the primary map and the reverse index. Does NOT touch the
+     * underlying JDI request — callers are responsible for {@code setEnabled(false)} on the
+     * dependent's request right after registering, so the dependent is disarmed from the very
+     * first event the JVM might deliver.
+     * <p>
+     * Idempotent for the {@code dependent → trigger} edge — re-registering the same pair simply
+     * replaces the {@link TriggerLink} (e.g., to toggle {@code oneShot}). If a previous trigger
+     * existed for this dependent, it is silently overwritten and the old reverse-index entry is
+     * cleaned up.
+     * <p>
+     * Validates that the trigger is still a known BP at registration time (closing a TOCTOU window
+     * where the boundary-level existence check at {@link JDWPTools} could be invalidated by a
+     * concurrent removal before the edge is written) and that adding the edge does not introduce a
+     * cycle. Multi-hop cycles like {@code 2 → 1 → 2} are rejected by walking the existing graph
+     * from {@code triggerId} up to a chain root; if {@code dependentId} is encountered along the
+     * way the registration is refused.
+     *
+     * @throws ChainRegistrationException when the trigger no longer exists or the edge would form
+     *                                    a cycle
+     */
+    public synchronized void registerDependency(int dependentId, int triggerId, boolean oneShot) {
+        if (!isKnownBreakpointId(triggerId)) {
+            throw ChainRegistrationException.triggerMissing(triggerId);
+        }
+        final List<Integer> cyclePath = findCyclePath(dependentId, triggerId);
+        if (cyclePath != null) {
+            throw ChainRegistrationException.cycle(cyclePath);
+        }
+        final TriggerLink previous = dependencyByDependent.put(dependentId, new TriggerLink(triggerId, oneShot));
+        if (previous != null && previous.triggerId() != triggerId) {
+            removeReverseIndexEntry(previous.triggerId(), dependentId);
+        }
+        dependentsByTrigger.computeIfAbsent(triggerId, k -> ConcurrentHashMap.newKeySet()).add(dependentId);
+    }
+
+    /**
+     * Walks the existing {@code dependency → trigger} chain starting at {@code triggerId} and
+     * follows {@link #dependencyByDependent} edges until a chain root (no further dependency) is
+     * reached. If {@code dependentId} is encountered along the way, adding the new edge
+     * {@code dependentId → triggerId} would close a cycle. Returns the chain that would form the
+     * cycle (starting at {@code dependentId}, ending back at {@code dependentId}) when a cycle is
+     * detected, or {@code null} when the new edge is safe to add. The walk is bounded by the size
+     * of {@link #dependencyByDependent} so it terminates even in the (currently impossible)
+     * presence of a pre-existing cycle.
+     */
+    @Nullable
+    private List<Integer> findCyclePath(int dependentId, int triggerId) {
+        final int maxSteps = dependencyByDependent.size() + 1;
+        final List<Integer> path = new ArrayList<>();
+        path.add(dependentId);
+        path.add(triggerId);
+        int cursor = triggerId;
+        for (int step = 0; step < maxSteps; step++) {
+            if (cursor == dependentId) {
+                return path;
+            }
+            final TriggerLink upstream = dependencyByDependent.get(cursor);
+            if (upstream == null) {
+                return null;
+            }
+            cursor = upstream.triggerId();
+            path.add(cursor);
+        }
+        return null;
+    }
+
+    /**
+     * Removes the chain edge for {@code dependentId}. Returns the previous {@link TriggerLink} so
+     * callers can decide whether to log a {@code CHAIN_BROKEN} event. No-op when the dependent has
+     * no chain configured.
+     */
+    @Nullable
+    public synchronized TriggerLink clearDependency(int dependentId) {
+        final TriggerLink previous = dependencyByDependent.remove(dependentId);
+        if (previous != null) {
+            removeReverseIndexEntry(previous.triggerId(), dependentId);
+        }
+        return previous;
+    }
+
+    /**
+     * Removes {@code dependentId} from the reverse-index set keyed by {@code triggerId} and drops
+     * the now-empty entry. Callers must already hold the tracker's intrinsic lock — the helper
+     * relies on the surrounding {@code synchronized} method to keep the get/remove sequence atomic
+     * against concurrent {@link #registerDependency} / {@link #clearDependency} calls.
+     */
+    private void removeReverseIndexEntry(int triggerId, int dependentId) {
+        final Set<Integer> deps = dependentsByTrigger.get(triggerId);
+        if (deps != null) {
+            deps.remove(dependentId);
+            if (deps.isEmpty()) {
+                dependentsByTrigger.remove(triggerId);
+            }
+        }
+    }
+
+    /**
+     * Returns the trigger relationship for {@code dependentId}, or {@code null} if the BP is not
+     * chained. O(1) lookup used by the listener after every BP/exception fire to decide whether the
+     * firing BP should re-disarm itself (one-shot mode).
+     */
+    @Nullable
+    public TriggerLink getDependencyOfDependent(int dependentId) {
+        return dependencyByDependent.get(dependentId);
+    }
+
+    /**
+     * Returns an unmodifiable snapshot of the dependent IDs waiting on {@code triggerId} (empty if
+     * none). Used by the JDI listener on every BP/exception event to find who to arm. The returned
+     * set is a defensive copy — NOT a live view — so the caller can iterate without worrying about
+     * concurrent mutations from another {@link #registerDependency} / {@link #clearDependency} call.
+     */
+    public Set<Integer> getDependentsOfTrigger(int triggerId) {
+        final Set<Integer> deps = dependentsByTrigger.get(triggerId);
+        return deps == null ? Set.of() : Set.copyOf(deps);
+    }
+
+    /**
+     * Drops every chain edge whose trigger is {@code triggerId} and returns the dependent IDs that
+     * were detached. Called from the trigger-removal code path in {@link JDWPTools} so the caller
+     * can arm each dependent and emit a {@code CHAIN_BROKEN} event per detached edge.
+     */
+    public synchronized Set<Integer> clearDependentsOfTrigger(int triggerId) {
+        final Set<Integer> deps = dependentsByTrigger.remove(triggerId);
+        if (deps == null) {
+            return Set.of();
+        }
+        for (Integer depId : deps) {
+            dependencyByDependent.remove(depId);
+        }
+        return Set.copyOf(deps);
+    }
+
+    /**
+     * Returns the JDI {@link EventRequest} for the given synthetic ID — checks active line BPs and
+     * active exception BPs (in that order). Returns {@code null} when the ID is pending, unknown,
+     * or already removed. Used by chain-handling code that needs to call {@code setEnabled(...)}
+     * without caring whether the underlying request is a line BP or an exception BP.
+     */
+    @Nullable
+    public EventRequest getEventRequestById(int id) {
+        final BreakpointRequest bp = breakpointsById.get(id);
+        if (bp != null) {
+            return bp;
+        }
+        final ExceptionBreakpointInfo info = exceptionBreakpointsById.get(id);
+        return info != null ? info.getRequest() : null;
+    }
+
+    /**
+     * Returns {@code true} when {@code id} matches any tracked breakpoint — active line, active
+     * exception, pending line, or pending exception. Used by {@link JDWPTools} to validate trigger
+     * IDs supplied to chain-aware tools without forcing the caller to query four separate maps.
+     */
+    public boolean isKnownBreakpointId(int id) {
+        return getEventRequestById(id) != null
+            || pendingBreakpointsById.containsKey(id)
+            || pendingExceptionBreakpointsById.containsKey(id);
+    }
+
+    /**
+     * If {@code id} is registered as a chain dependent, disable the supplied JDI request so the
+     * dependent stays disarmed until its trigger fires. Used during pending-to-active promotion —
+     * a dependent that was chained while still pending must come up disabled, otherwise the very
+     * first event could fire before the trigger ever has.
+     * <p>
+     * Honours the "trigger already fired" memory: if the dependent's trigger has fired at least
+     * once before the promotion happens, the dependent comes up armed instead of disarmed. This
+     * catches the case where the user installs a chained dependent for a class that gets loaded
+     * only AFTER the trigger has already executed once — without this check, the dependent would
+     * silently miss subsequent firings until the trigger fires again.
+     * <p>
+     * Any exception from {@link EventRequest#setEnabled} is allowed to propagate so the caller's
+     * surrounding try/catch can mark the promotion failed and emit the appropriate log entry; this
+     * is the historical behaviour of both call sites.
+     *
+     * @return {@code true} when the request was disabled (the BP was chained and its trigger has
+     *         not fired yet), {@code false} otherwise
+     */
+    boolean disarmIfChained(int id, EventRequest request) {
+        final TriggerLink link = dependencyByDependent.get(id);
+        if (link == null) {
+            return false;
+        }
+        if (triggersFiredAtLeastOnce.contains(link.triggerId())) {
+            // Trigger has already fired at least once — leave the dependent enabled so it catches
+            // the next hit at its location. The sticky/one-shot distinction still applies on the
+            // listener side, but at the promotion boundary the dependent is treated as armed.
+            return false;
+        }
+        request.setEnabled(false);
+        return true;
+    }
+
+    /**
+     * Records that {@code triggerId} has fired at least once. Called by the JDI listener after
+     * every BP/exception hit, regardless of whether the BP currently has any dependents — a
+     * future {@link #registerDependency} call may add one, and the dependent should still benefit
+     * from the historical fire.
+     * <p>
+     * Note: {@link #registerDependency} deliberately does NOT auto-arm a freshly-registered
+     * dependent even if {@code hasTriggerFired(triggerId)} is true. Arming-on-registration would
+     * violate the user's explicit intent to "wait for the next trigger fire" — the persistence is
+     * a safety net for pending → active promotion, not a shortcut for the chain CRUD path.
+     */
+    public void markTriggerFired(int triggerId) {
+        triggersFiredAtLeastOnce.add(triggerId);
+    }
+
+    /**
+     * Returns {@code true} when {@code triggerId} has fired at least once since attach (or since
+     * the last {@link #reset} / {@link #clearAll}). Used by the pending → active promotion path
+     * to decide whether a chained dependent should come up armed.
+     */
+    public boolean hasTriggerFired(int triggerId) {
+        return triggersFiredAtLeastOnce.contains(triggerId);
+    }
+
     // ── Thread tracking ──
 
     /**
@@ -654,7 +954,7 @@ public class BreakpointTracker {
      * `breakpointId` for non-breakpoint events (currently used by exception events).
      * <p>
      * Publishes the {@code (thread, id)} pair atomically via a single volatile reference so
-     * concurrent readers cannot observe a crossed pair (FINDING-9).
+     * concurrent readers cannot observe a crossed pair (thread from event N with id from event N+1).
      *
      * @param thread       the thread that hit the suspending event
      * @param breakpointId synthetic breakpoint ID, or {@code -1} for non-breakpoint events
@@ -734,16 +1034,7 @@ public class BreakpointTracker {
     public synchronized void reset() {
         // Release any awaiter BEFORE we touch state — see fireNextEvent() for why this matters.
         fireNextEvent();
-        breakpointsById.clear();
-        breakpointIdsByRequest.clear();
-        pendingBreakpointsById.clear();
-        breakpointMetadata.clear();
-        classPrepareRequests.clear();
-        exceptionBreakpointsById.clear();
-        exceptionInfoByRequest.clear();
-        pendingExceptionBreakpointsById.clear();
-        lastBreakpoint = null;
-        idCounter.set(1);
+        clearAllInMemoryStateLocked();
     }
 
     /**
@@ -752,6 +1043,74 @@ public class BreakpointTracker {
      * crossed pair from two different writes.
      */
     public record LastBreakpoint(ThreadReference thread, Integer id) {
+    }
+
+    /**
+     * Signals that {@link #registerDependency} refused a chain edge. Two reasons are distinguished:
+     * the trigger no longer exists at registration time (atomic validation closing the TOCTOU
+     * window with the boundary check) or adding the edge would close a cycle (multi-hop cycle
+     * detection). Carries enough context for {@link JDWPTools} to translate the rejection into a
+     * user-facing error string without re-walking the graph.
+     */
+    public static class ChainRegistrationException extends RuntimeException {
+        public enum Reason {MISSING_TRIGGER, CYCLE}
+
+        private final Reason reason;
+        private final int triggerId;
+        @Nullable
+        private final List<Integer> cyclePath;
+
+        private ChainRegistrationException(Reason reason, int triggerId, @Nullable List<Integer> cyclePath,
+                                           String message) {
+            super(message);
+            this.reason = reason;
+            this.triggerId = triggerId;
+            this.cyclePath = cyclePath;
+        }
+
+        static ChainRegistrationException triggerMissing(int triggerId) {
+            return new ChainRegistrationException(Reason.MISSING_TRIGGER, triggerId, null,
+                String.format("Trigger breakpoint #%d no longer exists", triggerId));
+        }
+
+        static ChainRegistrationException cycle(List<Integer> path) {
+            final StringBuilder sb = new StringBuilder(64);
+            for (int i = 0; i < path.size(); i++) {
+                if (i > 0) {
+                    sb.append(" → ");
+                }
+                sb.append('#').append(path.get(i));
+            }
+            return new ChainRegistrationException(Reason.CYCLE, path.get(path.size() - 1),
+                List.copyOf(path),
+                String.format("Adding this dependency would create a cycle: %s", sb));
+        }
+
+        public Reason reason() {
+            return reason;
+        }
+
+        public int triggerId() {
+            return triggerId;
+        }
+
+        @Nullable
+        public List<Integer> cyclePath() {
+            return cyclePath;
+        }
+    }
+
+    /**
+     * Chain edge metadata: which trigger BP must fire before the dependent is armed, plus the
+     * {@code oneShot} flag controlling whether the dependent re-disarms itself after each hit.
+     * <ul>
+     *   <li>{@code oneShot=false} (default, "sticky"): the dependent stays armed forever after the
+     *       trigger first fires. To re-engage the chain, call {@code jdwp_disarm_until_trigger}.</li>
+     *   <li>{@code oneShot=true} (IntelliJ-style): after each dependent fire, the listener disarms
+     *       the dependent again, so the next trigger fire re-arms it.</li>
+     * </ul>
+     */
+    public record TriggerLink(int triggerId, boolean oneShot) {
     }
 
     // ── Inner class ──

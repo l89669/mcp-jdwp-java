@@ -135,6 +135,21 @@ A value gets set in many places and you want to know which write produced the ba
 3. `jdwp_get_events(50)` -> all logpoint hits in chronological order.
 4. The last entry before the test fails is the culprit.
 
+### "Same method runs 1000× but I only care about the call after login"
+
+A noisy method fires repeatedly throughout the run; you only want to stop on it within a specific context (after a particular trigger).
+
+1. Set the trigger BP at the context entry: `jdwp_set_breakpoint("LoginService", 42)` — call it BP `#A`.
+2. Set the dependent BP at the noisy method, chained to `#A`:
+   `jdwp_set_breakpoint("CartService", 99, triggerBreakpointId=A)`
+   The dependent comes up disabled and only arms once `#A` fires.
+3. `jdwp_resume_until_event` — runs through every pre-login call to `CartService:99` without stopping. As soon as the login flow hits BP `#A`, the dependent is armed (you'll see a `CHAIN_ARMED` event in `jdwp_get_events`).
+4. The very next `CartService:99` call after that stops as a normal BP — inspect away.
+5. **Sticky default:** once armed, the dependent stays armed for the rest of the session. To catch the *next* run of the flow fresh again, call `jdwp_disarm_until_trigger(<dependentId>)` — this re-engages the chain without rebuilding the BP.
+6. **`oneShot=true` mode** is also available — the dependent re-disarms itself after each hit (IntelliJ-style). Use this when you want the noisy BP to fire exactly once per trigger event in a loop.
+
+Chains can be retrofitted to existing BPs via `jdwp_set_breakpoint_dependency(dependentId, triggerId)`, removed via `jdwp_clear_breakpoint_dependency(dependentId)`, and they survive `jdwp_reset` only if the BPs themselves do (reset clears everything). Removing the trigger BP collapses the chain — every dependent gets armed and a `CHAIN_BROKEN` event is recorded.
+
 ## Critical Gotchas
 
 - **Expression eval auto-rewrites bare field references** to `_this.field` when the enclosing class and field are both public. For PACKAGE-PRIVATE enclosing classes this is skipped — the error message will tell you to use `jdwp_get_fields(<thisObjectId>)` instead.

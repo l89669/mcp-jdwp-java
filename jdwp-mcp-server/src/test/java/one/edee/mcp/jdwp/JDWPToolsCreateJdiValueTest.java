@@ -132,12 +132,12 @@ class JDWPToolsCreateJdiValueTest {
 		}
 
 		/**
-		 * FINDING-4: For a {@code char} target type, surrounding {@code '...'} must be stripped
-		 * before {@code mirrorOf} is called so the parser produces the intended character rather
-		 * than the apostrophe at index 0.
+		 * For a {@code char} target type, surrounding {@code '...'} must be stripped before
+		 * {@code mirrorOf} is called so the parser produces the intended character rather than the
+		 * apostrophe at index 0.
 		 */
 		@Test
-		void shouldUseFirstCharFromQuotedInput_FINDING_4() throws Exception {
+		void shouldUseFirstCharFromQuotedInput() throws Exception {
 			CharValue cv = mock(CharValue.class);
 			when(vm.mirrorOf('a')).thenReturn(cv);
 

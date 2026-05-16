@@ -16,9 +16,9 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 /**
- * Verifies FINDING-7: when the JDI event loop catches a {@link VMDisconnectedException} on
- * external VM disconnect, the listener must release the {@code resume_until_event} latch
- * before exiting so any parked waiter can return promptly instead of hanging until timeout.
+ * When the JDI event loop catches a {@link VMDisconnectedException} on external VM disconnect,
+ * the listener must release the {@code resume_until_event} latch before exiting so any parked
+ * waiter can return promptly instead of hanging until timeout.
  *
  * <p>This test starts the real listener thread with a mocked VM whose
  * {@code eventQueue().remove()} throws {@code VMDisconnectedException}, then asserts the
@@ -44,12 +44,12 @@ class JdiEventListenerDisconnectBugTest {
 	}
 
 	/**
-	 * FINDING-7: external VM disconnect must release {@code resume_until_event} waiters.
-	 * Drives the listener with a queue that immediately throws {@link VMDisconnectedException}
-	 * and asserts the pre-armed latch is counted down promptly.
+	 * External VM disconnect must release {@code resume_until_event} waiters. Drives the listener
+	 * with a queue that immediately throws {@link VMDisconnectedException} and asserts the
+	 * pre-armed latch is counted down promptly.
 	 */
 	@Test
-	void shouldNotReleaseWaiterWhenVmDisconnectExceptionIsThrown_FINDING_7() throws Exception {
+	void shouldReleaseWaiterOnVmDisconnect() throws Exception {
 		VirtualMachine vm = mock(VirtualMachine.class);
 		EventQueue queue = mock(EventQueue.class);
 		when(vm.eventQueue()).thenReturn(queue);

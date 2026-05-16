@@ -720,8 +720,9 @@ public class JDWPTools {
         out.append(String.format("Active line breakpoints: %d%n", activeLineBps.size()));
         for (Map.Entry<Integer, BreakpointRequest> e : activeLineBps.entrySet()) {
             final Location loc = e.getValue().location();
-            out.append(String.format("  - #%d %s:%d%n",
-                e.getKey(), loc.declaringType().name(), loc.lineNumber()));
+            out.append(String.format("  - #%d %s:%d%s%n",
+                e.getKey(), loc.declaringType().name(), loc.lineNumber(),
+                renderChainSuffixForActive(e.getKey(), e.getValue().isEnabled())));
         }
 
         out.append(String.format("Pending line breakpoints: %d  (class not yet loaded)%n", pendingLineBps.size()));
@@ -730,16 +731,18 @@ public class JDWPTools {
             final String reason = pb.getFailureReason() != null
                 ? "  [FAILED: " + pb.getFailureReason() + ']' : "";
             out.append(
-                String.format("  - #%d %s:%d%s%n",
-                e.getKey(), pb.getClassName(), pb.getLineNumber(), reason)
+                String.format("  - #%d %s:%d%s%s%n",
+                e.getKey(), pb.getClassName(), pb.getLineNumber(), reason,
+                renderChainSuffixForPending(e.getKey()))
             );
         }
 
         out.append(String.format("Active exception breakpoints: %d%n", activeExBps.size()));
         for (Map.Entry<Integer, BreakpointTracker.ExceptionBreakpointInfo> e : activeExBps.entrySet()) {
-            out.append(String.format("  - #%d %s%s%n",
+            out.append(String.format("  - #%d %s%s%s%n",
                 e.getKey(), e.getValue().getExceptionClass(),
-                e.getValue().isLogOnly() ? " (logOnly)" : ""));
+                e.getValue().isLogOnly() ? " (logOnly)" : "",
+                renderChainSuffixForActive(e.getKey(), e.getValue().getRequest().isEnabled())));
         }
 
         out.append(String.format("Pending exception breakpoints: %d%n", pendingExBps.size()));
@@ -747,8 +750,9 @@ public class JDWPTools {
             final BreakpointTracker.PendingExceptionBreakpoint pb = e.getValue();
             final String reason = pb.getFailureReason() != null
                 ? "  [FAILED: " + pb.getFailureReason() + ']' : "";
-            out.append(String.format("  - #%d %s%s%n",
-                e.getKey(), pb.getExceptionClass(), reason));
+            out.append(String.format("  - #%d %s%s%s%n",
+                e.getKey(), pb.getExceptionClass(), reason,
+                renderChainSuffixForPending(e.getKey())));
         }
 
         out.append("\nLast suspending event: ");
@@ -775,12 +779,46 @@ public class JDWPTools {
     }
 
     /**
+     * Returns the {@code "  [chain: ...]"} suffix for an ACTIVE BP entry in the diagnostic
+     * report, or an empty string when the BP has no chain. {@code enabled} is read from the
+     * underlying JDI {@link EventRequest} — when {@code true} the BP renders as {@code ARMED},
+     * otherwise {@code WAITING}.
+     */
+    private String renderChainSuffixForActive(int bpId, boolean enabled) {
+        final BreakpointTracker.TriggerLink link = breakpointTracker.getDependencyOfDependent(bpId);
+        if (link == null) {
+            return "";
+        }
+        return String.format("  [chain: trigger=#%d, %s, %s]",
+            link.triggerId(), link.oneShot() ? "one-shot" : "sticky", enabled ? "ARMED" : "WAITING");
+    }
+
+    /**
+     * Returns the {@code "  [chain: ...]"} suffix for a PENDING BP entry in the diagnostic
+     * report, or an empty string when the BP has no chain. Pending BPs have no underlying JDI
+     * request yet, so they always render as {@code WAITING} — by construction they cannot be
+     * armed until promotion.
+     */
+    private String renderChainSuffixForPending(int bpId) {
+        final BreakpointTracker.TriggerLink link = breakpointTracker.getDependencyOfDependent(bpId);
+        if (link == null) {
+            return "";
+        }
+        return String.format("  [chain: trigger=#%d, %s, WAITING]",
+            link.triggerId(), link.oneShot() ? "one-shot" : "sticky");
+    }
+
+    /**
      * Picks the most actionable one-liner from the diagnostic state. The aim is to keep the caller
      * (typically an LLM) from blindly retrying {@code jdwp_resume_until_event} with a larger timeout
      * when the real problem is a wrong class name, an unloaded class, or breakpoints that are firing
      * but auto-resuming.
+     * <p>
+     * The interpretation pass is chain-aware via {@link #describeChainStuckState}, which recognises
+     * the "every armed BP is waiting on a trigger that has not fired" state — otherwise
+     * indistinguishable from a generic armed-but-idle state.
      */
-    private static String interpretDiagnostic(
+    private String interpretDiagnostic(
         Map<Integer, BreakpointRequest> activeLine,
         Map<Integer, BreakpointTracker.PendingBreakpoint> pendingLine,
         Map<Integer, BreakpointTracker.ExceptionBreakpointInfo> activeEx,
@@ -809,6 +847,11 @@ public class JDWPTools {
                 + "been invoked. Do NOT retry with a larger timeout; the BP will never fire until "
                 + "the class loads.";
         }
+        // Chain-aware: are all enabled BPs sitting behind a trigger that has not fired?
+        final String chainStuckMsg = describeChainStuckState(activeLine, activeEx, pendingLine, pendingEx);
+        if (chainStuckMsg != null) {
+            return chainStuckMsg;
+        }
         final boolean autoResumedHits = recent.stream().anyMatch(e ->
             "LOGPOINT".equals(e.type()) || "BREAKPOINT_SUPPRESSED".equals(e.type())
                 || "EXCEPTION_LOG".equals(e.type()) || "EXCEPTION_SUPPRESSED".equals(e.type()));
@@ -825,6 +868,110 @@ public class JDWPTools {
         }
         return "Some events have fired but nothing suspended within the wait window. Inspect "
             + "'Recent events' above for the most likely cause.";
+    }
+
+    /**
+     * If every active BP is a chained dependent currently in WAITING state (its underlying JDI
+     * request is disabled because the trigger has not fired), returns an interpretation message
+     * pointing the caller at the unfired trigger; otherwise returns {@code null}. This catches
+     * the "my chained BP is stuck because the trigger never hit" scenario which is otherwise
+     * indistinguishable from a generic "armed-but-not-fired" state.
+     * <p>
+     * Folds pending BPs into the tally: they cannot have an underlying JDI request yet, so they
+     * are categorically WAITING. When pending BPs are present alongside active chained-WAITING
+     * ones, the interpretation line calls out the pending count and an example pending ID so the
+     * user sees the full picture instead of just the active half. The message
+     * stays unchanged when no pending BPs are present.
+     */
+    @Nullable
+    private String describeChainStuckState(
+        Map<Integer, BreakpointRequest> activeLine,
+        Map<Integer, BreakpointTracker.ExceptionBreakpointInfo> activeEx,
+        Map<Integer, BreakpointTracker.PendingBreakpoint> pendingLine,
+        Map<Integer, BreakpointTracker.PendingExceptionBreakpoint> pendingEx
+    ) {
+        final ChainStuckTally tally = new ChainStuckTally();
+        for (Map.Entry<Integer, BreakpointRequest> e : activeLine.entrySet()) {
+            tally.observe(e.getKey(), e.getValue().isEnabled());
+        }
+        for (Map.Entry<Integer, BreakpointTracker.ExceptionBreakpointInfo> e : activeEx.entrySet()) {
+            tally.observe(e.getKey(), e.getValue().getRequest().isEnabled());
+        }
+        // Pending BPs have no JDI request yet — pass enabled=false so they always land in the
+        // chained-WAITING / unchained-WAITING bucket, and remember the count separately so the
+        // user-facing message can call them out explicitly.
+        for (Map.Entry<Integer, BreakpointTracker.PendingBreakpoint> e : pendingLine.entrySet()) {
+            tally.observePending(e.getKey());
+        }
+        for (Map.Entry<Integer, BreakpointTracker.PendingExceptionBreakpoint> e : pendingEx.entrySet()) {
+            tally.observePending(e.getKey());
+        }
+        if (tally.chainedWaiting > 0 && tally.unchainedOrArmed == 0) {
+            final StringBuilder msg = new StringBuilder(256);
+            msg.append(String.format("Every active BP is WAITING on a trigger. e.g. BP #%d is chained to "
+                    + "trigger BP #%d, which has not fired since attach. Verify the trigger's code path "
+                    + "is being exercised — or temporarily call jdwp_clear_breakpoint_dependency(#%d) "
+                    + "to detach the chain.",
+                tally.sampleDependentId, tally.sampleTriggerId, tally.sampleDependentId));
+            if (tally.pendingCount > 0) {
+                msg.append(String.format(" Additionally, %d pending BP(s) (e.g. #%d) are waiting for "
+                        + "their class to load — see [PENDING] entries above.",
+                    tally.pendingCount, tally.samplePendingId));
+            }
+            return msg.toString();
+        }
+        return null;
+    }
+
+    /**
+     * Counts how many active BPs are chained-and-waiting vs unchained-or-armed and remembers the
+     * first chained-waiting pair as a sample for the user-facing message. Mutable on purpose:
+     * {@link #describeChainStuckState} feeds it one entry at a time from two maps and only ever
+     * reads the final totals.
+     * <p>
+     * Pending BPs are tallied separately via {@link #observePending}: they cannot affect the
+     * active-side "WAITING vs ARMED" classification but their presence is still relevant to the
+     * user-facing interpretation, so the count is surfaced alongside an example pending ID.
+     */
+    private final class ChainStuckTally {
+        int chainedWaiting;
+        int unchainedOrArmed;
+        int pendingCount;
+        @Nullable
+        Integer sampleDependentId;
+        @Nullable
+        Integer sampleTriggerId;
+        @Nullable
+        Integer samplePendingId;
+
+        /**
+         * Classifies a single active BP into the chained-waiting vs unchained-or-armed bucket;
+         * {@code enabled} is the current state of the BP's underlying JDI request.
+         */
+        void observe(int bpId, boolean enabled) {
+            final BreakpointTracker.TriggerLink link = breakpointTracker.getDependencyOfDependent(bpId);
+            if (link != null && !enabled) {
+                chainedWaiting++;
+                if (sampleDependentId == null) {
+                    sampleDependentId = bpId;
+                    sampleTriggerId = link.triggerId();
+                }
+            } else {
+                unchainedOrArmed++;
+            }
+        }
+
+        /**
+         * Records a pending BP. Pending entries have no JDI request and therefore cannot be
+         * classified as ARMED — they are always WAITING. The active-side tally is left untouched
+         * so the chain-stuck condition still only fires when every ACTIVE BP is WAITING.
+         */
+        void observePending(int bpId) {
+            pendingCount++;
+            if (samplePendingId == null) {
+                samplePendingId = bpId;
+            }
+        }
     }
 
     @McpTool(description = "Suspend a specific thread by its ID")
@@ -993,13 +1140,19 @@ public class JDWPTools {
         @McpToolParam(description = "Fully qualified class name (e.g. 'com.example.MyClass')") String className,
         @McpToolParam(description = "Line number") int lineNumber,
         @McpToolParam(required = false, description = "Suspend policy: 'all' (default), 'thread', 'none'") @Nullable String suspendPolicy,
-        @McpToolParam(required = false, description = "Optional condition — only suspend when this evaluates to true (e.g., 'i > 100')") @Nullable String condition) {
+        @McpToolParam(required = false, description = "Optional condition — only suspend when this evaluates to true (e.g., 'i > 100')") @Nullable String condition,
+        @McpToolParam(required = false, description = "Optional ID of a trigger breakpoint — this BP stays disarmed until the trigger fires. Sticky by default: once armed it stays so unless re-disarmed via jdwp_disarm_until_trigger or oneShot=true.") @Nullable Integer triggerBreakpointId,
+        @McpToolParam(required = false, description = "If true, re-disarm this BP after each hit so the next trigger fire re-arms it (IntelliJ-style). Default: false (sticky).") @Nullable Boolean oneShot) {
         // Track the pending ID outside the try so the catch can clean it up if locationsOfLine
         // (or any later step) throws after the pending entry has already been registered (Tier 1B).
         Integer pendingIdForCleanup = null;
         try {
             final VirtualMachine vm = jdiService.getVM();
             final EventRequestManager erm = vm.eventRequestManager();
+            if (triggerBreakpointId != null && !breakpointTracker.isKnownBreakpointId(triggerBreakpointId)) {
+                return String.format("Error: Trigger breakpoint #%d does not exist", triggerBreakpointId);
+            }
+            final boolean effectiveOneShot = oneShot != null && oneShot;
 
             int jdiPolicy = EventRequest.SUSPEND_ALL;
             String policyLabel = "all";
@@ -1024,11 +1177,18 @@ public class JDWPTools {
             final ReferenceType eagerType = jdiService.findOrForceLoadClass(className);
             final List<ReferenceType> classes = eagerType != null ? List.of(eagerType) : List.of();
 
+            final String chainInfo = triggerBreakpointId != null
+                ? String.format(", chain: trigger=#%d%s",
+                    triggerBreakpointId, effectiveOneShot ? " (one-shot)" : " (sticky)") : "";
+
             if (classes.isEmpty()) {
                 final int pendingId = breakpointTracker.registerPendingBreakpoint(className, lineNumber, jdiPolicy, policyLabel);
                 pendingIdForCleanup = pendingId;
                 if (condition != null && !condition.isBlank()) {
                     breakpointTracker.setCondition(pendingId, condition);
+                }
+                if (triggerBreakpointId != null) {
+                    breakpointTracker.registerDependency(pendingId, triggerBreakpointId, effectiveOneShot);
                 }
 
                 if (!breakpointTracker.hasClassPrepareRequest(className)) {
@@ -1045,18 +1205,24 @@ public class JDWPTools {
                     final ReferenceType refType = recheck.get(0);
                     final List<Location> locations = refType.locationsOfLine(lineNumber);
                     if (!locations.isEmpty()) {
+                        // Same disable-then-publish ordering as the eager path — do not enable the
+                        // request while it is still being wired up. JDI delivers events the instant
+                        // a request is enabled, so a chained BP enabled before its chain edge is
+                        // registered could fire once unchained on a hot code path.
                         final BreakpointRequest bpRequest = erm.createBreakpointRequest(locations.get(0));
                         bpRequest.setSuspendPolicy(jdiPolicy);
-                        bpRequest.enable();
                         breakpointTracker.promotePendingToActive(pendingId, bpRequest);
-                        return String.format("Breakpoint set at %s:%d (ID: %d, suspend: %s%s)",
-                            className, lineNumber, pendingId, policyLabel, conditionInfo);
+                        if (triggerBreakpointId == null) {
+                            bpRequest.setEnabled(true);
+                        }
+                        return String.format("Breakpoint set at %s:%d (ID: %d, suspend: %s%s%s)",
+                            className, lineNumber, pendingId, policyLabel, conditionInfo, chainInfo);
                     }
                 }
 
-                return String.format("Breakpoint deferred for %s:%d (ID: %d, suspend: %s%s). " +
+                return String.format("Breakpoint deferred for %s:%d (ID: %d, suspend: %s%s%s). " +
                         "Class not yet loaded — will activate automatically when the JVM loads it.",
-                    className, lineNumber, pendingId, policyLabel, conditionInfo);
+                    className, lineNumber, pendingId, policyLabel, conditionInfo, chainInfo);
             }
 
             final ReferenceType refType = classes.get(0);
@@ -1065,17 +1231,28 @@ public class JDWPTools {
                 return String.format("Error: No executable code found at line %d in class %s", lineNumber, className);
             }
 
+            // Leave the request disabled while we register and wire up the chain. JDI delivers
+            // events the instant a request is enabled — enabling first then disabling for a chained
+            // BP opens a window where the BP can fire once before its trigger ever does. JDI
+            // request creation already returns a disabled request; postpone the enable to the very
+            // last step (and only when no chain edge applies).
             final BreakpointRequest bpRequest = erm.createBreakpointRequest(locations.get(0));
             bpRequest.setSuspendPolicy(jdiPolicy);
-            bpRequest.enable();
 
             final int breakpointId = breakpointTracker.registerBreakpoint(bpRequest);
             if (condition != null && !condition.isBlank()) {
                 breakpointTracker.setCondition(breakpointId, condition);
             }
+            if (triggerBreakpointId != null) {
+                breakpointTracker.registerDependency(breakpointId, triggerBreakpointId, effectiveOneShot);
+                // Stays disabled — the chain will arm it when the trigger fires.
+            } else {
+                // No chain: now safe to publish the request to the target VM.
+                bpRequest.setEnabled(true);
+            }
 
-            return String.format("Breakpoint set at %s:%d (ID: %d, suspend: %s%s)",
-                className, lineNumber, breakpointId, policyLabel, conditionInfo);
+            return String.format("Breakpoint set at %s:%d (ID: %d, suspend: %s%s%s)",
+                className, lineNumber, breakpointId, policyLabel, conditionInfo, chainInfo);
         } catch (AbsentInformationException e) {
             cleanupOrphanPendingBreakpoint(pendingIdForCleanup);
             return "Error: No line number information available for this class. Compile with debug info (-g).";
@@ -1224,10 +1401,12 @@ public class JDWPTools {
             // Find and delete matching breakpoint requests (copy list to avoid ConcurrentModificationException)
             final List<BreakpointRequest> breakpoints = new ArrayList<>(erm.breakpointRequests());
             int removed = 0;
+            int chainBreaks = 0;
             for (BreakpointRequest bp : breakpoints) {
                 if (bp.location().equals(location)) {
                     final Integer bpId = breakpointTracker.findIdByRequest(bp);
                     if (bpId != null) {
+                        chainBreaks += cascadeChainBreak(bpId);
                         watcherManager.deleteWatchersForBreakpoint(bpId);
                     }
                     breakpointTracker.unregisterByRequest(bp);
@@ -1241,7 +1420,9 @@ public class JDWPTools {
                     className, lineNumber, exceptionBreakpointHint(className));
             }
 
-            return String.format("Removed %d breakpoint(s) at %s:%d", removed, className, lineNumber);
+            return String.format("Removed %d breakpoint(s) at %s:%d%s",
+                removed, className, lineNumber,
+                chainBreaks > 0 ? String.format(" — %d dependent BP(s) armed (chain broken)", chainBreaks) : "");
         } catch (AbsentInformationException e) {
             return "Error: No line number information available for this class";
         } catch (Exception e) {
@@ -1308,6 +1489,13 @@ public class JDWPTools {
                     if (logExpr != null) {
                         result.append(String.format("  Type: LOGPOINT\n  Expression: %s\n", logExpr));
                     }
+                    final BreakpointTracker.TriggerLink chain = breakpointTracker.getDependencyOfDependent(id);
+                    if (chain != null) {
+                        result.append(String.format("  Chain: trigger=#%d (%s, %s)\n",
+                            chain.triggerId(),
+                            chain.oneShot() ? "one-shot" : "sticky",
+                            bp.isEnabled() ? "ARMED" : "WAITING"));
+                    }
                     result.append('\n');
                 }
             }
@@ -1323,10 +1511,16 @@ public class JDWPTools {
                     result.append(String.format("  Line: %d\n", pb.getLineNumber()));
                     result.append(String.format("  Suspend: %s\n", pb.getSuspendPolicyLabel()));
                     if (pb.getFailureReason() != null) {
-                        result.append(String.format("  Status: FAILED (%s)\n\n", pb.getFailureReason()));
+                        result.append(String.format("  Status: FAILED (%s)\n", pb.getFailureReason()));
                     } else {
-                        result.append("  Status: PENDING (class not yet loaded)\n\n");
+                        result.append("  Status: PENDING (class not yet loaded)\n");
                     }
+                    final BreakpointTracker.TriggerLink chain = breakpointTracker.getDependencyOfDependent(id);
+                    if (chain != null) {
+                        result.append(String.format("  Chain: trigger=#%d (%s)\n",
+                            chain.triggerId(), chain.oneShot() ? "one-shot" : "sticky"));
+                    }
+                    result.append('\n');
                 }
             }
 
@@ -1339,8 +1533,28 @@ public class JDWPTools {
     @McpTool(description = "Clear a specific breakpoint by its ID (from jdwp_list_breakpoints)")
     public String jdwp_clear_breakpoint_by_id(@McpToolParam(description = "Breakpoint ID to clear") int breakpointId) {
         try {
+            // Validate the ID kind BEFORE running cascadeChainBreak. The cascade detaches every
+            // dependent that was waiting on `breakpointId` and arms them unconditionally — running
+            // it for an exception-BP ID or a wholly unknown ID would silently demolish a chain the
+            // user did not intend to touch.
+            final boolean isLineBp = breakpointTracker.getBreakpoint(breakpointId) != null
+                || breakpointTracker.getPendingBreakpoint(breakpointId) != null;
+            if (!isLineBp) {
+                // Distinguish "wrong kind" from "unknown" so the user gets actionable guidance.
+                if (breakpointTracker.isKnownBreakpointId(breakpointId)) {
+                    return String.format("Breakpoint %d is an exception breakpoint — use "
+                        + "jdwp_clear_exception_breakpoint to remove it", breakpointId);
+                }
+                return String.format("Breakpoint %d not found", breakpointId);
+            }
+
+            // Safe to cascade: the ID is a real line BP / pending line BP. Cascading first keeps
+            // the CHAIN_BROKEN events ordered before the removal confirmation.
+            final int detached = cascadeChainBreak(breakpointId);
             final boolean removed = breakpointTracker.removeBreakpoint(breakpointId);
             if (!removed) {
+                // Defensive: should not happen given the pre-check, but handle the race where
+                // another thread removed the BP between the check and the removal.
                 return String.format("Breakpoint %d not found", breakpointId);
             }
 
@@ -1349,7 +1563,136 @@ public class JDWPTools {
             if (watchersRemoved > 0) {
                 msg += String.format(" (%d associated watcher(s) also removed)", watchersRemoved);
             }
+            if (detached > 0) {
+                msg += String.format(" — %d dependent BP(s) armed (chain broken)", detached);
+            }
             return msg;
+        } catch (Exception e) {
+            return "Error: " + e.getMessage();
+        }
+    }
+
+    /**
+     * Detaches every dependent that was waiting on {@code removedTriggerId}, arms them when
+     * possible, and emits one {@code CHAIN_BROKEN} event per detached edge. Called from the
+     * BP-removal code paths so the dependent BPs collapse back to plain (unconditional) BPs when
+     * their trigger goes away — the BP itself is the user's primary intent, and the chain was a
+     * refinement on top.
+     * <p>
+     * The {@code CHAIN_BROKEN} summary distinguishes the active and pending cases: an active
+     * dependent is armed immediately; a pending dependent has no JDI request yet, so the arming
+     * applies when its class loads. Using the same wording for both is misleading because "armed
+     * unconditionally" implies an action that did not occur for the pending entries.
+     *
+     * @return number of dependent BPs that were detached
+     */
+    private int cascadeChainBreak(int removedTriggerId) {
+        final Set<Integer> dependents = breakpointTracker.clearDependentsOfTrigger(removedTriggerId);
+        for (Integer depId : dependents) {
+            final EventRequest depReq = breakpointTracker.getEventRequestById(depId);
+            if (depReq != null) {
+                try {
+                    depReq.setEnabled(true);
+                } catch (Exception e) {
+                    // Best-effort — dependent may be in a torn state; CHAIN_BROKEN still records the detach.
+                    log.debug("[JDWPTools] Failed to arm dependent BP #{}: {}", depId, e.getMessage());
+                }
+            }
+            // Record CHAIN_BROKEN per dependent (not per trigger) so the user sees which BPs
+            // lost their guard. Pending dependents get a different message because they have no
+            // JDI request to "arm" — the arming applies on the eventual pending → active promotion.
+            final String summary = depReq != null
+                ? String.format("BP #%d trigger (#%d) was removed — dependent armed unconditionally",
+                    depId, removedTriggerId)
+                : String.format("BP #%d trigger (#%d) was removed — dependent still pending; "
+                        + "will come up armed when its class loads",
+                    depId, removedTriggerId);
+            eventHistory.record(new EventHistory.DebugEvent("CHAIN_BROKEN",
+                summary,
+                Map.of("breakpointId", String.valueOf(depId),
+                    "triggerId", String.valueOf(removedTriggerId))));
+        }
+        return dependents.size();
+    }
+
+    @McpTool(description = "Make breakpoint <dependentId> only fire after breakpoint <triggerId> has fired. The dependent is disabled immediately. Sticky by default: it stays armed forever after the first trigger fire. With oneShot=true the dependent re-disarms after each hit so the next trigger fire re-arms it.")
+    public String jdwp_set_breakpoint_dependency(
+        @McpToolParam(description = "ID of the BP that will be controlled by the trigger") int dependentId,
+        @McpToolParam(description = "ID of the BP whose hit arms the dependent") int triggerId,
+        @McpToolParam(required = false, description = "If true, re-disarm after each hit (default false = sticky).") @Nullable Boolean oneShot) {
+        try {
+            if (dependentId == triggerId) {
+                return "Error: A breakpoint cannot be its own trigger";
+            }
+            if (!breakpointTracker.isKnownBreakpointId(dependentId)) {
+                return String.format("Error: Dependent breakpoint #%d does not exist", dependentId);
+            }
+            if (!breakpointTracker.isKnownBreakpointId(triggerId)) {
+                return String.format("Error: Trigger breakpoint #%d does not exist", triggerId);
+            }
+            final EventRequest depReq = breakpointTracker.getEventRequestById(dependentId);
+
+            final boolean effectiveOneShot = oneShot != null && oneShot;
+            try {
+                breakpointTracker.registerDependency(dependentId, triggerId, effectiveOneShot);
+            } catch (BreakpointTracker.ChainRegistrationException cre) {
+                // Atomic re-validation inside registerDependency caught either a concurrent trigger
+                // removal or a would-be cycle. Surface a focused error message instead of the
+                // generic catch-all branch below.
+                return "Error: " + cre.getMessage();
+            }
+            if (depReq != null) {
+                depReq.setEnabled(false);
+            }
+            return String.format("BP #%d is now chained to trigger BP #%d (%s). %s",
+                dependentId, triggerId,
+                effectiveOneShot ? "one-shot" : "sticky",
+                depReq != null
+                    ? "Disarmed — will arm when trigger fires."
+                    : "Dependent is still pending; will come up disarmed when its class loads.");
+        } catch (Exception e) {
+            return "Error: " + e.getMessage();
+        }
+    }
+
+    @McpTool(description = "Clear a chain dependency — the breakpoint becomes always-active again. Does NOT change its enabled state; if the BP was disarmed waiting on the trigger you may also want to call jdwp_resume_until_event after this clears.")
+    public String jdwp_clear_breakpoint_dependency(@McpToolParam(description = "Dependent breakpoint ID") int dependentId) {
+        try {
+            final BreakpointTracker.TriggerLink previous = breakpointTracker.clearDependency(dependentId);
+            if (previous == null) {
+                return String.format("BP #%d has no chain dependency", dependentId);
+            }
+            final EventRequest depReq = breakpointTracker.getEventRequestById(dependentId);
+            if (depReq != null) {
+                try {
+                    // Auto-re-arm on detach — once the chain is cleared, the BP collapses back to
+                    // a plain BP, which is always-armed.
+                    depReq.setEnabled(true);
+                } catch (Exception e) {
+                    // Best-effort — caller can re-set enabled later if needed.
+                }
+            }
+            return String.format("BP #%d chain to trigger #%d cleared; BP is now armed independently.",
+                dependentId, previous.triggerId());
+        } catch (Exception e) {
+            return "Error: " + e.getMessage();
+        }
+    }
+
+    @McpTool(description = "Re-engage the chain after a sticky dependent has fired: disable the dependent BP again so its trigger must fire before it becomes active. Use this when you want to catch the flow fresh again without rebuilding the chain. No-op if the BP has no chain.")
+    public String jdwp_disarm_until_trigger(@McpToolParam(description = "Dependent breakpoint ID to re-disarm") int dependentId) {
+        try {
+            final BreakpointTracker.TriggerLink link = breakpointTracker.getDependencyOfDependent(dependentId);
+            if (link == null) {
+                return String.format("BP #%d has no chain — there is no trigger to wait on. Use jdwp_set_breakpoint_dependency first.", dependentId);
+            }
+            final EventRequest depReq = breakpointTracker.getEventRequestById(dependentId);
+            if (depReq == null) {
+                return String.format("BP #%d is still pending (class not loaded); it will come up disarmed when promoted.", dependentId);
+            }
+            depReq.setEnabled(false);
+            return String.format("BP #%d re-disarmed; waiting on trigger BP #%d to fire again.",
+                dependentId, link.triggerId());
         } catch (Exception e) {
             return "Error: " + e.getMessage();
         }
@@ -1415,7 +1758,9 @@ public class JDWPTools {
         @McpToolParam(required = false, description = "Break on caught exceptions (default: true)") @Nullable Boolean caught,
         @McpToolParam(required = false, description = "Break on uncaught exceptions (default: true)") @Nullable Boolean uncaught,
         @McpToolParam(required = false, description = "If true, record an EXCEPTION_LOG event and auto-resume instead of suspending. Implied true when expression is supplied. Default: false.") @Nullable Boolean logOnly,
-        @McpToolParam(required = false, description = "Optional expression evaluated on each hit; the result is attached to the EXCEPTION_LOG event. Use $exception to refer to the thrown object. Implies logOnly=true.") @Nullable String expression) {
+        @McpToolParam(required = false, description = "Optional expression evaluated on each hit; the result is attached to the EXCEPTION_LOG event. Use $exception to refer to the thrown object. Implies logOnly=true.") @Nullable String expression,
+        @McpToolParam(required = false, description = "Optional ID of a trigger breakpoint — this exception BP stays disarmed until the trigger fires. Sticky by default.") @Nullable Integer triggerBreakpointId,
+        @McpToolParam(required = false, description = "If true, re-disarm this BP after each hit so the next trigger fire re-arms it. Default: false (sticky).") @Nullable Boolean oneShot) {
         try {
             if (caught == null) {
                 caught = true;
@@ -1423,6 +1768,13 @@ public class JDWPTools {
             if (uncaught == null) {
                 uncaught = true;
             }
+            if (triggerBreakpointId != null && !breakpointTracker.isKnownBreakpointId(triggerBreakpointId)) {
+                return String.format("Error: Trigger breakpoint #%d does not exist", triggerBreakpointId);
+            }
+            final boolean effectiveOneShot = oneShot != null && oneShot;
+            final String chainInfo = triggerBreakpointId != null
+                ? String.format("\n  Chain: trigger=#%d%s",
+                    triggerBreakpointId, effectiveOneShot ? " (one-shot)" : " (sticky)") : "";
             final String normalisedExpression = (expression == null || expression.isBlank()) ? null : expression;
             // An expression always implies logOnly — without auto-resume, evaluating it would be
             // redundant (the user could just set a normal BP and inspect manually).
@@ -1440,6 +1792,9 @@ public class JDWPTools {
             if (eagerType == null) {
                 // Class not loadable yet — defer
                 final int pendingId = breakpointTracker.registerPendingExceptionBreakpoint(spec);
+                if (triggerBreakpointId != null) {
+                    breakpointTracker.registerDependency(pendingId, triggerBreakpointId, effectiveOneShot);
+                }
 
                 if (!breakpointTracker.hasClassPrepareRequest(exceptionClass)) {
                     final ClassPrepareRequest cpr = erm.createClassPrepareRequest();
@@ -1454,25 +1809,36 @@ public class JDWPTools {
                           Exception: %s
                           Caught: %s
                           Uncaught: %s
-                          Mode: %s%s
+                          Mode: %s%s%s
                         Class not yet loaded — will activate automatically when the JVM loads it.""",
                     pendingId, exceptionClass, caught, uncaught,
                     effectiveLogOnly ? "log-only" : "suspend",
-                    normalisedExpression != null ? "\n  Expression: " + normalisedExpression : "");
+                    normalisedExpression != null ? "\n  Expression: " + normalisedExpression : "",
+                    chainInfo);
             }
 
+            // Create the exception request DISABLED, finish wiring it up (including the chain
+            // edge), and only enable as the very last step. JDI delivers events the instant a
+            // request is enabled; enabling-then-disabling a chained BP opens a window where an
+            // exception could fire and bypass the chain.
             final ExceptionRequest exReq = erm.createExceptionRequest(eagerType, caught, uncaught);
             // Always SUSPEND_EVENT_THREAD; logOnly BPs are auto-resumed by JdiEventListener after
             // recording / expression evaluation (invokeMethod requires the firing thread suspended).
             exReq.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
-            exReq.enable();
 
             final int id = breakpointTracker.registerExceptionBreakpoint(exReq, spec);
+            if (triggerBreakpointId != null) {
+                breakpointTracker.registerDependency(id, triggerBreakpointId, effectiveOneShot);
+                // Stays disabled — the chain will arm it when the trigger fires.
+            } else {
+                exReq.setEnabled(true);
+            }
 
-            return String.format("Exception breakpoint set (ID: %d)\n  Exception: %s\n  Caught: %s\n  Uncaught: %s\n  Mode: %s%s",
+            return String.format("Exception breakpoint set (ID: %d)\n  Exception: %s\n  Caught: %s\n  Uncaught: %s\n  Mode: %s%s%s",
                 id, exceptionClass, caught, uncaught,
                 effectiveLogOnly ? "log-only" : "suspend",
-                normalisedExpression != null ? "\n  Expression: " + normalisedExpression : "");
+                normalisedExpression != null ? "\n  Expression: " + normalisedExpression : "",
+                chainInfo);
         } catch (Exception e) {
             return "Error: " + e.getMessage();
         }
@@ -1481,11 +1847,13 @@ public class JDWPTools {
     @McpTool(description = "Remove an exception breakpoint by its ID")
     public String jdwp_clear_exception_breakpoint(@McpToolParam(description = "Exception breakpoint ID") int breakpointId) {
         try {
+            final int chainBreaks = cascadeChainBreak(breakpointId);
             final boolean removed = breakpointTracker.removeExceptionBreakpoint(breakpointId);
             if (!removed) {
                 return String.format("Exception breakpoint %d not found", breakpointId);
             }
-            return String.format("Exception breakpoint %d cleared", breakpointId);
+            return String.format("Exception breakpoint %d cleared%s", breakpointId,
+                chainBreaks > 0 ? String.format(" — %d dependent BP(s) armed (chain broken)", chainBreaks) : "");
         } catch (Exception e) {
             return "Error: " + e.getMessage();
         }
@@ -1507,11 +1875,18 @@ public class JDWPTools {
             if (!active.isEmpty()) {
                 result.append(String.format("Active exception breakpoints: %d\n\n", active.size()));
                 for (Map.Entry<Integer, BreakpointTracker.ExceptionBreakpointInfo> entry : active.entrySet()) {
+                    final int id = entry.getKey();
                     final BreakpointTracker.ExceptionBreakpointInfo info = entry.getValue();
-                    result.append(String.format("%d. (ID: %d) %s — caught: %s, uncaught: %s, mode: %s%s\n",
-                        i++, entry.getKey(), info.getExceptionClass(), info.isCaught(), info.isUncaught(),
+                    final BreakpointTracker.TriggerLink chain = breakpointTracker.getDependencyOfDependent(id);
+                    final String chainInfo = chain != null
+                        ? String.format(", chain=#%d (%s, %s)", chain.triggerId(),
+                            chain.oneShot() ? "one-shot" : "sticky",
+                            info.getRequest().isEnabled() ? "ARMED" : "WAITING") : "";
+                    result.append(String.format("%d. (ID: %d) %s — caught: %s, uncaught: %s, mode: %s%s%s\n",
+                        i++, id, info.getExceptionClass(), info.isCaught(), info.isUncaught(),
                         info.isLogOnly() ? "log-only" : "suspend",
-                        info.getExpression() != null ? ", expression: " + info.getExpression() : ""));
+                        info.getExpression() != null ? ", expression: " + info.getExpression() : "",
+                        chainInfo));
                 }
             }
 
@@ -1521,13 +1896,19 @@ public class JDWPTools {
                 }
                 result.append(String.format("Pending exception breakpoints: %d\n\n", pending.size()));
                 for (Map.Entry<Integer, BreakpointTracker.PendingExceptionBreakpoint> entry : pending.entrySet()) {
+                    final int id = entry.getKey();
                     final BreakpointTracker.PendingExceptionBreakpoint pb = entry.getValue();
                     final String status = pb.getFailureReason() != null
                         ? " [FAILED: " + pb.getFailureReason() + ']' : " [PENDING]";
-                    result.append(String.format("%d. (ID: %d) %s — caught: %s, uncaught: %s, mode: %s%s%s\n",
-                        i++, entry.getKey(), pb.getExceptionClass(), pb.isCaught(), pb.isUncaught(),
+                    final BreakpointTracker.TriggerLink chain = breakpointTracker.getDependencyOfDependent(id);
+                    final String chainInfo = chain != null
+                        ? String.format(", chain=#%d (%s)", chain.triggerId(),
+                            chain.oneShot() ? "one-shot" : "sticky") : "";
+                    result.append(String.format("%d. (ID: %d) %s — caught: %s, uncaught: %s, mode: %s%s%s%s\n",
+                        i++, id, pb.getExceptionClass(), pb.isCaught(), pb.isUncaught(),
                         pb.isLogOnly() ? "log-only" : "suspend",
                         pb.getExpression() != null ? ", expression: " + pb.getExpression() : "",
+                        chainInfo,
                         status));
                 }
             }
@@ -1549,7 +1930,7 @@ public class JDWPTools {
 
         // VM-dependent path first: try to delete the live JDI requests via the EventRequestManager.
         // If the VM is unreachable (external disconnect, crash) we fall back to a pure in-memory
-        // reset so the server-local state still gets cleared (FINDING-10).
+        // reset so the server-local state still gets cleared.
         boolean vmCleared = false;
         try {
             final VirtualMachine vm = jdiService.getVM();

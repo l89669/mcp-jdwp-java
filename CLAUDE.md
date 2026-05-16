@@ -5,18 +5,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build Commands
 
 ```bash
-# Run from /workspace (the reactor root). Builds both modules.
-mvn compile                                    # Compile only
-mvn clean package -DskipTests                  # Full build (produces jdwp-mcp-server/target/mcp-jdwp-java.jar)
+# Run from the reactor root. Builds both modules.
+# Prefer ./mvnw (the bundled Maven Wrapper) — it pins the Maven version and
+# does not require Maven to be installed system-wide. Plain `mvn` works too
+# if it is on PATH.
+./mvnw compile                                    # Compile only
+./mvnw clean package -DskipTests                  # Full build (produces jdwp-mcp-server/target/mcp-jdwp-java.jar)
 
 # Build only the MCP server (skips the sandbox module entirely):
-mvn -pl jdwp-mcp-server -am clean package -DskipTests
+./mvnw -pl jdwp-mcp-server -am clean package -DskipTests
 ```
 
 The repository is a 2-module Maven reactor:
 
-- **`jdwp-mcp-server/`** — the real MCP server. Contains all genuine unit tests; `mvn -pl jdwp-mcp-server test` runs them.
-- **`jdwp-sandbox/`** — deliberately broken Java classes used as JDWP debugging targets ("test flights"). Sandbox tests are expected-to-fail by design and are **skipped by default** so a normal `mvn test` stays green. Run them explicitly during a test flight with: `mvn -pl jdwp-sandbox test -DskipTests=false`.
+- **`jdwp-mcp-server/`** — the real MCP server. Contains all genuine unit tests; `./mvnw -pl jdwp-mcp-server test` runs them.
+- **`jdwp-sandbox/`** — deliberately broken Java classes used as JDWP debugging targets ("test flights"). Sandbox tests are expected-to-fail by design and are **skipped by default** so a normal `./mvnw test` stays green. Run them explicitly during a test flight with: `./mvnw -pl jdwp-sandbox test -DskipTests=false`.
 
 The compiler requires `--add-modules jdk.jdi` (configured in `jdwp-mcp-server/pom.xml`). At runtime, the JAR must also be launched with `--add-modules jdk.jdi`.
 
@@ -53,7 +56,7 @@ Watchers are MCP-side only — they store expressions that get evaluated via the
 
 ### Nullness
 
-`jdwp-mcp-server` is `@NullMarked` at the package level — every type, field, parameter and return in the module is **non-null by default**. The small number of legitimately nullable slots are annotated with `org.jspecify.annotations.Nullable`. The convention is enforced at compile time by NullAway running as an Error Prone plugin in `maven-compiler-plugin` (see `jdwp-mcp-server/pom.xml`); a `mvn -pl jdwp-mcp-server compile` that emits any `[NullAway]` diagnostic fails the build.
+`jdwp-mcp-server` is `@NullMarked` at the package level — every type, field, parameter and return in the module is **non-null by default**. The small number of legitimately nullable slots are annotated with `org.jspecify.annotations.Nullable`. The convention is enforced at compile time by NullAway running as an Error Prone plugin in `maven-compiler-plugin` (see `jdwp-mcp-server/pom.xml`); a `./mvnw -pl jdwp-mcp-server compile` that emits any `[NullAway]` diagnostic fails the build.
 
 When adding new code, do not introduce un-annotated nullable slots — if a value can legitimately be null, annotate the declaration with `@Nullable` from `org.jspecify.annotations`. `jdwp-sandbox` is intentionally unmarked: its classes are deliberately broken debugging targets and annotations there would muddy the exercises.
 

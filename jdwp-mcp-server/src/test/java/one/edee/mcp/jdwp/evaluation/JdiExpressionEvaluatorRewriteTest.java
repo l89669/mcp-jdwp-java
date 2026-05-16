@@ -317,7 +317,9 @@ class JdiExpressionEvaluatorRewriteTest {
 	@Test
 	@DisplayName("rewriteThisKeyword: does NOT rewrite `this` inside a string literal")
 	void shouldNotRewriteThisInsideStringLiteral() {
-		// FINDING: simplifier flagged the original naive `replaceAll` as corrupting this case.
+		// Guards against a regression where a naive `replaceAll` would rewrite the `this`
+		// substring inside the string literal. The token-aware rewrite must leave string contents
+		// alone and only rewrite `this` outside string boundaries.
 		String result = JdiExpressionEvaluator.rewriteThisKeyword("\"this is a test\" + this");
 
 		assertThat(result).isEqualTo("\"this is a test\" + _this");

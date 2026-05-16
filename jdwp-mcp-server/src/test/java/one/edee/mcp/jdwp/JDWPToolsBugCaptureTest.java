@@ -18,7 +18,6 @@ import org.junit.jupiter.api.Test;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
@@ -50,13 +49,13 @@ class JDWPToolsBugCaptureTest {
 	}
 
 	/**
-	 * FINDING-5: passing a length-1 input of just {@code "} must NOT crash with a
+	 * Passing a length-1 input of just {@code "} must NOT crash with a
 	 * {@link StringIndexOutOfBoundsException}. The strip-quotes branch must guard on
 	 * {@code value.length() >= 2} so an unbalanced single quote falls through unchanged.
 	 * The resulting value is mirrored verbatim and the call succeeds.
 	 */
 	@Test
-	void shouldCrashOnSingleQuoteWhenSettingStringLocal_FINDING_5() throws Exception {
+	void shouldHandleSingleQuoteStringWithoutCrashing() throws Exception {
 		VirtualMachine vm = mock(VirtualMachine.class);
 		ThreadReference thread = mock(ThreadReference.class);
 		StackFrame frame = mock(StackFrame.class);
@@ -81,12 +80,12 @@ class JDWPToolsBugCaptureTest {
 	}
 
 	/**
-	 * FINDING-10: when {@code jdiService.getVM()} throws (e.g. external VM disconnect),
-	 * {@code jdwp_reset} must still clear all server-local state (watchers, object cache,
-	 * event history, breakpoint tracker) so a subsequent reconnect starts from a clean slate.
+	 * When {@code jdiService.getVM()} throws (e.g. external VM disconnect), {@code jdwp_reset}
+	 * must still clear all server-local state (watchers, object cache, event history, breakpoint
+	 * tracker) so a subsequent reconnect starts from a clean slate.
 	 */
 	@Test
-	void shouldSilentlyDropWatcherAndCacheClearsWhenGetVmThrows_FINDING_10() throws Exception {
+	void shouldClearServerLocalStateWhenJdiVmFails() throws Exception {
 		when(jdiService.getVM()).thenThrow(new Exception("Not connected"));
 
 		String result = tools.jdwp_reset();
@@ -124,7 +123,7 @@ class JDWPToolsBugCaptureTest {
 		when(breakpointTracker.registerPendingBreakpoint(anyString(), anyInt(), anyInt(), anyString()))
 			.thenReturn(99);
 
-		String result = tools.jdwp_set_breakpoint("com.example.MyClass", 42, "all", null);
+		String result = tools.jdwp_set_breakpoint("com.example.MyClass", 42, "all", null, null, null);
 
 		// User-facing error message preserved
 		assertThat(result).startsWith("Error:");

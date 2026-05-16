@@ -235,24 +235,24 @@ class JDIConnectionServiceFormatValueTest {
 		}
 
 		/**
-		 * FINDING-11: {@code LinkedHashSet} must be in the smart-view allow-list so its elements
-		 * render via the same path as the other Set types — once FINDING-3 is fixed the routing
-		 * to {@link JDIConnectionService#getSetElements(ObjectReference, int)} works correctly.
+		 * {@code LinkedHashSet} must be in the smart-view allow-list so its elements render via
+		 * the same path as the other Set types — the dispatch routes it to
+		 * {@link JDIConnectionService#getSetElements(ObjectReference, int)}.
 		 */
 		@Test
-		void shouldNotRecogniseLinkedHashSet_FINDING_11() throws Exception {
+		void shouldRecogniseLinkedHashSet() throws Exception {
 			assertThat(invokeIsCollection("java.util.LinkedHashSet")).isTrue();
 		}
 
 		/**
-		 * FINDING-13: the {@code getCollectionView} dispatch must not route by substring match. A
-		 * future addition like {@code ConcurrentSkipListMap} contains both "List" and "Map" — the
+		 * The {@code getCollectionView} dispatch must not route by substring match. A future
+		 * addition like {@code ConcurrentSkipListMap} contains both "List" and "Map" — the
 		 * dispatch must reject types not on the allow-list rather than falling through to the
 		 * wrong branch. {@code ConcurrentSkipListMap} should remain {@code false} for
 		 * {@code isCollection} (and thus unreachable from the dispatch entirely).
 		 */
 		@Test
-		void shouldNotRecogniseConcurrentSkipListMap_FINDING_13() throws Exception {
+		void shouldNotRecogniseConcurrentSkipListMap() throws Exception {
 			assertThat(invokeIsCollection("java.util.concurrent.ConcurrentSkipListMap")).isFalse();
 		}
 
