@@ -48,10 +48,12 @@ Every debug session follows this sequence:
 1. **Launch the target** in a separate shell with `suspend=y` — *or skip this step if the JVM is already running with JDWP open*. The JVM blocks until step 2.
 2. **Attach:** `jdwp_wait_for_attach()` defaults to `localhost:5005`. For any other port — and crucially for already-running services — pass it explicitly: `jdwp_wait_for_attach(port=8003)`. Polls until the JVM is listening, then attaches.
 3. **Set breakpoints** at suspected bug locations: `jdwp_set_breakpoint(className, lineNumber)`. Add exception breakpoints or logpoints as needed.
-4. **Resume and wait:** `jdwp_resume_until_event()` — releases the JVM and BLOCKS until the next BP/step/exception fires. Returns the suspended thread info.
+4. **Resume and wait:** `jdwp_resume_until_event()` — releases the JVM and BLOCKS until the next BP/step/exception fires (30s default). Returns the suspended thread info.
 5. **Inspect in one call:** `jdwp_get_breakpoint_context()` — returns thread, top frames, locals (incl. `this`), and `this` field dump.
 6. **Form a hypothesis,** test it: step through, `jdwp_assert_expression(...)` to check invariants, `jdwp_set_local`/`jdwp_set_field` to mutate state and ask "would the test pass if X were Y?"
 7. **Resume to next event** (`jdwp_resume_until_event`) or **disconnect** when done. For sequential scenarios against the same target, use `jdwp_reset` between flights to clear state without dropping the connection.
+
+**On `[TIMEOUT]`:** the response includes a structured diagnostic — *read it*. If your breakpoints are `PENDING` (target class not loaded), the code path is not executing and a larger timeout will not help — verify the entry point or class name. If a pending BP shows `[FAILED]`, the line/class is invalid. If recent events show `LOGPOINT` or `BREAKPOINT_SUPPRESSED` hits, your BP *is* firing but auto-resuming (logpoint or false condition). Do **not** blindly retry with a bigger timeout. Call `jdwp_diagnose()` any time for the same snapshot without resuming — useful as a sanity check before waiting on a long path.
 
 For follow-up investigations against the same target: `jdwp_reset` + new breakpoints, no need to reconnect.
 

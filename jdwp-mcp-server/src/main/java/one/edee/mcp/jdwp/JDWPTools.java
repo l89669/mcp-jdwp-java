@@ -662,9 +662,7 @@ public class JDWPTools {
 
             final boolean fired = latch.await(deadlineMs, TimeUnit.MILLISECONDS);
             if (!fired) {
-                return String.format("[TIMEOUT] No event fired within %dms after resume.\n" +
-                    "The VM is still running. You can call jdwp_resume_until_event again with a larger timeout, " +
-                    "or use jdwp_get_threads to see live thread state.", deadlineMs);
+                return buildDiagnosticReport(true, deadlineMs);
             }
 
             final BreakpointTracker.LastBreakpoint snapshot = breakpointTracker.getLastBreakpoint();
@@ -683,6 +681,150 @@ public class JDWPTools {
         } catch (Exception e) {
             return "Error: " + e.getMessage();
         }
+    }
+
+    @McpTool(description = "Read-only snapshot of debugger state: active vs pending breakpoints, recent events, last suspending event, and an interpretation hint. Use BEFORE waiting on a long jdwp_resume_until_event to verify breakpoints are actually armed (not pending), and after a [TIMEOUT] to understand why nothing fired. Does not resume or suspend anything.")
+    public String jdwp_diagnose() {
+        try {
+            return buildDiagnosticReport(false, null);
+        } catch (Exception e) {
+            return "Error: " + e.getMessage();
+        }
+    }
+
+    /**
+     * Builds a structured snapshot of breakpoint state and recent JDI events with an interpretation
+     * line, used by both {@link #jdwp_resume_until_event} on timeout and the standalone
+     * {@link #jdwp_diagnose} tool. The interpretation is the actionable part — it tells the caller
+     * whether retrying is pointless (pending BPs, failed bindings) or whether the BP is firing but
+     * auto-resuming (logpoints, false conditions).
+     */
+    private String buildDiagnosticReport(boolean afterTimeout, @Nullable Integer waitedMs) {
+        final Map<Integer, BreakpointRequest> activeLineBps = breakpointTracker.getAllBreakpoints();
+        final Map<Integer, BreakpointTracker.PendingBreakpoint> pendingLineBps =
+            breakpointTracker.getAllPendingBreakpoints();
+        final Map<Integer, BreakpointTracker.ExceptionBreakpointInfo> activeExBps =
+            breakpointTracker.getAllExceptionBreakpoints();
+        final Map<Integer, BreakpointTracker.PendingExceptionBreakpoint> pendingExBps =
+            breakpointTracker.getAllPendingExceptionBreakpoints();
+        final List<EventHistory.DebugEvent> recent = eventHistory.getRecent(10);
+        final BreakpointTracker.LastBreakpoint last = breakpointTracker.getLastBreakpoint();
+
+        final StringBuilder out = new StringBuilder();
+        if (afterTimeout) {
+            out.append(String.format("[TIMEOUT] No suspending event fired within %dms.%n%n", waitedMs));
+        } else {
+            out.append("[DIAGNOSTIC] Current debugger state:\n\n");
+        }
+
+        out.append(String.format("Active line breakpoints: %d%n", activeLineBps.size()));
+        for (Map.Entry<Integer, BreakpointRequest> e : activeLineBps.entrySet()) {
+            final Location loc = e.getValue().location();
+            out.append(String.format("  - #%d %s:%d%n",
+                e.getKey(), loc.declaringType().name(), loc.lineNumber()));
+        }
+
+        out.append(String.format("Pending line breakpoints: %d  (class not yet loaded)%n", pendingLineBps.size()));
+        for (Map.Entry<Integer, BreakpointTracker.PendingBreakpoint> e : pendingLineBps.entrySet()) {
+            final BreakpointTracker.PendingBreakpoint pb = e.getValue();
+            final String reason = pb.getFailureReason() != null
+                ? "  [FAILED: " + pb.getFailureReason() + ']' : "";
+            out.append(
+                String.format("  - #%d %s:%d%s%n",
+                e.getKey(), pb.getClassName(), pb.getLineNumber(), reason)
+            );
+        }
+
+        out.append(String.format("Active exception breakpoints: %d%n", activeExBps.size()));
+        for (Map.Entry<Integer, BreakpointTracker.ExceptionBreakpointInfo> e : activeExBps.entrySet()) {
+            out.append(String.format("  - #%d %s%s%n",
+                e.getKey(), e.getValue().getExceptionClass(),
+                e.getValue().isLogOnly() ? " (logOnly)" : ""));
+        }
+
+        out.append(String.format("Pending exception breakpoints: %d%n", pendingExBps.size()));
+        for (Map.Entry<Integer, BreakpointTracker.PendingExceptionBreakpoint> e : pendingExBps.entrySet()) {
+            final BreakpointTracker.PendingExceptionBreakpoint pb = e.getValue();
+            final String reason = pb.getFailureReason() != null
+                ? "  [FAILED: " + pb.getFailureReason() + ']' : "";
+            out.append(String.format("  - #%d %s%s%n",
+                e.getKey(), pb.getExceptionClass(), reason));
+        }
+
+        out.append("\nLast suspending event: ");
+        if (last == null) {
+            out.append("never\n");
+        } else {
+            out.append(String.format("thread %s (id=%d), bp=%s%n",
+                last.thread().name(), last.thread().uniqueID(), String.valueOf(last.id())));
+        }
+
+        out.append(String.format("%nRecent events (last %d):%n", recent.size()));
+        if (recent.isEmpty()) {
+            out.append("  (none — no JDI events have fired since attach/reset)\n");
+        } else {
+            for (EventHistory.DebugEvent ev : recent) {
+                out.append(String.format("  [%s] %s (%s)%n",
+                    ev.type(), ev.summary(), ev.timestamp().toString().substring(11, 23)));
+            }
+        }
+
+        out.append("\nINTERPRETATION: ")
+            .append(interpretDiagnostic(activeLineBps, pendingLineBps, activeExBps, pendingExBps, recent, last == null));
+        return out.toString();
+    }
+
+    /**
+     * Picks the most actionable one-liner from the diagnostic state. The aim is to keep the caller
+     * (typically an LLM) from blindly retrying {@code jdwp_resume_until_event} with a larger timeout
+     * when the real problem is a wrong class name, an unloaded class, or breakpoints that are firing
+     * but auto-resuming.
+     */
+    private static String interpretDiagnostic(
+        Map<Integer, BreakpointRequest> activeLine,
+        Map<Integer, BreakpointTracker.PendingBreakpoint> pendingLine,
+        Map<Integer, BreakpointTracker.ExceptionBreakpointInfo> activeEx,
+        Map<Integer, BreakpointTracker.PendingExceptionBreakpoint> pendingEx,
+        List<EventHistory.DebugEvent> recent,
+        boolean noPriorSuspendingEvent
+    ) {
+        final int activeCount = activeLine.size() + activeEx.size();
+        final int pendingCount = pendingLine.size() + pendingEx.size();
+        final boolean anyFailedPending =
+            pendingLine.values().stream().anyMatch(p -> p.getFailureReason() != null)
+                || pendingEx.values().stream().anyMatch(p -> p.getFailureReason() != null);
+
+        if (activeCount == 0 && pendingCount == 0) {
+            return "No breakpoints are armed. Set one with jdwp_set_breakpoint or "
+                + "jdwp_set_exception_breakpoint before waiting again.";
+        }
+        if (anyFailedPending) {
+            return "One or more pending breakpoints FAILED to bind (see [FAILED] entries above). "
+                + "Fix the class name or line number — retrying with a larger timeout will not help.";
+        }
+        if (activeCount == 0 && pendingCount > 0) {
+            return "All your breakpoints are PENDING — their target classes have not been loaded by "
+                + "the target JVM since attach. The code path you are watching is not executing. "
+                + "Verify the class name and that the entry point you expected to run has actually "
+                + "been invoked. Do NOT retry with a larger timeout; the BP will never fire until "
+                + "the class loads.";
+        }
+        final boolean autoResumedHits = recent.stream().anyMatch(e ->
+            "LOGPOINT".equals(e.type()) || "BREAKPOINT_SUPPRESSED".equals(e.type())
+                || "EXCEPTION_LOG".equals(e.type()) || "EXCEPTION_SUPPRESSED".equals(e.type()));
+        if (autoResumedHits) {
+            return "Breakpoints ARE firing but auto-resuming (logpoint, log-only exception, or "
+                + "condition evaluated to false). If you want execution to stop, remove the "
+                + "condition or switch to a regular (non-logpoint) breakpoint.";
+        }
+        if (activeCount > 0 && recent.isEmpty() && noPriorSuspendingEvent) {
+            return "Breakpoint(s) armed but NO JDI events have fired since attach. Either the thread "
+                + "holding the BP location is idle, the BP location is unreachable from the active "
+                + "code path, or no code is currently executing in the target JVM. Check live thread "
+                + "state with jdwp_get_threads before waiting again.";
+        }
+        return "Some events have fired but nothing suspended within the wait window. Inspect "
+            + "'Recent events' above for the most likely cause.";
     }
 
     @McpTool(description = "Suspend a specific thread by its ID")
