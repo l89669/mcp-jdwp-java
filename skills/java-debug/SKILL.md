@@ -1,6 +1,15 @@
 ---
-name: java-debug
-description: Debug live Java applications via the jdwp-inspector MCP server — set breakpoints, inspect runtime state, evaluate expressions, mutate variables at runtime, catch exceptions at their throw site, and trace execution non-intrusively with line logpoints or log-only exception breakpoints (with $exception-bound expressions). Use when investigating Java bugs, test failures, runtime exceptions, race conditions, or any JVM behavior that is hard to understand from reading code alone.
+description: Debug a live Java application via the jdwp-inspector MCP server — breakpoints, runtime state, expression eval, variable mutation, exception-throw-site catches, and non-intrusive line/exception logpoints.
+when_to_use: |
+  A test fails and the assertion message is unhelpful; an exception is buried under wrappers; a value is wrong but you can't tell where it changes; a race / partial-init / off-by-one / edge-case bug; stepping in your head doesn't match runtime. Triggers: "this test is failing", "why is X null/wrong", "trace this exception", "attach to JDWP", "port 5005/8003/...", "debug the issue".
+argument-hint: "[port]"
+arguments: port
+allowed-tools: mcp__plugin_jdwp-debugging_jdwp-inspector__*
+paths:
+  - "**/*.java"
+  - "**/pom.xml"
+  - "**/build.gradle*"
+  - "**/build.gradle.kts"
 ---
 
 # Java Debug
@@ -31,8 +40,8 @@ The target JVM must be running with the JDWP agent. **The port is whatever the d
 
 **Two attach scenarios:**
 
-1. **Launch-and-debug (tests, reproducers):** start a fresh JVM yourself, usually on port 5005 via the shortcuts below.
-2. **Attach-to-running (services already up):** the developer tells you the port — "JDWP is ready on 8003". Skip the launch step entirely and pass that port to `jdwp_wait_for_attach(port=8003)`. **If the port isn't 5005, do not guess — ask.**
+1. **Launch-and-debug (tests, reproducers):** start a fresh JVM yourself, usually via one of the quick-launch shortcuts below.
+2. **Attach-to-running (services already up):** skip the launch step entirely — go straight to attach. The port follows the resolution priority in the next section.
 
 **Quick launch shortcuts (these all default to port 5005):**
 - Maven Surefire: `mvn test -Dtest=<TestClass> -Dmaven.surefire.debug`
@@ -41,12 +50,22 @@ The target JVM must be running with the JDWP agent. **The port is whatever the d
 
 For build-system-specific gotchas (Surefire `<argLine>` overrides, Gradle `maxParallelForks`, `bootRun`) and the already-running-service workflow: see [references/prerequisites.md](references/prerequisites.md).
 
+## Attach: port resolution
+
+Follow this priority — do not skip steps:
+
+1. **User-specified port** — given in the conversation, or as the `/java-debug $port` argument — use it directly: `jdwp_wait_for_attach(port=<that-port>)`.
+2. **No port given** — try the default once: `jdwp_wait_for_attach()` (= `localhost:5005`).
+3. **Default failed / nothing listening on 5005** — call `jdwp_diagnose()`. It returns the list of local JVMs with their JDWP ports. Pick the right one (ask the user if more than one is plausible) and retry `jdwp_wait_for_attach(port=<discovered>)`.
+
+Never silently fall back to 5005 if the user specified a port — that's a bug, not a default.
+
 ## Core Workflow
 
 Every debug session follows this sequence:
 
 1. **Launch the target** in a separate shell with `suspend=y` — *or skip this step if the JVM is already running with JDWP open*. The JVM blocks until step 2.
-2. **Attach:** `jdwp_wait_for_attach()` defaults to `localhost:5005`. For any other port — and crucially for already-running services — pass it explicitly: `jdwp_wait_for_attach(port=8003)`. Polls until the JVM is listening, then attaches.
+2. **Attach** following the port-resolution priority above. `jdwp_wait_for_attach` polls until the JVM is listening, then attaches.
 3. **Set breakpoints** at suspected bug locations: `jdwp_set_breakpoint(className, lineNumber)`. Add exception breakpoints or logpoints as needed.
 4. **Resume and wait:** `jdwp_resume_until_event()` — releases the JVM and BLOCKS until the next BP/step/exception fires (30s default). Returns the suspended thread info.
 5. **Inspect in one call:** `jdwp_get_breakpoint_context()` — returns thread, top frames, locals (incl. `this`), and `this` field dump.
@@ -175,4 +194,4 @@ When you land at a breakpoint and don't know what to look at:
 2. For each interesting `Object#N` reference: `jdwp_get_fields(objectId)` to drill in, then `jdwp_to_string(objectId)` for a quick view.
 3. `jdwp_assert_expression(<expression>, <expected>)` to test "is the state what I expected?" — much terser than evaluating and eyeballing.
 
-**Server troubleshooting:** see [references/troubleshooting.md](references/troubleshooting.md).
+**When something isn't working:** call `jdwp_diagnose` first — it returns the MCP server status, the JDWP connection (with last-attempt error if disconnected), and a list of local JVMs with their JDWP ports in a single call. Skips the `ps`/`lsof`/`jps` round-trip. See [references/troubleshooting.md](references/troubleshooting.md) for more.
