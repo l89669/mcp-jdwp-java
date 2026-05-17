@@ -101,44 +101,38 @@ public class JdiEventListener {
 
         // Re-disarm only in one-shot mode; sticky dependents intentionally stay armed so subsequent
         // hits go through without waiting on the trigger again. A synthesised event without a request
-        // (firingRequest == null) skips self-disarm but still arms dependents below.
+        // (firingRequest == null) skips self-disarm but still arms dependents below. For a BOTH-mode
+        // field BP the disarm must apply to BOTH underlying requests so the next event of EITHER
+        // kind requires re-arm; setBreakpointEnabledById iterates both halves.
         final BreakpointTracker.TriggerLink selfLink = breakpointTracker.getDependencyOfDependent(firingBpId);
         if (selfLink != null && selfLink.oneShot() && firingRequest != null) {
             try {
-                firingRequest.setEnabled(false);
+                breakpointTracker.setBreakpointEnabledById(firingBpId, false);
                 eventHistory.record(new EventHistory.DebugEvent("CHAIN_DISARMED",
                     String.format("BP #%d disarmed (one-shot); waiting on trigger BP #%d",
                         firingBpId, selfLink.triggerId()),
                     Map.of("breakpointId", String.valueOf(firingBpId),
                         "triggerId", String.valueOf(selfLink.triggerId()))));
-            } catch (InvalidRequestStateException e) {
-                // Request was removed concurrently — expected race during chain teardown, not an
-                // error. Drop to trace so this does not pollute warn-level diagnostics.
-                log.trace("[JDI] One-shot BP #{} already removed: {}", firingBpId, e.getMessage());
             } catch (Exception e) {
                 log.debug("[JDI] Failed to disarm one-shot BP #{}: {}", firingBpId, e.getMessage());
             }
         }
 
-        // 2. Arm dependents waiting on this BP.
+        // 2. Arm dependents waiting on this BP. For BOTH-mode field BPs "is already armed?" is
+        // ambiguous when only one of two underlying requests is enabled, so the isEnabled() short-
+        // circuit is dropped — always call setBreakpointEnabledById, which is idempotent at the
+        // JDI level and tolerates the redundant re-enable. The CHAIN_ARMED event is recorded
+        // unconditionally; downstream consumers must already de-duplicate by (depId, triggerId).
         for (Integer depId : breakpointTracker.getDependentsOfTrigger(firingBpId)) {
-            final EventRequest depReq = breakpointTracker.getEventRequestById(depId);
-            if (depReq == null) {
+            if (!breakpointTracker.isKnownBreakpointId(depId)) {
                 continue;
             }
             try {
-                // Guard avoids emitting CHAIN_ARMED when the dependent is already armed
-                // (sticky dependent that fired once before the trigger re-fires).
-                if (!depReq.isEnabled()) {
-                    depReq.setEnabled(true);
-                    eventHistory.record(new EventHistory.DebugEvent("CHAIN_ARMED",
-                        String.format("BP #%d armed by trigger BP #%d", depId, firingBpId),
-                        Map.of("breakpointId", String.valueOf(depId),
-                            "triggerId", String.valueOf(firingBpId))));
-                }
-            } catch (InvalidRequestStateException e) {
-                // Dependent was removed mid-event — expected race, not an error.
-                log.trace("[JDI] Dependent BP #{} already removed: {}", depId, e.getMessage());
+                breakpointTracker.setBreakpointEnabledById(depId, true);
+                eventHistory.record(new EventHistory.DebugEvent("CHAIN_ARMED",
+                    String.format("BP #%d armed by trigger BP #%d", depId, firingBpId),
+                    Map.of("breakpointId", String.valueOf(depId),
+                        "triggerId", String.valueOf(firingBpId))));
             } catch (Exception e) {
                 log.debug("[JDI] Failed to arm dependent BP #{} on trigger #{}: {}",
                     depId, firingBpId, e.getMessage());

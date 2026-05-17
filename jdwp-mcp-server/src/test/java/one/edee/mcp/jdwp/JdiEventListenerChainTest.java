@@ -102,8 +102,8 @@ class JdiEventListenerChainTest {
 	}
 
 	@Test
-	@DisplayName("Already-armed dependent: no duplicate setEnabled call and no CHAIN_ARMED event")
-	void shouldNotReArmAlreadyEnabledDependent() throws Exception {
+	@DisplayName("Already-armed dependent: arming is idempotent and CHAIN_ARMED is still recorded")
+	void shouldReArmAlreadyEnabledDependentIdempotently() throws Exception {
 		BreakpointRequest triggerBp = mock(BreakpointRequest.class);
 		BreakpointRequest dependentBp = mock(BreakpointRequest.class);
 		int triggerId = tracker.registerBreakpoint(triggerBp);
@@ -115,8 +115,13 @@ class JdiEventListenerChainTest {
 		BreakpointEvent event = mockBreakpointEvent(thread, triggerBp, "com.Foo", 10);
 		runListenerWith(listener, mockEventSet(event));
 
-		verify(dependentBp, never()).setEnabled(anyBoolean());
-		assertThat(hasEventOfType("CHAIN_ARMED")).isFalse();
+		// New contract: the listener always re-arms via setBreakpointEnabledById and always records
+		// CHAIN_ARMED. The redundant call is the cost of treating "the BP" as a single logical
+		// unit — for a BOTH-mode field BP "is already armed?" cannot be answered correctly from a
+		// single EventRequest, so the short-circuit was removed. JDI tolerates the redundant
+		// setEnabled(true) at no observable cost.
+		verify(dependentBp).setEnabled(true);
+		assertThat(hasEventOfType("CHAIN_ARMED")).isTrue();
 	}
 
 	@Test

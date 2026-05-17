@@ -18,11 +18,14 @@ import java.util.concurrent.atomic.AtomicInteger;
  * that hit a suspending event. JDI's `BreakpointRequest` has no user-facing identifier, so this
  * service mints synthetic monotonic integer IDs and exposes them to the MCP client.
  * <p>
- * Maintains four parallel state maps:
+ * Maintains six parallel state maps:
  * - `breakpointsById` — line breakpoints already bound to a JDI `BreakpointRequest`.
  * - `pendingBreakpointsById` — line breakpoints whose target class is not yet loaded.
  * - `exceptionBreakpointsById` — exception breakpoints bound to a JDI `ExceptionRequest`.
  * - `pendingExceptionBreakpointsById` — exception breakpoints whose exception class is not yet loaded.
+ * - `fieldBreakpointsById` — field watchpoints already bound to JDI `WatchpointRequest`(s) —
+ *   `BOTH`-mode binds two requests (one access, one modification) under one synthetic ID.
+ * - `pendingFieldBreakpointsById` — field watchpoints whose declaring class is not yet loaded.
  * <p>
  * Pending entries are promoted to active either by `JdiEventListener.handleClassPrepareEvent` (the
  * normal path) or by the {@link #tryPromotePending} safety net (called from {@link JDIConnectionService#getVM()}
@@ -87,6 +90,29 @@ public class BreakpointTracker {
      * Exception breakpoints awaiting class load; promoted via {@link #promotePendingExceptionToActive}.
      */
     private final ConcurrentHashMap<Integer, PendingExceptionBreakpoint> pendingExceptionBreakpointsById = new ConcurrentHashMap<>();
+    /**
+     * Active field watchpoints keyed by synthetic ID. A {@code BOTH}-mode entry binds one synthetic
+     * ID to two underlying JDI requests (one access, one modification) — the {@link FieldBreakpointInfo}
+     * holds both. Populated by {@link #registerFieldBreakpoint}.
+     */
+    private final ConcurrentHashMap<Integer, FieldBreakpointInfo> fieldBreakpointsById = new ConcurrentHashMap<>();
+    /**
+     * Reverse index from JDI {@link WatchpointRequest} (either access or modification) to its info
+     * record. {@code BOTH}-mode contributes two entries pointing at the same info. Hot path: the
+     * listener consults this on every watchpoint event to recover the BP record without scanning.
+     */
+    private final ConcurrentHashMap<WatchpointRequest, FieldBreakpointInfo> fieldInfoByRequest = new ConcurrentHashMap<>();
+    /**
+     * Reverse index from JDI {@link WatchpointRequest} to its synthetic ID — mirrors
+     * {@link #fieldInfoByRequest}. Used by chain handlers to recover the user-facing ID from the
+     * firing request.
+     */
+    private final ConcurrentHashMap<WatchpointRequest, Integer> fieldIdsByRequest = new ConcurrentHashMap<>();
+    /**
+     * Field watchpoints awaiting class load; promoted via {@link #promotePendingFieldToActive} once
+     * the declaring class is loaded by the target JVM.
+     */
+    private final ConcurrentHashMap<Integer, PendingFieldBreakpoint> pendingFieldBreakpointsById = new ConcurrentHashMap<>();
 
     /**
      * Atomic snapshot of the last suspending JDI event: the firing {@link ThreadReference} paired
@@ -257,9 +283,11 @@ public class BreakpointTracker {
 
     /**
      * Clean shutdown variant: clears every state map (active line BPs, pending line BPs, exception BPs,
-     * pending exception BPs, breakpoint metadata, ClassPrepare requests) and deletes the underlying
-     * JDI event requests via `erm`. Also releases any pending `resume_until_event` waiter so a
-     * `jdwp_reset` or `jdwp_disconnect` from another caller does not leave it hanging until timeout.
+     * pending exception BPs, active field watchpoints, pending field watchpoints, breakpoint metadata,
+     * ClassPrepare requests) and deletes the underlying JDI event requests via `erm` — including BOTH
+     * halves of a {@code BOTH}-mode field watchpoint. Also releases any pending `resume_until_event`
+     * waiter so a `jdwp_reset` or `jdwp_disconnect` from another caller does not leave it hanging
+     * until timeout.
      * <p>
      * Counterpart of {@link #reset()}, which performs the same in-memory cleanup but skips the JDI
      * calls — used when the target VM is already gone.
@@ -275,6 +303,14 @@ public class BreakpointTracker {
         }
         for (ExceptionBreakpointInfo info : exceptionBreakpointsById.values()) {
             deleteQuietly(erm, info.request);
+        }
+        for (FieldBreakpointInfo info : fieldBreakpointsById.values()) {
+            if (info.getAccessRequest() != null) {
+                deleteQuietly(erm, info.getAccessRequest());
+            }
+            if (info.getModificationRequest() != null) {
+                deleteQuietly(erm, info.getModificationRequest());
+            }
         }
         clearAllInMemoryStateLocked();
     }
@@ -295,6 +331,10 @@ public class BreakpointTracker {
         exceptionInfoByRequest.clear();
         exceptionIdsByRequest.clear();
         pendingExceptionBreakpointsById.clear();
+        fieldBreakpointsById.clear();
+        fieldInfoByRequest.clear();
+        fieldIdsByRequest.clear();
+        pendingFieldBreakpointsById.clear();
         dependencyByDependent.clear();
         dependentsByTrigger.clear();
         triggersFiredAtLeastOnce.clear();
@@ -407,13 +447,16 @@ public class BreakpointTracker {
     }
 
     /**
-     * If no more pending breakpoints reference this class, delete the ClassPrepareRequest.
+     * If no more pending entries of any kind (line, exception, or field) reference this class, delete
+     * the ClassPrepareRequest.
      */
     private void cleanupClassPrepareRequestIfNeeded(String className) {
         final boolean hasOthers = pendingBreakpointsById.values().stream()
             .anyMatch(p -> p.getClassName().equals(className))
             || pendingExceptionBreakpointsById.values().stream()
-            .anyMatch(p -> p.getExceptionClass().equals(className));
+            .anyMatch(p -> p.getExceptionClass().equals(className))
+            || pendingFieldBreakpointsById.values().stream()
+            .anyMatch(p -> p.getSpec().className().equals(className));
         if (!hasOthers) {
             final ClassPrepareRequest cpr = classPrepareRequests.remove(className);
             if (cpr != null) {
@@ -617,11 +660,157 @@ public class BreakpointTracker {
         }
     }
 
+    // ── Field breakpoint operations ──
+
+    /**
+     * Registers an active field watchpoint and returns its synthetic ID. {@code accessReq} and
+     * {@code modReq} are individually optional but at least one must be non-null — a
+     * {@code BOTH}-mode entry passes both, an access-only entry passes {@code modReq=null}, and
+     * a modification-only entry passes {@code accessReq=null}. Both reverse indices are populated
+     * in lockstep so the listener can recover the info / ID from either request kind on every hit.
+     *
+     * @throws IllegalArgumentException when both requests are {@code null}
+     */
+    public int registerFieldBreakpoint(FieldBreakpointSpec spec,
+                                       @Nullable AccessWatchpointRequest accessReq,
+                                       @Nullable ModificationWatchpointRequest modReq) {
+        if (accessReq == null && modReq == null) {
+            throw new IllegalArgumentException(
+                "At least one of accessReq / modReq must be non-null");
+        }
+        final int id = idCounter.getAndIncrement();
+        final FieldBreakpointInfo info = new FieldBreakpointInfo(spec, accessReq, modReq);
+        fieldBreakpointsById.put(id, info);
+        if (accessReq != null) {
+            indexFieldRequest(accessReq, info, id);
+        }
+        if (modReq != null) {
+            indexFieldRequest(modReq, info, id);
+        }
+        return id;
+    }
+
+    /**
+     * Looks up the {@link FieldBreakpointInfo} for a given JDI {@link WatchpointRequest}, or
+     * {@code null} if the request is not tracked. O(1) via the reverse index.
+     */
+    @Nullable
+    public FieldBreakpointInfo findFieldInfoByRequest(WatchpointRequest req) {
+        return fieldInfoByRequest.get(req);
+    }
+
+    /**
+     * Returns the synthetic ID for a given JDI {@link WatchpointRequest}. O(1) via the reverse index.
+     */
+    @Nullable
+    public Integer findFieldIdByRequest(WatchpointRequest req) {
+        return fieldIdsByRequest.get(req);
+    }
+
+    /**
+     * Returns an unmodifiable snapshot of all currently-active field watchpoints.
+     */
+    public Map<Integer, FieldBreakpointInfo> getAllFieldBreakpoints() {
+        return Collections.unmodifiableMap(fieldBreakpointsById);
+    }
+
+    /**
+     * Registers a pending field watchpoint for a class not yet loaded. Twin of
+     * {@link #registerPendingExceptionBreakpoint} for the field side of the state machine. The caller
+     * is expected to also register a {@link ClassPrepareRequest} so {@link JdiEventListener#handleClassPrepareEvent}
+     * can promote it via {@link #promotePendingFieldToActive}.
+     */
+    public synchronized int registerPendingFieldBreakpoint(FieldBreakpointSpec spec) {
+        final int id = idCounter.getAndIncrement();
+        pendingFieldBreakpointsById.put(id, new PendingFieldBreakpoint(spec));
+        return id;
+    }
+
+    /**
+     * Returns every pending field watchpoint targeting {@code className}. Used by the class-prepare
+     * handler to know which entries to promote when the class loads.
+     */
+    public List<Map.Entry<Integer, PendingFieldBreakpoint>> getPendingFieldBreakpointsForClass(String className) {
+        return pendingFieldBreakpointsById.entrySet().stream()
+            .filter(e -> e.getValue().getSpec().className().equals(className))
+            .toList();
+    }
+
+    /**
+     * Returns an unmodifiable snapshot of all currently-pending field watchpoints.
+     */
+    public Map<Integer, PendingFieldBreakpoint> getAllPendingFieldBreakpoints() {
+        return Collections.unmodifiableMap(pendingFieldBreakpointsById);
+    }
+
+    /**
+     * Promotes a pending field watchpoint to active by removing it from the pending map and
+     * inserting a {@link FieldBreakpointInfo} under the same synthetic ID with the supplied JDI
+     * requests. No-op if the ID is unknown.
+     */
+    public void promotePendingFieldToActive(int id,
+                                            @Nullable AccessWatchpointRequest accessReq,
+                                            @Nullable ModificationWatchpointRequest modReq) {
+        final PendingFieldBreakpoint pending = pendingFieldBreakpointsById.remove(id);
+        if (pending != null) {
+            final FieldBreakpointInfo info = new FieldBreakpointInfo(pending.getSpec(), accessReq, modReq);
+            fieldBreakpointsById.put(id, info);
+            if (accessReq != null) {
+                indexFieldRequest(accessReq, info, id);
+            }
+            if (modReq != null) {
+                indexFieldRequest(modReq, info, id);
+            }
+        }
+    }
+
+    /**
+     * Records why a pending field watchpoint could not be activated. The pending entry stays in the
+     * map so the failure reason is visible to {@code jdwp_list_field_breakpoints}.
+     */
+    public void markPendingFieldFailed(int id, @Nullable String reason) {
+        final PendingFieldBreakpoint pending = pendingFieldBreakpointsById.get(id);
+        if (pending != null) {
+            pending.setFailureReason(reason);
+        }
+    }
+
+    /**
+     * Removes a field watchpoint by ID — checks active first, then pending. Active removals also
+     * delete the underlying JDI {@link WatchpointRequest}(s) — both for a {@code BOTH}-mode entry.
+     * Pending removals additionally clean up the {@link ClassPrepareRequest} if no other pending
+     * item still references the same declaring class.
+     *
+     * @return {@code true} if found and removed, {@code false} otherwise
+     */
+    public synchronized boolean removeFieldBreakpoint(int id) {
+        final FieldBreakpointInfo info = fieldBreakpointsById.remove(id);
+        if (info != null) {
+            if (info.getAccessRequest() != null) {
+                tearDownFieldRequestQuietly(info.getAccessRequest());
+            }
+            if (info.getModificationRequest() != null) {
+                tearDownFieldRequestQuietly(info.getModificationRequest());
+            }
+            clearDependency(id);
+            triggersFiredAtLeastOnce.remove(id);
+            return true;
+        }
+        final PendingFieldBreakpoint pending = pendingFieldBreakpointsById.remove(id);
+        if (pending != null) {
+            cleanupClassPrepareRequestIfNeeded(pending.getSpec().className());
+            clearDependency(id);
+            triggersFiredAtLeastOnce.remove(id);
+            return true;
+        }
+        return false;
+    }
+
     // ── Opportunistic promotion ──
 
     /**
-     * Re-attempts to promote every pending breakpoint and pending exception breakpoint by
-     * re-querying `vm.classesByName(...)`. This is the safety net for cases where
+     * Re-attempts to promote every pending entry — line BPs, exception BPs, and field watchpoints —
+     * by re-querying `vm.classesByName(...)`. This is the safety net for cases where
      * {@link ClassPrepareRequest} does not fire — most notably bootstrap classes loaded by the JVM
      * before any debugger event is delivered.
      * <p>
@@ -629,6 +818,10 @@ public class BreakpointTracker {
      * from {@link JdiEventListener} (after every JDI event), so any user interaction
      * gives pending items another chance to bind. Best-effort; transient failures are logged at
      * debug and the item stays pending for the next retry.
+     * <p>
+     * Field BPs additionally roll back any partially-created JDI requests if promotion fails
+     * mid-flight (a {@code BOTH}-mode entry creates two requests, either of which can throw) and
+     * mark the pending entry failed so subsequent cycles do not retry the same orphan-prone path.
      *
      * @return number of items promoted in this call
      */
@@ -721,7 +914,157 @@ public class BreakpointTracker {
             }
         }
 
+        // Promote pending field watchpoints
+        for (Map.Entry<Integer, PendingFieldBreakpoint> entry :
+            new ArrayList<>(pendingFieldBreakpointsById.entrySet())) {
+            final int id = entry.getKey();
+            final PendingFieldBreakpoint pending = entry.getValue();
+            if (pending.getFailureReason() != null) {
+                continue;
+            }
+
+            final FieldBreakpointSpec spec = pending.getSpec();
+            try {
+                final ReferenceType refType = jdiService.findOrForceLoadClass(spec.className(), preferredThread);
+                if (refType == null) {
+                    continue;
+                }
+
+                final List<Field> candidates = refType.allFields().stream()
+                    .filter(f -> f.name().equals(spec.fieldName()))
+                    .toList();
+                if (candidates.isEmpty()) {
+                    markPendingFieldFailed(id, String.format(
+                        "Field '%s' not found on %s or its supertypes", spec.fieldName(), spec.className()));
+                    continue;
+                }
+                if (candidates.size() > 1) {
+                    markPendingFieldFailed(id, String.format(
+                        "Field '%s' is ambiguous on %s (declared on %d types) — use a more specific className",
+                        spec.fieldName(), spec.className(), candidates.size()));
+                    continue;
+                }
+                final Field field = candidates.get(0);
+                if (spec.objectFilterId() != null && field.isStatic()) {
+                    markPendingFieldFailed(id, String.format(
+                        "Field '%s' on %s is static; objectId filter does not apply",
+                        spec.fieldName(), spec.className()));
+                    continue;
+                }
+
+                // Two-step creation for BOTH-mode is split across two erm calls plus two
+                // configureFieldRequest calls — any of them can throw on a VM in mid-transition. The
+                // inner try/catch tracks every JDI request handed out so a half-creation can roll
+                // back via erm.deleteEventRequest before re-throwing into the outer catch. Without
+                // the rollback the access request would stay armed on the target VM with no tracker
+                // entry pointing at it, and events on it would be delivered but immediately
+                // discarded (findFieldInfoByRequest returns null).
+                final List<EventRequest> createdRequests = new ArrayList<>(2);
+                try {
+                    AccessWatchpointRequest accessReq = null;
+                    ModificationWatchpointRequest modReq = null;
+                    if (spec.mode() == FieldWatchMode.ACCESS || spec.mode() == FieldWatchMode.BOTH) {
+                        accessReq = erm.createAccessWatchpointRequest(field);
+                        createdRequests.add(accessReq);
+                        configureFieldRequest(accessReq, spec, vm, jdiService);
+                    }
+                    if (spec.mode() == FieldWatchMode.MODIFICATION || spec.mode() == FieldWatchMode.BOTH) {
+                        modReq = erm.createModificationWatchpointRequest(field);
+                        createdRequests.add(modReq);
+                        configureFieldRequest(modReq, spec, vm, jdiService);
+                    }
+
+                    if (accessReq != null) {
+                        disarmIfChained(id, accessReq);
+                    }
+                    if (modReq != null) {
+                        disarmIfChained(id, modReq);
+                    }
+                    promotePendingFieldToActive(id, accessReq, modReq);
+                    promoted++;
+                    log.info("[Tracker] Opportunistically promoted pending field BP {} for {}.{}",
+                        id, spec.className(), spec.fieldName());
+                } catch (Exception inner) {
+                    // Delete every half-created request so a retry cycle does not see orphan JDI
+                    // requests on the target VM. Per-request delete failures are swallowed — the
+                    // outer log entry below is enough diagnostic noise for what is already a
+                    // best-effort rollback path.
+                    for (EventRequest leaked : createdRequests) {
+                        try {
+                            erm.deleteEventRequest(leaked);
+                        } catch (Exception ignore) {
+                            // No-op: best-effort cleanup, do not mask the original failure.
+                        }
+                    }
+                    // Mark the pending entry failed so future tryPromotePending cycles skip it
+                    // instead of retrying the same orphan-prone path on every tool call.
+                    markPendingFieldFailed(id, "Failed during promotion: " + inner.getMessage());
+                    log.debug("[Tracker] Field BP {} promotion rolled back: {}", id, inner.getMessage());
+                }
+            } catch (Exception e) {
+                log.debug("[Tracker] Failed to promote pending field BP {}: {}", id, e.getMessage());
+            }
+        }
+
         return promoted;
+    }
+
+    /**
+     * Applies suspend policy, thread filter, and instance filter to a freshly created
+     * {@link WatchpointRequest}-style request, then enables it. Shared by the access and
+     * modification creation paths during pending → active promotion. Throws when the spec
+     * references a thread or object that cannot be resolved against the live VM.
+     */
+    private static void configureFieldRequest(WatchpointRequest req, FieldBreakpointSpec spec,
+                                              VirtualMachine vm, JDIConnectionService jdiService)
+        throws IllegalStateException {
+        req.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
+        if (spec.threadFilterId() != null) {
+            final ThreadReference thread = vm.allThreads().stream()
+                .filter(t -> t.uniqueID() == spec.threadFilterId())
+                .findFirst().orElse(null);
+            if (thread == null) {
+                throw new IllegalStateException(
+                    "Thread #" + spec.threadFilterId() + " no longer alive — cannot apply thread filter");
+            }
+            req.addThreadFilter(thread);
+        }
+        if (spec.objectFilterId() != null) {
+            final ObjectReference instance = jdiService.getCachedObject(spec.objectFilterId());
+            if (instance == null) {
+                throw new IllegalStateException(
+                    "Object #" + spec.objectFilterId() + " not in cache — cannot apply instance filter");
+            }
+            req.addInstanceFilter(instance);
+        }
+        req.enable();
+    }
+
+    /**
+     * Adds the {@code req → info} and {@code req → id} entries to the field watchpoint reverse
+     * indices in lockstep. Shared by {@link #registerFieldBreakpoint} and
+     * {@link #promotePendingFieldToActive}; callers null-guard before invocation so a {@code BOTH}-mode
+     * entry contributes two calls (one access, one modification) and a single-mode entry one.
+     */
+    private void indexFieldRequest(WatchpointRequest req, FieldBreakpointInfo info, int id) {
+        fieldInfoByRequest.put(req, info);
+        fieldIdsByRequest.put(req, id);
+    }
+
+    /**
+     * Removes the {@code req → info} and {@code req → id} reverse-index entries for the given field
+     * watchpoint, then best-effort deletes the underlying JDI request — exceptions are swallowed so
+     * a removal can still complete against a VM in mid-disconnect. Shared by the access and
+     * modification arms of {@link #removeFieldBreakpoint}; callers null-guard before invocation.
+     */
+    private void tearDownFieldRequestQuietly(WatchpointRequest req) {
+        fieldInfoByRequest.remove(req);
+        fieldIdsByRequest.remove(req);
+        try {
+            req.virtualMachine().eventRequestManager().deleteEventRequest(req);
+        } catch (Exception e) {
+            // VM may already be disconnected
+        }
     }
 
     // ── Chain (dependency) operations ──
@@ -862,10 +1205,11 @@ public class BreakpointTracker {
     }
 
     /**
-     * Returns the JDI {@link EventRequest} for the given synthetic ID — checks active line BPs and
-     * active exception BPs (in that order). Returns {@code null} when the ID is pending, unknown,
-     * or already removed. Used by chain-handling code that needs to call {@code setEnabled(...)}
-     * without caring whether the underlying request is a line BP or an exception BP.
+     * Returns the JDI {@link EventRequest} for the given synthetic ID — checks active line BPs,
+     * active exception BPs, then active field BPs (in that order). For a {@code BOTH}-mode field
+     * BP, returns the access request when present, otherwise the modification request — chain
+     * machinery treats them as one logical entity so either request suffices for {@code setEnabled}.
+     * Returns {@code null} when the ID is pending, unknown, or already removed.
      */
     @Nullable
     public EventRequest getEventRequestById(int id) {
@@ -873,19 +1217,89 @@ public class BreakpointTracker {
         if (bp != null) {
             return bp;
         }
-        final ExceptionBreakpointInfo info = exceptionBreakpointsById.get(id);
-        return info != null ? info.getRequest() : null;
+        final ExceptionBreakpointInfo exInfo = exceptionBreakpointsById.get(id);
+        if (exInfo != null) {
+            return exInfo.getRequest();
+        }
+        final FieldBreakpointInfo fieldInfo = fieldBreakpointsById.get(id);
+        if (fieldInfo != null) {
+            return fieldInfo.getAccessRequest() != null
+                ? fieldInfo.getAccessRequest() : fieldInfo.getModificationRequest();
+        }
+        return null;
+    }
+
+    /**
+     * Kind-agnostic enable/disable of every JDI request that backs the logical breakpoint
+     * identified by {@code id}. Chain machinery treats a synthetic ID as "the BP" rather than
+     * "one of its underlying JDI requests", and a {@code BOTH}-mode field BP binds one ID to two
+     * requests (access + modification). Toggling only one half — what a single
+     * {@link #getEventRequestById} result plus {@code setEnabled} would do — leaves the chain in
+     * a split state where the next event of the unflipped kind still goes through (when arming)
+     * or still fires (when disarming).
+     * <p>
+     * Lookup order matches {@link #getEventRequestById}: line BP, exception BP, field BP. For a
+     * field BP both the access and modification requests are toggled when present. Pending and
+     * unknown IDs are silent no-ops — the chain hot path must never throw on a stale ID because
+     * a concurrent removal happened between the listener decision and the enable/disable call.
+     * <p>
+     * Per-request failures are caught and logged at trace level to match the chain handler's
+     * tolerance for the "request was concurrently removed" race; the loop does not abort on a
+     * single half failing.
+     */
+    public void setBreakpointEnabledById(int id, boolean enabled) {
+        final BreakpointRequest bp = breakpointsById.get(id);
+        if (bp != null) {
+            try {
+                bp.setEnabled(enabled);
+            } catch (InvalidRequestStateException e) {
+                log.trace("[Tracker] Line BP #{} setEnabled({}) ignored — request already removed: {}",
+                    id, enabled, e.getMessage());
+            }
+            return;
+        }
+        final ExceptionBreakpointInfo exInfo = exceptionBreakpointsById.get(id);
+        if (exInfo != null) {
+            try {
+                exInfo.getRequest().setEnabled(enabled);
+            } catch (InvalidRequestStateException e) {
+                log.trace("[Tracker] Exception BP #{} setEnabled({}) ignored — request already removed: {}",
+                    id, enabled, e.getMessage());
+            }
+            return;
+        }
+        final FieldBreakpointInfo fieldInfo = fieldBreakpointsById.get(id);
+        if (fieldInfo != null) {
+            if (fieldInfo.getAccessRequest() != null) {
+                try {
+                    fieldInfo.getAccessRequest().setEnabled(enabled);
+                } catch (InvalidRequestStateException e) {
+                    log.trace("[Tracker] Field BP #{} access half setEnabled({}) ignored — request already removed: {}",
+                        id, enabled, e.getMessage());
+                }
+            }
+            if (fieldInfo.getModificationRequest() != null) {
+                try {
+                    fieldInfo.getModificationRequest().setEnabled(enabled);
+                } catch (InvalidRequestStateException e) {
+                    log.trace("[Tracker] Field BP #{} modification half setEnabled({}) ignored — request already removed: {}",
+                        id, enabled, e.getMessage());
+                }
+            }
+        }
     }
 
     /**
      * Returns {@code true} when {@code id} matches any tracked breakpoint — active line, active
-     * exception, pending line, or pending exception. Used by {@link JDWPTools} to validate trigger
-     * IDs supplied to chain-aware tools without forcing the caller to query four separate maps.
+     * exception, active field, pending line, pending exception, or pending field. Used by
+     * {@link JDWPTools} to validate trigger IDs supplied to chain-aware tools without forcing the
+     * caller to query six separate maps.
      */
     public boolean isKnownBreakpointId(int id) {
         return getEventRequestById(id) != null
             || pendingBreakpointsById.containsKey(id)
-            || pendingExceptionBreakpointsById.containsKey(id);
+            || pendingExceptionBreakpointsById.containsKey(id)
+            || pendingFieldBreakpointsById.containsKey(id);
     }
 
     /**
@@ -1309,6 +1723,138 @@ public class BreakpointTracker {
         public static ExceptionBreakpointSpec logOnly(String exceptionClass, boolean caught, boolean uncaught,
                                                       @Nullable String expression) {
             return new ExceptionBreakpointSpec(exceptionClass, caught, uncaught, true, expression);
+        }
+    }
+
+    /**
+     * Watch direction for a field watchpoint:
+     * <ul>
+     *   <li>{@code ACCESS} — fires on every read of the field</li>
+     *   <li>{@code MODIFICATION} — fires on every write of the field</li>
+     *   <li>{@code BOTH} — binds one synthetic ID to two JDI requests (one of each kind);
+     *       increments / compound assignments fire two events per source line</li>
+     * </ul>
+     */
+    public enum FieldWatchMode {ACCESS, MODIFICATION, BOTH}
+
+    /**
+     * User-facing options bundle for a field watchpoint. Captures the same flags accepted by
+     * {@code jdwp_set_field_breakpoint} and {@code jdwp_set_field_logpoint} in a shape that travels
+     * through the active and pending tracker records and across pending → active promotion.
+     * Construct via {@link #suspending} or {@link #logOnly}.
+     */
+    public record FieldBreakpointSpec(
+        String className,
+        String fieldName,
+        FieldWatchMode mode,
+        @Nullable String condition,
+        boolean logOnly,
+        @Nullable String expression,
+        @Nullable Long threadFilterId,
+        @Nullable Long objectFilterId
+    ) {
+        /**
+         * Default suspending behaviour: the firing thread is parked at the field access / modification
+         * site for inspection. {@code condition} (optional, may be {@code null}) is evaluated with
+         * the field-event synthetic bindings ({@code $oldValue}, {@code $newValue}, {@code $object},
+         * {@code $fieldName}, {@code $mode}) bound on each hit — false skips the suspend.
+         */
+        public static FieldBreakpointSpec suspending(String className, String fieldName, FieldWatchMode mode,
+                                                     @Nullable Long threadFilterId, @Nullable Long objectFilterId,
+                                                     @Nullable String condition) {
+            return new FieldBreakpointSpec(className, fieldName, mode, condition, false, null,
+                threadFilterId, objectFilterId);
+        }
+
+        /**
+         * Log-only behaviour: the listener records a {@code FIELD_LOGPOINT} event and auto-resumes
+         * the firing thread. {@code expression} is evaluated against the firing frame with the
+         * field-event synthetic bindings bound; {@code condition} (optional) gates whether the
+         * expression is evaluated and the event recorded.
+         */
+        public static FieldBreakpointSpec logOnly(String className, String fieldName, FieldWatchMode mode,
+                                                  String expression, @Nullable Long threadFilterId,
+                                                  @Nullable Long objectFilterId, @Nullable String condition) {
+            return new FieldBreakpointSpec(className, fieldName, mode, condition, true, expression,
+                threadFilterId, objectFilterId);
+        }
+    }
+
+    /**
+     * Tracks a field watchpoint created via one or two JDI {@link WatchpointRequest}s. {@code BOTH}
+     * mode populates both {@code accessRequest} and {@code modificationRequest}; the other two
+     * modes populate exactly one. Listener handlers consult {@link #getSpec()} to decide between
+     * suspending and log-only paths and to read filter / expression metadata.
+     */
+    public static class FieldBreakpointInfo {
+        private final FieldBreakpointSpec spec;
+        @Nullable
+        private final AccessWatchpointRequest accessRequest;
+        @Nullable
+        private final ModificationWatchpointRequest modificationRequest;
+
+        /**
+         * Precondition: at least one of {@code accessRequest} / {@code modificationRequest} is
+         * non-null; {@code BOTH} mode passes both.
+         */
+        public FieldBreakpointInfo(FieldBreakpointSpec spec,
+                                   @Nullable AccessWatchpointRequest accessRequest,
+                                   @Nullable ModificationWatchpointRequest modificationRequest) {
+            this.spec = spec;
+            this.accessRequest = accessRequest;
+            this.modificationRequest = modificationRequest;
+        }
+
+        public FieldBreakpointSpec getSpec() {
+            return spec;
+        }
+
+        @Nullable
+        public AccessWatchpointRequest getAccessRequest() {
+            return accessRequest;
+        }
+
+        @Nullable
+        public ModificationWatchpointRequest getModificationRequest() {
+            return modificationRequest;
+        }
+    }
+
+    /**
+     * A field watchpoint registered for a declaring class that is not yet loaded. Will be promoted
+     * to an active {@link FieldBreakpointInfo} when the class loads.
+     */
+    public static class PendingFieldBreakpoint {
+        private final FieldBreakpointSpec spec;
+        @Nullable
+        private volatile String failureReason;
+
+        /**
+         * {@code failureReason} starts {@code null} and is populated later by
+         * {@link #setFailureReason} via {@link BreakpointTracker#markPendingFieldFailed}.
+         */
+        public PendingFieldBreakpoint(FieldBreakpointSpec spec) {
+            this.spec = spec;
+        }
+
+        public FieldBreakpointSpec getSpec() {
+            return spec;
+        }
+
+        /**
+         * @return the recorded failure reason from a prior promotion attempt, or {@code null} when
+         *         this pending entry has not yet failed promotion
+         */
+        @Nullable
+        public String getFailureReason() {
+            return failureReason;
+        }
+
+        /**
+         * Records why this pending field watchpoint could not be activated.
+         */
+        public void setFailureReason(@Nullable String failureReason) {
+            this.failureReason = failureReason;
         }
     }
 }

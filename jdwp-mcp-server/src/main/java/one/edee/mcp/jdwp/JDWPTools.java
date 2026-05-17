@@ -1751,10 +1751,12 @@ public class JDWPTools {
     private int cascadeChainBreak(int removedTriggerId) {
         final Set<Integer> dependents = breakpointTracker.clearDependentsOfTrigger(removedTriggerId);
         for (Integer depId : dependents) {
-            final EventRequest depReq = breakpointTracker.getEventRequestById(depId);
-            if (depReq != null) {
+            final boolean active = breakpointTracker.getEventRequestById(depId) != null;
+            if (active) {
                 try {
-                    depReq.setEnabled(true);
+                    // Toggle every underlying request (both halves for a BOTH-mode field BP) so the
+                    // dependent comes back armed as a logical BP, not as a half-disarmed survivor.
+                    breakpointTracker.setBreakpointEnabledById(depId, true);
                 } catch (Exception e) {
                     // Best-effort — dependent may be in a torn state; CHAIN_BROKEN still records the detach.
                     log.debug("[JDWPTools] Failed to arm dependent BP #{}: {}", depId, e.getMessage());
@@ -1763,7 +1765,7 @@ public class JDWPTools {
             // Record CHAIN_BROKEN per dependent (not per trigger) so the user sees which BPs
             // lost their guard. Pending dependents get a different message because they have no
             // JDI request to "arm" — the arming applies on the eventual pending → active promotion.
-            final String summary = depReq != null
+            final String summary = active
                 ? String.format("BP #%d trigger (#%d) was removed — dependent armed unconditionally",
                     depId, removedTriggerId)
                 : String.format("BP #%d trigger (#%d) was removed — dependent still pending; "
@@ -1792,7 +1794,9 @@ public class JDWPTools {
             if (!breakpointTracker.isKnownBreakpointId(triggerId)) {
                 return String.format("Error: Trigger breakpoint #%d does not exist", triggerId);
             }
-            final EventRequest depReq = breakpointTracker.getEventRequestById(dependentId);
+            // Capture active-vs-pending state up front: the disarm path below must skip pending
+            // dependents (they have no JDI request yet) and so must the summary message.
+            final boolean active = breakpointTracker.getEventRequestById(dependentId) != null;
 
             final boolean effectiveOneShot = oneShot != null && oneShot;
             try {
@@ -1803,13 +1807,15 @@ public class JDWPTools {
                 // generic catch-all branch below.
                 return "Error: " + cre.getMessage();
             }
-            if (depReq != null) {
-                depReq.setEnabled(false);
+            if (active) {
+                // Disarms every underlying request — both halves for a BOTH-mode field BP — so the
+                // dependent really is waiting on the trigger across all event kinds.
+                breakpointTracker.setBreakpointEnabledById(dependentId, false);
             }
             return String.format("BP #%d is now chained to trigger BP #%d (%s). %s",
                 dependentId, triggerId,
                 effectiveOneShot ? "one-shot" : "sticky",
-                depReq != null
+                active
                     ? "Disarmed — will arm when trigger fires."
                     : "Dependent is still pending; will come up disarmed when its class loads.");
         } catch (Exception e) {
@@ -1824,12 +1830,13 @@ public class JDWPTools {
             if (previous == null) {
                 return String.format("BP #%d has no chain dependency", dependentId);
             }
-            final EventRequest depReq = breakpointTracker.getEventRequestById(dependentId);
-            if (depReq != null) {
+            if (breakpointTracker.getEventRequestById(dependentId) != null) {
                 try {
                     // Auto-re-arm on detach — once the chain is cleared, the BP collapses back to
-                    // a plain BP, which is always-armed.
-                    depReq.setEnabled(true);
+                    // a plain BP, which is always-armed. For a BOTH-mode field BP both underlying
+                    // requests must come back on, otherwise the "armed independently" claim is a
+                    // half-truth for one event kind.
+                    breakpointTracker.setBreakpointEnabledById(dependentId, true);
                 } catch (Exception e) {
                     // Best-effort — caller can re-set enabled later if needed.
                 }
@@ -1848,11 +1855,12 @@ public class JDWPTools {
             if (link == null) {
                 return String.format("BP #%d has no chain — there is no trigger to wait on. Use jdwp_set_breakpoint_dependency first.", dependentId);
             }
-            final EventRequest depReq = breakpointTracker.getEventRequestById(dependentId);
-            if (depReq == null) {
+            if (breakpointTracker.getEventRequestById(dependentId) == null) {
                 return String.format("BP #%d is still pending (class not loaded); it will come up disarmed when promoted.", dependentId);
             }
-            depReq.setEnabled(false);
+            // Disarms both halves of a BOTH-mode field BP so the next event of either kind waits
+            // on the trigger; for line and exception BPs it collapses to a single setEnabled call.
+            breakpointTracker.setBreakpointEnabledById(dependentId, false);
             return String.format("BP #%d re-disarmed; waiting on trigger BP #%d to fire again.",
                 dependentId, link.triggerId());
         } catch (Exception e) {
