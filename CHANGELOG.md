@@ -66,6 +66,28 @@ Per-ID delete tools are unchanged: `jdwp_clear_breakpoint(id)` and
 the only per-BP watcher query (the substring filter on `jdwp_overview` is
 not breakpoint-id-aware).
 
+## [2.0.1] — 2026-05-17
+
+### Fixed — stdio handshake with MCP clients on protocol `2025-11-25`
+
+Claude Code 2.1.143 (and any client requesting an MCP protocol newer than
+`2024-11-05`) could not use the plugin: `/mcp` reported
+`Failed to reconnect to jdwp-inspector: -32000` and every tool call was
+silently dropped after `initialize`.
+
+Root cause was upstream: `mcp-core`'s `StdioServerTransportProvider.protocolVersions()`
+hardcodes `List.of("2024-11-05")` in every published version through
+`2.0.0-M2` (the latest shipped with Spring AI `2.0.0-M6`). The server
+downgraded the session in its `initialize` response, then `McpAsyncServer`
+stopped responding to all subsequent requests.
+
+The plugin now ships a local `MultiVersionStdioServerTransportProvider` that
+advertises all four protocol versions known to the bundled SDK
+(`2024-11-05`, `2025-03-26`, `2025-06-18`, `2025-11-25`) and registers it as
+`stdioServerTransport`, displacing Spring AI's `@ConditionalOnMissingBean`
+auto-config bean. Existing clients on `2024-11-05` continue to negotiate
+successfully.
+
 ## [2.0.0] — 2026-05-17
 
 This release renames and removes several breakpoint-clear tools to unify them
