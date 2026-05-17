@@ -235,6 +235,22 @@ class JDWPToolsNullParamDefaultsTest {
 	}
 
 	@Nested
+	@DisplayName("jdwp_step_* defaults")
+	class StepDefaults {
+
+		@Test
+		@DisplayName("null threadId on jdwp_step_over does not NPE on auto-unbox")
+		void shouldNotThrowNpeWhenStepThreadIdIsNull() throws Exception {
+			when(jdiService.getVM()).thenThrow(new IllegalStateException("Not connected"));
+
+			final String[] holder = new String[1];
+			assertThatCode(() -> holder[0] = tools.jdwp_step_over(null))
+				.doesNotThrowAnyException();
+			assertThat(holder[0]).startsWith("Error");
+		}
+	}
+
+	@Nested
 	@DisplayName("jdwp_get_breakpoint_context more defaults")
 	class BreakpointContextMoreDefaults {
 

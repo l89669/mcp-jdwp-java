@@ -84,9 +84,9 @@ A value looks correct before a method call and wrong after. The method appears t
 
 1. BP at the call site, *before* the suspicious call.
 2. `jdwp_evaluate_expression` on the value -> correct.
-3. `jdwp_step_over` past the call.
+3. `jdwp_step_over` followed by `jdwp_resume_until_event` (the step resumes the thread; the latch fires when the STEP event lands).
 4. `jdwp_evaluate_expression` again -> wrong! The call mutates.
-5. Restart, BP at the same site, `jdwp_step_into` to land inside the suspicious method, then `jdwp_step_over` line by line and eval after each — find the exact mutation point.
+5. Restart, BP at the same site, `jdwp_step_into` to land inside the suspicious method, then a small number of `jdwp_step_over` + `jdwp_resume_until_event` cycles, eval after each — find the exact mutation point. If you find yourself stepping more than ~3 lines, set a breakpoint at the suspect line and resume to it instead.
 
 ### "Race / partial init / observable intermediate state"
 
@@ -198,10 +198,20 @@ Chains can be retrofitted to existing BPs via `jdwp_set_breakpoint_dependency(de
 - **Field watchpoints are expensive.** Each access/modification of a watched field traps into the debugger; on a hot field this can dominate target-VM CPU. Use the narrowest mode that answers your question (`modification` is usually enough), and add `threadFilterId` / `objectFilterId` / `condition` to scope the catches. `jdwp_diagnose` reports `canWatchFieldAccess` / `canWatchFieldModification` plus this warning when connected. Pending field BPs registered before class load promote synchronously on `ClassPrepareEvent`, so `<clinit>` writes are caught.
 - **Object IDs are session-scoped.** They become invalid after `disconnect` or if GC collects the object. If you see "Object not found in cache", re-fetch via `jdwp_get_locals`.
 
+## When to step vs. when to set a breakpoint
+
+Each step is a JDWP round-trip — slow and token-expensive. Default to a breakpoint at the destination + `jdwp_resume_until_event` whenever you can predict where execution will go next. Stepping wins in three narrow cases:
+
+- **`jdwp_step_into`** — polymorphic dispatch is unclear and you can't tell from source which override will actually run. One call, then go back to inspecting.
+- **`jdwp_step_out`** — an exception or early-abort dropped you in a frame you don't care about and finding the right caller line for a breakpoint would be awkward. One call escapes the frame.
+- **`jdwp_step_over`** — only for the *single* next statement, when observing a state mutation is faster than predicting it. More than ~3 `step_over`s in a row means "I should have set a breakpoint."
+
+After any step, `jdwp_resume_until_event` blocks until the `STEP` event lands. The step itself only resumes the thread — it does not wait. `threadId` is optional on all three step tools: omitted, it falls back to the thread of the last breakpoint hit.
+
 ## Anti-patterns
 
 - **Don't restart the test for every hypothesis.** Use `jdwp_set_local` / `jdwp_set_field` to mutate state in place and resume. If the test passes, your hypothesis is confirmed — no rebuild needed.
-- **Don't step through 50 loop iterations manually.** Use a conditional breakpoint or logpoint to jump straight to the iteration that matters.
+- **Don't step over more than ~3 lines in a row.** If you already know which line you want to inspect, put a breakpoint there and `jdwp_resume_until_event`. One round-trip beats N. The same goes for stepping through loop iterations — use a conditional breakpoint or logpoint.
 - **Don't catch `Throwable` or `Exception` "to be safe".** Target the specific exception type. Broad exception breakpoints fire on every JDK internal exception — extremely noisy and slow.
 - **Don't stop at the first wrapped exception.** The original throw site is almost always more informative. Set an exception BP on the inner type and re-run.
 

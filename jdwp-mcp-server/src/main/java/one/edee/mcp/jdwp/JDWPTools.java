@@ -1303,18 +1303,27 @@ public class JDWPTools {
         }
     }
 
-    @McpTool(description = "Step over (execute current line and stop at next line)")
-    public String jdwp_step_over(@McpToolParam(description = "Thread unique ID") long threadId) {
+    @McpTool(description = "Step over the current line (resumes the thread; JDI fires a STEP event when the next line is reached). " +
+        "Thread must be suspended. After calling, use jdwp_resume_until_event to block until the step lands. " +
+        "Each step is one round-trip — for jumps longer than ~3 lines, place a breakpoint at the destination and resume_until_event instead.")
+    public String jdwp_step_over(
+        @McpToolParam(required = false, description = "Thread unique ID (must be suspended). If omitted, uses the last breakpoint thread.") @Nullable Long threadId) {
         return doStep(threadId, StepRequest.STEP_OVER, "over");
     }
 
-    @McpTool(description = "Step into (enter method calls)")
-    public String jdwp_step_into(@McpToolParam(description = "Thread unique ID") long threadId) {
+    @McpTool(description = "Step into a method call (resumes the thread; JDI fires a STEP event on the first line of the callee). " +
+        "Thread must be suspended. After calling, use jdwp_resume_until_event to block until the step lands. " +
+        "Most useful when polymorphic dispatch is unclear and you can't tell from source which override will actually run.")
+    public String jdwp_step_into(
+        @McpToolParam(required = false, description = "Thread unique ID (must be suspended). If omitted, uses the last breakpoint thread.") @Nullable Long threadId) {
         return doStep(threadId, StepRequest.STEP_INTO, "into");
     }
 
-    @McpTool(description = "Step out (exit current method)")
-    public String jdwp_step_out(@McpToolParam(description = "Thread unique ID") long threadId) {
+    @McpTool(description = "Step out of the current frame (resumes the thread; JDI fires a STEP event on the next line of the caller). " +
+        "Thread must be suspended. After calling, use jdwp_resume_until_event to block until the step lands. " +
+        "Useful for escaping uninteresting frames when finding the right caller line for a breakpoint would be awkward.")
+    public String jdwp_step_out(
+        @McpToolParam(required = false, description = "Thread unique ID (must be suspended). If omitted, uses the last breakpoint thread.") @Nullable Long threadId) {
         return doStep(threadId, StepRequest.STEP_OUT, "out");
     }
 
@@ -1391,14 +1400,23 @@ public class JDWPTools {
     }
 
     /**
-     * Performs a single-line step operation (over/into/out) on the given thread.
+     * Single-line step (over/into/out) on the given thread; when {@code threadId} is null,
+     * falls back to the last breakpoint thread.
      */
-    private String doStep(long threadId, int stepDepth, String label) {
+    private String doStep(@Nullable Long threadId, int stepDepth, String label) {
         try {
             final VirtualMachine vm = jdiService.getVM();
-            final ThreadReference thread = findThread(vm, threadId);
-            if (thread == null) {
-                return "Error: Thread not found with ID " + threadId;
+            final ThreadReference thread;
+            if (threadId != null) {
+                thread = findThread(vm, threadId);
+                if (thread == null) {
+                    return "Error: Thread not found with ID " + threadId;
+                }
+            } else {
+                thread = breakpointTracker.getLastBreakpointThread();
+                if (thread == null) {
+                    return "Error: No suspended thread available. Provide a threadId or hit a breakpoint first.";
+                }
             }
 
             if (!thread.isSuspended()) {
@@ -1407,12 +1425,8 @@ public class JDWPTools {
 
             final EventRequestManager erm = vm.eventRequestManager();
 
-            // Delete any existing StepRequests for this thread — JDI allows only one per thread.
-            // Two concurrent step calls on the same thread could otherwise interleave between the
-            // delete and the create (e.g. caller A deletes A's request, caller B creates B's, then
-            // caller A creates A's), leaving both requests live and producing a
-            // DuplicateRequestException. Synchronising on the EventRequestManager makes the
-            // delete-then-create pair atomic from this tool's perspective.
+            // JDI permits only one StepRequest per thread; synchronising on the EventRequestManager
+            // keeps the delete-then-create pair atomic against concurrent step calls.
             final StepRequest stepRequest;
             synchronized (erm) {
                 erm.stepRequests().stream()
@@ -1427,7 +1441,8 @@ public class JDWPTools {
 
             thread.resume();
 
-            return String.format("Step %s executed on thread %d (%s)", label, threadId, thread.name());
+            return String.format("Step %s executed on thread %d (%s). Call jdwp_resume_until_event to wait for the STEP event.",
+                label, thread.uniqueID(), thread.name());
         } catch (Exception e) {
             return "Error: " + e.getMessage();
         }

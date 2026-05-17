@@ -485,6 +485,16 @@ jdwp_get_breakpoint_context(maxFrames=5, includeThisFields=true)
 
 Returns thread info, top stack frames, locals at frame 0, and `this` fields in a single call — replaces the four-call sequence `get_current_thread → get_stack → get_locals → get_fields(this)` that an agent would otherwise need at every breakpoint hit.
 
+### Stepping: when it's worth it
+
+`jdwp_step_over` / `jdwp_step_into` / `jdwp_step_out` are wired through the same event-and-latch pipeline as breakpoints — the step resumes the thread, the next `STEP` event suspends it again, and `jdwp_resume_until_event` blocks on it. `threadId` is optional; omitted, the step targets the thread of the last breakpoint hit.
+
+Each step is one round-trip, so prefer a breakpoint at the destination + `jdwp_resume_until_event` whenever you can predict where execution will go. Stepping pays off in three narrow situations:
+
+- **`step_into`** — polymorphic dispatch is unclear; you can't tell from source which override will run.
+- **`step_out`** — an exception/early-abort left you deep in a frame you don't care about and finding the caller line for a breakpoint is awkward.
+- **`step_over`** — the *single* next line, when observing a state mutation is faster than predicting it. More than ~3 in a row → set a breakpoint instead.
+
 ## Tool reference (46 tools)
 
 ### Connection (3)
@@ -516,9 +526,9 @@ Returns thread info, top stack frames, locals at frame 0, and `this` fields in a
 | `jdwp_resume_thread`      | `threadId`   | Resume a specific thread                              |
 | `jdwp_suspend_thread`     | `threadId`   | Suspend a specific thread                             |
 | `jdwp_resume_until_event` | `timeoutMs?` | Resume and block until next breakpoint/step/exception |
-| `jdwp_step_over`          | `threadId`   | Step over (F6)                                        |
-| `jdwp_step_into`          | `threadId`   | Step into (F7)                                        |
-| `jdwp_step_out`           | `threadId`   | Step out (Shift+F8)                                   |
+| `jdwp_step_over`          | `threadId?`  | Step over current line; follow with `resume_until_event` |
+| `jdwp_step_into`          | `threadId?`  | Step into method call; follow with `resume_until_event`  |
+| `jdwp_step_out`           | `threadId?`  | Step out of current frame; follow with `resume_until_event` |
 
 ### Breakpoints (11)
 
