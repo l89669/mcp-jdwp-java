@@ -195,12 +195,27 @@ Watchers are dual-indexed by watcher UUID and breakpoint ID via `WatcherManager`
 
 ## Logpoint and Conditional Breakpoint Evaluation
 
-Logpoints (`jdwp_set_logpoint`) and conditional breakpoints both use the expression evaluation pipeline:
+Logpoints (`jdwp_set_logpoint`), exception logpoints (`jdwp_set_exception_logpoint`), field watchpoints / field logpoints (`jdwp_set_field_breakpoint`, `jdwp_set_field_logpoint`), and conditional breakpoints all use the expression evaluation pipeline:
 
 - **Logpoints**: evaluate the expression on every hit, record the result to event history, and auto-resume. Support an optional condition expression that gates whether the log fires.
 - **Conditional breakpoints**: evaluate the condition expression on every hit; the thread stays suspended only if the condition evaluates to `true`.
 
 Both are subject to the same constraints: the expression must compile against the frame's visible types, and each evaluation incurs the `invokeMethod` cost. Placing a logpoint inside a tight loop with millions of iterations will be expensive.
+
+### Synthetic bindings
+
+Several breakpoint kinds inject extra named values into the expression scope. These bindings appear as ordinary local variables in the wrapper class generated for the expression — reference them with their `$`-prefixed name.
+
+| Binding       | Available in                                       | Type / Description                                                                                  |
+|---------------|----------------------------------------------------|-----------------------------------------------------------------------------------------------------|
+| `$exception`  | exception breakpoints, exception logpoints         | The thrown `Throwable`. Always non-null.                                                            |
+| `$oldValue`   | field breakpoints, field logpoints                 | Value before the event — the value being read (access) or about to be overwritten (modification). Omitted when the JDI value is Java-null. |
+| `$newValue`   | field breakpoints, field logpoints (modification)  | Value about to be written. Modification events only; absent on access events.                       |
+| `$object`     | field breakpoints, field logpoints                 | The instance the field belongs to. Omitted (key absent) for static fields.                          |
+| `$fieldName`  | field breakpoints, field logpoints                 | String mirror of the watched field's simple name.                                                   |
+| `$mode`       | field breakpoints, field logpoints                 | String mirror — `"access"` or `"modification"` — identifying which direction fired. Useful in BOTH-mode handlers. |
+
+Bindings are passed as the third argument to `JdiExpressionEvaluator.evaluate(frame, expression, extraBindings)`. The evaluator merges them with the frame's visible locals, so an expression like `$oldValue.equals(currentLocal)` resolves both names. Conditional bindings (e.g. `$object` for instance vs static fields) are intentionally **absent from the map** rather than bound to a null sentinel — referencing them on the wrong event kind yields a compile-time error from JDT, not a misleading NPE at evaluation time.
 
 ## Reentrancy Protection
 
