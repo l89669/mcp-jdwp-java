@@ -1694,33 +1694,51 @@ public class JDWPTools {
         }
     }
 
-    @McpTool(description = "Clear a breakpoint by its synthetic ID (from jdwp_list_breakpoints or jdwp_list_exception_breakpoints). Routes by kind: line breakpoints and exception breakpoints are both addressed by the same ID space.")
+    @McpTool(description = "Clear a breakpoint by its synthetic ID (from jdwp_list_breakpoints, jdwp_list_exception_breakpoints, or jdwp_list_field_breakpoints). Routes by kind: line, exception, and field breakpoints share one ID space.")
     public String jdwp_clear_breakpoint(@McpToolParam(description = "Breakpoint ID to clear") int breakpointId) {
         try {
             // Distinguish "unknown" from "wrong kind" up-front. Cascade BEFORE removal so
             // CHAIN_BROKEN events land in front of the removal confirmation.
             final boolean isLineBp = breakpointTracker.getBreakpoint(breakpointId) != null
                 || breakpointTracker.getPendingBreakpoint(breakpointId) != null;
-            final boolean isExceptionBp = !isLineBp && breakpointTracker.isKnownBreakpointId(breakpointId);
+            final boolean isExceptionBp = !isLineBp && (
+                breakpointTracker.getAllExceptionBreakpoints().containsKey(breakpointId)
+                || breakpointTracker.getAllPendingExceptionBreakpoints().containsKey(breakpointId));
+            final boolean isFieldBp = !isLineBp && !isExceptionBp && (
+                breakpointTracker.getAllFieldBreakpoints().containsKey(breakpointId)
+                || breakpointTracker.getAllPendingFieldBreakpoints().containsKey(breakpointId));
 
-            if (!isLineBp && !isExceptionBp) {
+            if (!isLineBp && !isExceptionBp && !isFieldBp) {
                 return String.format("Breakpoint %d not found", breakpointId);
             }
 
             final int detached = cascadeChainBreak(breakpointId);
-            final boolean removed = isLineBp
-                ? breakpointTracker.removeBreakpoint(breakpointId)
-                : breakpointTracker.removeExceptionBreakpoint(breakpointId);
+            final boolean removed;
+            if (isLineBp) {
+                removed = breakpointTracker.removeBreakpoint(breakpointId);
+            } else if (isExceptionBp) {
+                removed = breakpointTracker.removeExceptionBreakpoint(breakpointId);
+            } else {
+                removed = breakpointTracker.removeFieldBreakpoint(breakpointId);
+            }
             if (!removed) {
                 // Defensive: handle the race where another thread removed the BP between the
                 // kind probe above and this call.
                 return String.format("Breakpoint %d not found", breakpointId);
             }
 
-            final int watchersRemoved = isLineBp
-                ? watcherManager.deleteWatchersForBreakpoint(breakpointId) : 0;
+            // Watchers may be attached to any BP kind via jdwp_attach_watcher — clean them on every
+            // remove so a recycled or stale ID can never resurface as an orphan in jdwp_list_watchers.
+            final int watchersRemoved = watcherManager.deleteWatchersForBreakpoint(breakpointId);
 
-            final String kindLabel = isLineBp ? "Breakpoint" : "Exception breakpoint";
+            final String kindLabel;
+            if (isLineBp) {
+                kindLabel = "Breakpoint";
+            } else if (isExceptionBp) {
+                kindLabel = "Exception breakpoint";
+            } else {
+                kindLabel = "Field breakpoint";
+            }
             String msg = String.format("%s %d cleared", kindLabel, breakpointId);
             if (watchersRemoved > 0) {
                 msg += String.format(" (%d associated watcher(s) also removed)", watchersRemoved);
@@ -2119,12 +2137,346 @@ public class JDWPTools {
         }
     }
 
-    @McpTool(description = "Clear ALL session state (breakpoints, exception breakpoints, watchers, object cache, event history) WITHOUT disconnecting from the target VM. Use between sequential debugging scenarios against the same long-running target.")
+    @McpTool(description = "Set a field watchpoint that suspends the firing thread when the field is read " +
+        "(mode='access'), written (mode='modification'), or both. Conditions are evaluated against the firing " +
+        "frame with $oldValue, $newValue (modification only), $object (null for static), $fieldName, and $mode " +
+        "bound. If the class is not yet loaded, the watchpoint is deferred and activates automatically. " +
+        "ERROR if the field is ambiguous on the class, missing, or static when objectFilterId is supplied.")
+    public String jdwp_set_field_breakpoint(
+        @McpToolParam(description = "Fully-qualified class declaring the field (e.g., 'com.example.Order')") String className,
+        @McpToolParam(description = "Field name (must be unambiguous on the class)") String fieldName,
+        @McpToolParam(description = "Watch mode: 'access', 'modification', or 'both' (case-insensitive)") String mode,
+        @McpToolParam(required = false, description = "Optional condition with $oldValue, $newValue, $object, $fieldName, $mode bound — fire only when this evaluates to true") @Nullable String condition,
+        @McpToolParam(required = false, description = "Optional thread filter — only fire when this thread (uniqueID) hits the field") @Nullable Long threadFilterId,
+        @McpToolParam(required = false, description = "Optional object filter — only fire on the given instance (object ID from jdwp_get_locals/jdwp_get_fields). Must be omitted for static fields.") @Nullable Long objectFilterId,
+        @McpToolParam(required = false, description = "Optional ID of a trigger breakpoint — this field BP stays disarmed until the trigger fires. Sticky by default.") @Nullable Integer triggerBreakpointId,
+        @McpToolParam(required = false, description = "If true, re-disarm this BP after each hit so the next trigger fire re-arms it. Default: false (sticky).") @Nullable Boolean oneShot) {
+        return registerFieldBreakpointInternal(
+            className, fieldName, mode,
+            /* expression */ null, condition,
+            threadFilterId, objectFilterId,
+            triggerBreakpointId, oneShot);
+    }
+
+    @McpTool(description = "Set a non-stopping field watchpoint that records a FIELD_LOGPOINT event for each " +
+        "access or modification of the field. The expression is evaluated against the firing frame with " +
+        "$oldValue, $newValue (modification only), $object (null for static), $fieldName, and $mode bound; " +
+        "its result is attached to the event. Optional condition gates whether the log is recorded. " +
+        "Use this to trace state transitions in long-running services without halting traffic.")
+    public String jdwp_set_field_logpoint(
+        @McpToolParam(description = "Fully-qualified class declaring the field") String className,
+        @McpToolParam(description = "Field name (must be unambiguous on the class)") String fieldName,
+        @McpToolParam(description = "Watch mode: 'access', 'modification', or 'both' (case-insensitive)") String mode,
+        @McpToolParam(description = "Java expression evaluated on each hit (e.g., '$oldValue + \" -> \" + $newValue')") String expression,
+        @McpToolParam(required = false, description = "Optional condition with the same synthetic bindings — log only when true") @Nullable String condition,
+        @McpToolParam(required = false, description = "Optional thread filter — only fire when this thread (uniqueID) hits the field") @Nullable Long threadFilterId,
+        @McpToolParam(required = false, description = "Optional object filter — only fire on the given instance. Must be omitted for static fields.") @Nullable Long objectFilterId,
+        @McpToolParam(required = false, description = "Optional ID of a trigger breakpoint — this logpoint stays disarmed until the trigger fires. Sticky by default.") @Nullable Integer triggerBreakpointId,
+        @McpToolParam(required = false, description = "If true, re-disarm after each hit so the next trigger fire re-arms it. Default: false (sticky).") @Nullable Boolean oneShot) {
+        if (expression == null || expression.isBlank()) {
+            return "Error: expression is required for jdwp_set_field_logpoint. "
+                + "Use jdwp_set_field_breakpoint for a suspending field BP without expression evaluation.";
+        }
+        return registerFieldBreakpointInternal(
+            className, fieldName, mode,
+            expression, condition,
+            threadFilterId, objectFilterId,
+            triggerBreakpointId, oneShot);
+    }
+
+    /**
+     * Shared registration path for suspending field breakpoints and field logpoints. Returns an
+     * {@code Error: ...} response (does not throw, does not silently fall back) when the user
+     * supplies an invalid mode, an objectFilterId for a static field, or an ambiguous / missing
+     * field — silent fallback would let the caller believe the BP is set when it isn't, and field
+     * BPs only re-surface on event delivery, so a half-installed one can hide for the remainder of
+     * the session. Falls back to the pending state when the declaring class is not loaded,
+     * identical to the exception-BP path; the static-vs-objectFilter validation defers to class
+     * load in that case and a {@code Note:} line in the response warns the caller.
+     */
+    private String registerFieldBreakpointInternal(
+        String className, String fieldName, String mode,
+        @Nullable String expression, @Nullable String condition,
+        @Nullable Long threadFilterId, @Nullable Long objectFilterId,
+        @Nullable Integer triggerBreakpointId, @Nullable Boolean oneShot) {
+        try {
+            if (className == null || className.isBlank()) {
+                return "Error: className is required";
+            }
+            if (fieldName == null || fieldName.isBlank()) {
+                return "Error: fieldName is required";
+            }
+            if (mode == null || mode.isBlank()) {
+                return "Error: mode is required (one of: access, modification, both)";
+            }
+            final BreakpointTracker.FieldWatchMode watchMode;
+            switch (mode.toLowerCase(Locale.ROOT)) {
+                case "access" -> watchMode = BreakpointTracker.FieldWatchMode.ACCESS;
+                case "modification", "modify", "write" -> watchMode = BreakpointTracker.FieldWatchMode.MODIFICATION;
+                case "both" -> watchMode = BreakpointTracker.FieldWatchMode.BOTH;
+                default -> {
+                    return String.format(
+                        "Error: invalid mode '%s' — expected one of: access, modification, both", mode);
+                }
+            }
+            if (triggerBreakpointId != null && !breakpointTracker.isKnownBreakpointId(triggerBreakpointId)) {
+                return String.format("Error: Trigger breakpoint #%d does not exist", triggerBreakpointId);
+            }
+            final boolean effectiveOneShot = oneShot != null && oneShot;
+            final String normalisedCondition = (condition == null || condition.isBlank()) ? null : condition;
+            final boolean isLogpoint = expression != null;
+
+            final BreakpointTracker.FieldBreakpointSpec spec = isLogpoint
+                ? BreakpointTracker.FieldBreakpointSpec.logOnly(className, fieldName, watchMode,
+                    expression, threadFilterId, objectFilterId, normalisedCondition)
+                : BreakpointTracker.FieldBreakpointSpec.suspending(className, fieldName, watchMode,
+                    threadFilterId, objectFilterId, normalisedCondition);
+
+            final VirtualMachine vm = jdiService.getVM();
+            final EventRequestManager erm = vm.eventRequestManager();
+            final ReferenceType eagerType = jdiService.findOrForceLoadClass(className);
+
+            final String chainInfo = triggerBreakpointId != null
+                ? String.format("\n  Chain: trigger=#%d%s",
+                    triggerBreakpointId, effectiveOneShot ? " (one-shot)" : " (sticky)") : "";
+            final String expressionLine = isLogpoint ? "\n  Expression: " + expression : "";
+            final String conditionLine = normalisedCondition != null ? "\n  Condition: " + normalisedCondition : "";
+            final String filterLine =
+                (threadFilterId != null || objectFilterId != null)
+                    ? "\n  Filters:"
+                        + (threadFilterId != null ? " thread=" + threadFilterId : "")
+                        + (objectFilterId != null ? " object=" + objectFilterId : "")
+                    : "";
+
+            if (eagerType == null) {
+                final int pendingId = breakpointTracker.registerPendingFieldBreakpoint(spec);
+                if (normalisedCondition != null) {
+                    breakpointTracker.setCondition(pendingId, normalisedCondition);
+                }
+                if (triggerBreakpointId != null) {
+                    breakpointTracker.registerDependency(pendingId, triggerBreakpointId, effectiveOneShot);
+                }
+                if (!breakpointTracker.hasClassPrepareRequest(className)) {
+                    final ClassPrepareRequest cpr = erm.createClassPrepareRequest();
+                    cpr.addClassFilter(className);
+                    cpr.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
+                    cpr.enable();
+                    breakpointTracker.registerClassPrepareRequest(className, cpr);
+                }
+                // Static-ness cannot be checked until the class loads — surface a warning so users
+                // who supplied an objectFilterId know the validation is deferred. If the field turns
+                // out to be static on load, the pending entry is marked FAILED and visible via
+                // jdwp_list_field_breakpoints.
+                final String objectFilterWarning = objectFilterId != null
+                    ? "\n  Note: objectFilterId is set — if '" + fieldName
+                        + "' turns out to be static on load, the breakpoint will fail; "
+                        + "check jdwp_list_field_breakpoints after the class loads."
+                    : "";
+                return String.format("""
+                        Field breakpoint deferred (ID: %d)
+                          Class: %s
+                          Field: %s
+                          Mode: %s (%s)%s%s%s%s%s
+                        Class not yet loaded — will activate automatically when the JVM loads it.""",
+                    pendingId, className, fieldName, watchMode.name().toLowerCase(Locale.ROOT),
+                    isLogpoint ? "log-only" : "suspend",
+                    expressionLine, conditionLine, filterLine, chainInfo, objectFilterWarning);
+            }
+
+            // Resolve the field on the eagerly-loaded class. Ambiguous (declared on multiple types
+            // via shadowing or interface inheritance) and missing fields are hard errors — silent
+            // fallback would let the user think the BP is set when it isn't.
+            final List<Field> candidates = eagerType.allFields().stream()
+                .filter(f -> f.name().equals(fieldName))
+                .toList();
+            if (candidates.isEmpty()) {
+                return String.format("Error: Field '%s' not found on %s or its supertypes", fieldName, className);
+            }
+            if (candidates.size() > 1) {
+                return String.format(
+                    "Error: Field '%s' is ambiguous on %s (declared on %d types) — use a more specific className",
+                    fieldName, className, candidates.size());
+            }
+            final Field field = candidates.get(0);
+            if (objectFilterId != null && field.isStatic()) {
+                return String.format(
+                    "Error: Field '%s' on %s is static; objectFilterId does not apply", fieldName, className);
+            }
+
+            // Two-step creation for BOTH-mode mirrors BreakpointTracker.promoteSinglePendingField:
+            // accumulate created requests and roll back on any failure so a half-armed pair never
+            // leaks onto the target VM.
+            final List<EventRequest> createdRequests = new ArrayList<>(2);
+            AccessWatchpointRequest accessReq = null;
+            ModificationWatchpointRequest modReq = null;
+            try {
+                if (watchMode == BreakpointTracker.FieldWatchMode.ACCESS
+                    || watchMode == BreakpointTracker.FieldWatchMode.BOTH) {
+                    accessReq = erm.createAccessWatchpointRequest(field);
+                    createdRequests.add(accessReq);
+                    configureWatchpoint(accessReq, threadFilterId, objectFilterId, vm);
+                }
+                if (watchMode == BreakpointTracker.FieldWatchMode.MODIFICATION
+                    || watchMode == BreakpointTracker.FieldWatchMode.BOTH) {
+                    modReq = erm.createModificationWatchpointRequest(field);
+                    createdRequests.add(modReq);
+                    configureWatchpoint(modReq, threadFilterId, objectFilterId, vm);
+                }
+            } catch (Exception inner) {
+                for (EventRequest leaked : createdRequests) {
+                    try {
+                        erm.deleteEventRequest(leaked);
+                    } catch (Exception ignore) {
+                        // No-op: best-effort cleanup, do not mask the original failure.
+                    }
+                }
+                return "Error: failed to create field watchpoint — " + inner.getMessage();
+            }
+
+            final int id = breakpointTracker.registerFieldBreakpoint(spec, accessReq, modReq);
+            if (normalisedCondition != null) {
+                breakpointTracker.setCondition(id, normalisedCondition);
+            }
+            if (triggerBreakpointId != null) {
+                breakpointTracker.registerDependency(id, triggerBreakpointId, effectiveOneShot);
+                // Stays disabled — the chain will arm it when the trigger fires.
+            } else {
+                if (accessReq != null) {
+                    accessReq.setEnabled(true);
+                }
+                if (modReq != null) {
+                    modReq.setEnabled(true);
+                }
+            }
+
+            return String.format("""
+                    Field breakpoint set (ID: %d)
+                      Class: %s
+                      Field: %s
+                      Mode: %s (%s)%s%s%s%s""",
+                id, className, fieldName, watchMode.name().toLowerCase(Locale.ROOT),
+                isLogpoint ? "log-only" : "suspend",
+                expressionLine, conditionLine, filterLine, chainInfo);
+        } catch (Exception e) {
+            return "Error: " + e.getMessage();
+        }
+    }
+
+    /**
+     * Applies suspend policy, thread filter, and instance filter to a freshly-created watchpoint
+     * request. The MCP tool path here mirrors {@code BreakpointTracker.configureFieldRequest} but
+     * stays in the tool layer because the deferred / promotion path lives there; keeping the two
+     * configurators identical means a refactor in either place is one-line obvious. Always
+     * SUSPEND_EVENT_THREAD: logOnly BPs are auto-resumed by the listener after recording.
+     */
+    private void configureWatchpoint(WatchpointRequest req,
+                                     @Nullable Long threadFilterId, @Nullable Long objectFilterId,
+                                     VirtualMachine vm) {
+        req.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
+        if (threadFilterId != null) {
+            final ThreadReference thread = vm.allThreads().stream()
+                .filter(t -> t.uniqueID() == threadFilterId)
+                .findFirst().orElse(null);
+            if (thread == null) {
+                throw new IllegalStateException(
+                    "Thread #" + threadFilterId + " no longer alive — cannot apply thread filter");
+            }
+            req.addThreadFilter(thread);
+        }
+        if (objectFilterId != null) {
+            final ObjectReference instance = jdiService.getCachedObject(objectFilterId);
+            if (instance == null) {
+                throw new IllegalStateException(
+                    "Object #" + objectFilterId + " no longer in cache — re-fetch via jdwp_get_locals or jdwp_get_fields");
+            }
+            req.addInstanceFilter(instance);
+        }
+    }
+
+    @McpTool(description = "List all field breakpoints (active and pending), with chain status, mode, filters, and any pending failure reason.")
+    public String jdwp_list_field_breakpoints() {
+        try {
+            final Map<Integer, BreakpointTracker.FieldBreakpointInfo> active = breakpointTracker.getAllFieldBreakpoints();
+            final Map<Integer, BreakpointTracker.PendingFieldBreakpoint> pending = breakpointTracker.getAllPendingFieldBreakpoints();
+
+            if (active.isEmpty() && pending.isEmpty()) {
+                return "No field breakpoints set.\n\nUse jdwp_set_field_breakpoint() to watch a field.";
+            }
+
+            final StringBuilder result = new StringBuilder();
+            int i = 1;
+
+            if (!active.isEmpty()) {
+                result.append(String.format("Active field breakpoints: %d\n\n", active.size()));
+                for (Map.Entry<Integer, BreakpointTracker.FieldBreakpointInfo> entry : active.entrySet()) {
+                    final int id = entry.getKey();
+                    final BreakpointTracker.FieldBreakpointSpec spec = entry.getValue().getSpec();
+                    final BreakpointTracker.TriggerLink chain = breakpointTracker.getDependencyOfDependent(id);
+                    final EventRequest req = breakpointTracker.getEventRequestById(id);
+                    final boolean armed = req != null && req.isEnabled();
+                    final String chainInfo = chain != null
+                        ? String.format(", chain=#%d (%s, %s)", chain.triggerId(),
+                            chain.oneShot() ? "one-shot" : "sticky",
+                            armed ? "ARMED" : "WAITING") : "";
+                    result.append(String.format("%d. (ID: %d) %s.%s — mode: %s, %s%s%s%s\n",
+                        i++, id, spec.className(), spec.fieldName(),
+                        spec.mode().name().toLowerCase(Locale.ROOT),
+                        spec.logOnly() ? "log-only" : "suspend",
+                        spec.expression() != null ? ", expression: " + spec.expression() : "",
+                        renderFilters(spec.threadFilterId(), spec.objectFilterId()),
+                        chainInfo));
+                }
+            }
+
+            if (!pending.isEmpty()) {
+                if (!active.isEmpty()) {
+                    result.append('\n');
+                }
+                result.append(String.format("Pending field breakpoints: %d\n\n", pending.size()));
+                for (Map.Entry<Integer, BreakpointTracker.PendingFieldBreakpoint> entry : pending.entrySet()) {
+                    final int id = entry.getKey();
+                    final BreakpointTracker.PendingFieldBreakpoint pf = entry.getValue();
+                    final BreakpointTracker.FieldBreakpointSpec spec = pf.getSpec();
+                    final String status = pf.getFailureReason() != null
+                        ? " [FAILED: " + pf.getFailureReason() + ']' : " [PENDING]";
+                    final BreakpointTracker.TriggerLink chain = breakpointTracker.getDependencyOfDependent(id);
+                    final String chainInfo = chain != null
+                        ? String.format(", chain=#%d (%s)", chain.triggerId(),
+                            chain.oneShot() ? "one-shot" : "sticky") : "";
+                    result.append(String.format("%d. (ID: %d) %s.%s — mode: %s, %s%s%s%s%s\n",
+                        i++, id, spec.className(), spec.fieldName(),
+                        spec.mode().name().toLowerCase(Locale.ROOT),
+                        spec.logOnly() ? "log-only" : "suspend",
+                        spec.expression() != null ? ", expression: " + spec.expression() : "",
+                        renderFilters(spec.threadFilterId(), spec.objectFilterId()),
+                        chainInfo, status));
+                }
+            }
+
+            return result.toString();
+        } catch (Exception e) {
+            return "Error: " + e.getMessage();
+        }
+    }
+
+    private static String renderFilters(@Nullable Long threadFilterId, @Nullable Long objectFilterId) {
+        if (threadFilterId == null && objectFilterId == null) {
+            return "";
+        }
+        final StringBuilder sb = new StringBuilder(", filters:");
+        if (threadFilterId != null) sb.append(" thread=").append(threadFilterId);
+        if (objectFilterId != null) sb.append(" object=").append(objectFilterId);
+        return sb.toString();
+    }
+
+    @McpTool(description = "Clear ALL session state (breakpoints, exception breakpoints, field breakpoints, watchers, object cache, event history) WITHOUT disconnecting from the target VM. Use between sequential debugging scenarios against the same long-running target.")
     public String jdwp_reset() {
         final int activeBp = breakpointTracker.getAllBreakpoints().size();
         final int pendingBp = breakpointTracker.getAllPendingBreakpoints().size();
         final int activeExBp = breakpointTracker.getAllExceptionBreakpoints().size();
         final int pendingExBp = breakpointTracker.getAllPendingExceptionBreakpoints().size();
+        final int activeFieldBp = breakpointTracker.getAllFieldBreakpoints().size();
+        final int pendingFieldBp = breakpointTracker.getAllPendingFieldBreakpoints().size();
         final int watchers = watcherManager.getAllWatchers().size();
         final int events = eventHistory.size();
 
@@ -2153,21 +2505,25 @@ public class JDWPTools {
                 %s
                   Breakpoints cleared:           %d active + %d pending
                   Exception breakpoints cleared: %d active + %d pending
+                  Field breakpoints cleared:     %d active + %d pending
                   Watchers cleared:              %d
                   Event history cleared:         %d entries
                   Object cache cleared.""",
-            header, activeBp, pendingBp, activeExBp, pendingExBp, watchers, events);
+            header, activeBp, pendingBp, activeExBp, pendingExBp,
+            activeFieldBp, pendingFieldBp, watchers, events);
     }
 
-    @McpTool(description = "Clear ALL breakpoints (active and pending) set by this MCP server")
+    @McpTool(description = "Clear ALL breakpoints (line, exception, and field — active and pending) set by this MCP server")
     public String jdwp_clear_all_breakpoints() {
         try {
             final int activeCount = breakpointTracker.getAllBreakpoints().size();
             final int pendingCount = breakpointTracker.getAllPendingBreakpoints().size();
             final int exceptionCount = breakpointTracker.getAllExceptionBreakpoints().size()
                 + breakpointTracker.getAllPendingExceptionBreakpoints().size();
+            final int fieldCount = breakpointTracker.getAllFieldBreakpoints().size()
+                + breakpointTracker.getAllPendingFieldBreakpoints().size();
             final int totalCount = activeCount + pendingCount;
-            if (totalCount == 0 && exceptionCount == 0) {
+            if (totalCount == 0 && exceptionCount == 0 && fieldCount == 0) {
                 return "No breakpoints to clear";
             }
 
@@ -2175,10 +2531,22 @@ public class JDWPTools {
             breakpointTracker.clearAll(vm.eventRequestManager());
             watcherManager.clearAll();
 
-            String msg = String.format("Cleared %d breakpoint(s) (%d active, %d pending) and all associated watchers.",
-                totalCount, activeCount, pendingCount);
+            // Build the message from the BP kinds that actually had non-zero counts so a session
+            // with only exception or only field BPs reads cleanly instead of leading with "Cleared
+            // 0 breakpoint(s)".
+            String msg;
+            if (totalCount > 0) {
+                msg = String.format(
+                    "Cleared %d breakpoint(s) (%d active, %d pending) and all associated watchers.",
+                    totalCount, activeCount, pendingCount);
+            } else {
+                msg = "All associated watchers cleared.";
+            }
             if (exceptionCount > 0) {
                 msg += String.format(" Also cleared %d exception breakpoint(s).", exceptionCount);
+            }
+            if (fieldCount > 0) {
+                msg += String.format(" Also cleared %d field breakpoint(s).", fieldCount);
             }
             return msg;
         } catch (Exception e) {
