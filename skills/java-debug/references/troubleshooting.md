@@ -1,5 +1,15 @@
 # Troubleshooting the JDWP MCP Server
 
+## Start here: `jdwp_diagnose`
+
+When something isn't working — can't connect, breakpoint won't fire, target JVM seems to be gone — run `jdwp_diagnose` first. It returns a three-block "state of the world" snapshot in one call:
+
+1. **MCP server** — PID, uptime, configured target host/port.
+2. **JDWP connection** — connected/disconnected with the last-attempt error; when connected, the breakpoint+events report follows inline.
+3. **Local JVMs** — every JVM visible to your user, with its JDWP port (read from `/proc` on Linux, confirmed by handshake) and whether it's listening, suspended on startup, attached to us, or unreachable.
+
+This answers most "what's going on?" questions without `ps`/`lsof`/`jps`. Add `inspectAll=true` only if a JVM shows no port and you suspect JDWP is on — that briefly attaches to read `sun.jdwp.listenerAddress` (visible to the target, hence opt-in).
+
 ## Tool returns an unexpected error or server seems stuck
 
 1. Check the server log if your installation writes one — the JDWP MCP server logs JDI operations and errors there.

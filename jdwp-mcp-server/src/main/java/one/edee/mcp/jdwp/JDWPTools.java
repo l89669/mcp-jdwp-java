@@ -3,17 +3,24 @@ package one.edee.mcp.jdwp;
 import com.sun.jdi.*;
 import com.sun.jdi.connect.IllegalConnectorArgumentsException;
 import com.sun.jdi.request.*;
+import one.edee.mcp.jdwp.discovery.DiagnoseReportRenderer;
+import one.edee.mcp.jdwp.discovery.JvmDescriptor;
+import one.edee.mcp.jdwp.discovery.JvmDiscoveryService;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
 import one.edee.mcp.jdwp.watchers.Watcher;
 import one.edee.mcp.jdwp.watchers.WatcherManager;
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.ai.mcp.annotation.McpResource;
 import org.springframework.ai.mcp.annotation.McpTool;
 import org.springframework.ai.mcp.annotation.McpToolParam;
 import org.springframework.stereotype.Service;
 
 import java.io.IOException;
+import java.lang.management.ManagementFactory;
+import java.lang.reflect.Modifier;
+import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -22,10 +29,12 @@ import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
- * Single MCP-facing surface for the JDWP debugger. Each `@McpTool` method is auto-discovered by the
- * Spring AI MCP framework and exposed as an invocable tool; the per-tool contracts (parameters,
- * behaviour, error formats) live in the `@McpTool(description=...)` strings and are NOT duplicated
- * in this JavaDoc.
+ * Single MCP-facing surface for the JDWP debugger. Each {@code @McpTool} method is auto-discovered
+ * by the Spring AI MCP framework and exposed as an invocable tool; a small number of read-only
+ * snapshots are additionally exposed as {@code @McpResource} URIs so users can attach them via
+ * the {@code @server:uri} mention picker without burning a tool call. Per-tool / per-resource
+ * contracts (parameters, behaviour, error formats) live in the annotation {@code description}
+ * strings and are NOT duplicated in this JavaDoc.
  * <p>
  * Architecture: every tool method is a thin orchestration layer over the underlying services
  * ({@link JDIConnectionService}, {@link BreakpointTracker}, {@link JdiExpressionEvaluator},
@@ -77,16 +86,19 @@ public class JDWPTools {
     private final JdiExpressionEvaluator expressionEvaluator;
     private final EventHistory eventHistory;
     private final EvaluationGuard evaluationGuard;
+    private final JvmDiscoveryService jvmDiscoveryService;
 
     public JDWPTools(JDIConnectionService jdiService, BreakpointTracker breakpointTracker,
                      WatcherManager watcherManager, JdiExpressionEvaluator expressionEvaluator,
-                     EventHistory eventHistory, EvaluationGuard evaluationGuard) {
+                     EventHistory eventHistory, EvaluationGuard evaluationGuard,
+                     JvmDiscoveryService jvmDiscoveryService) {
         this.jdiService = jdiService;
         this.breakpointTracker = breakpointTracker;
         this.watcherManager = watcherManager;
         this.expressionEvaluator = expressionEvaluator;
         this.eventHistory = eventHistory;
         this.evaluationGuard = evaluationGuard;
+        this.jvmDiscoveryService = jvmDiscoveryService;
     }
 
     /**
@@ -233,6 +245,18 @@ public class JDWPTools {
     }
 
     /**
+     * Strips a single pair of surrounding double quotes from a Java string literal — the value
+     * passed by callers to jdwp_set_local / jdwp_set_field includes its source quotes (e.g.
+     * {@code "hello"}), but the target slot expects the raw string content.
+     */
+    private static String stripJavaStringQuotes(String value) {
+        if (value.length() >= 2 && value.startsWith("\"") && value.endsWith("\"")) {
+            return value.substring(1, value.length() - 1);
+        }
+        return value;
+    }
+
+    /**
      * Finds a thread by its unique ID.
      */
     @Nullable
@@ -302,13 +326,23 @@ public class JDWPTools {
             }
         }
 
-        return String.format("""
+        final String baseMessage = String.format("""
                 [TIMEOUT] No JVM listening on %s:%d after %d attempt(s) over %dms.
                 Last error: %s
-                
+
                 Make sure the target JVM was launched with -agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=*:%d
                 For Maven tests in this repo, use: mvn test -Dmaven.surefire.debug""",
             resolvedHost, resolvedPort, attempts, deadlineMs, lastError, resolvedPort);
+        // Run discovery on timeout — surfacing the local-JVM list helps the user spot a JVM
+        // that came up on a different port, or didn't come up at all. Same time budget as
+        // jdwp_diagnose; failures degrade silently to just the base message.
+        JDIConnectionService.@Nullable ConnectionStatus status;
+        try {
+            status = jdiService.getConnectionStatus();
+        } catch (Exception ignored) {
+            status = null;
+        }
+        return baseMessage + '\n' + renderLocalJvmsBlock(status, false);
     }
 
     @McpTool(description = "Disconnect from the JDWP server")
@@ -357,7 +391,8 @@ public class JDWPTools {
                         final int frameCount = thread.frameCount();
                         result.append(String.format("  Frames: %d\n", frameCount));
                     } catch (IncompatibleThreadStateException e) {
-                        // Thread state changed between isSuspended() and frameCount()
+                        // Thread resumed in the gap between isSuspended() and frameCount();
+                        // skip the frame count rather than failing the whole listing.
                     }
                 }
 
@@ -442,16 +477,76 @@ public class JDWPTools {
         }
     }
 
-    @McpTool(description = "Get fields (properties) of an object by its object ID (obtained from jdwp_get_locals)")
+    @McpTool(description = "Get fields (properties) of an object by its object ID (obtained from jdwp_get_locals). Returns '[ERROR] Object #N belongs to a previous VM session ...' if the ID came from a prior connection — re-fetch via jdwp_get_locals after re-attach.")
     public String jdwp_get_fields(@McpToolParam(description = "Object unique ID") long objectId) {
         try {
+            final ObjectReference cached = jdiService.getCachedObject(objectId);
+            final String staleVmHint = staleVmHintIfMismatched(objectId, cached);
+            if (staleVmHint != null) {
+                return staleVmHint;
+            }
             return jdiService.getObjectFields(objectId);
         } catch (Exception e) {
             return "Error: " + e.getMessage();
         }
     }
 
-    @McpTool(description = "Invoke toString() on a cached object to get its string representation")
+    /**
+     * Returns a user-facing hint string when the cached object belongs to a previous VM session
+     * (i.e. its {@link ObjectReference#virtualMachine()} no longer matches the live VM held by
+     * {@link JDIConnectionService}). Returns {@code null} when the cache slot is empty (caller is
+     * responsible for that case) or when the VM identity matches.
+     *
+     * <p>A silent re-attach to a different target between MCP calls leaves stale object IDs in
+     * the cache; without this check the caller would see an opaque JDI error instead of an
+     * actionable instruction to re-fetch the id via {@code jdwp_get_locals}.
+     */
+    @Nullable
+    private String staleVmHintIfMismatched(long objectId, @Nullable ObjectReference cached) {
+        if (cached == null) {
+            return null;
+        }
+        final VirtualMachine liveVm;
+        try {
+            liveVm = jdiService.getVM();
+        } catch (Exception e) {
+            return null;
+        }
+        final VirtualMachine cachedVm;
+        try {
+            cachedVm = cached.virtualMachine();
+        } catch (Exception e) {
+            // Object reference probably belongs to a dead VM — fall through to the mismatch
+            // message rather than letting the caller blow up on a downstream call.
+            return staleVmMessage(objectId);
+        }
+        // A null cached VM means we have no identity information to compare against; treat as
+        // "no mismatch detected" rather than producing a false-positive alert.
+        if (cachedVm == null || cachedVm == liveVm) {
+            return null;
+        }
+        return staleVmMessage(objectId);
+    }
+
+    private static String staleVmMessage(long objectId) {
+        return String.format(
+            "[ERROR] Object #%d belongs to a previous VM session — the cache entry is stale. "
+                + "Re-attach state was lost across reconnects; call jdwp_get_locals() to obtain a fresh object id.",
+            objectId);
+    }
+
+    /**
+     * Canonical {@code [VM_DEATH]} response for tools that hit a {@link VMDisconnectedException}
+     * mid-call. JDI throws this unchecked exception when the target VM dies during an in-flight
+     * operation (e.g. {@code invokeMethod}, expression evaluation). Surfacing it as a generic
+     * {@code "Error: ..."} loses the actionable hint that the cure is to re-attach.
+     */
+    private static String vmDisconnectedMessage(String operation) {
+        return "[VM_DEATH] target VM disconnected during " + operation
+            + " — re-attach via jdwp_connect / jdwp_wait_for_attach.";
+    }
+
+    @McpTool(description = "Invoke toString() on a cached object to get its string representation. Returns '[VM_DEATH] ...' if the target VM disconnects mid-call.")
     public String jdwp_to_string(
         @McpToolParam(description = "Object unique ID (from jdwp_get_locals or jdwp_get_fields)") long objectId,
         @McpToolParam(required = false, description = "Thread unique ID (must be suspended). If omitted, uses the last breakpoint thread.") @Nullable Long threadId) {
@@ -460,6 +555,10 @@ public class JDWPTools {
             if (obj == null) {
                 return String.format("[ERROR] Object #%d not found in cache.\n" +
                     "Use jdwp_get_locals() to discover objects in the current scope.", objectId);
+            }
+            final String staleVmHint = staleVmHintIfMismatched(objectId, obj);
+            if (staleVmHint != null) {
+                return staleVmHint;
             }
 
             final VirtualMachine vm = jdiService.getVM();
@@ -508,12 +607,14 @@ public class JDWPTools {
             }
             return String.format("Object #%d (%s).toString() = %s",
                 objectId, obj.referenceType().name(), formatValue(result));
+        } catch (VMDisconnectedException vmDead) {
+            return vmDisconnectedMessage("jdwp_to_string");
         } catch (Exception e) {
             return "Error invoking toString(): " + e.getMessage();
         }
     }
 
-    @McpTool(description = "Evaluate a Java expression in the context of a suspended thread's stack frame")
+    @McpTool(description = "Evaluate a Java expression in the context of a suspended thread's stack frame. Returns '[VM_DEATH] ...' if the target VM disconnects mid-call.")
     public String jdwp_evaluate_expression(
         @McpToolParam(description = "Thread unique ID") long threadId,
         @McpToolParam(description = "Java expression to evaluate (e.g., 'order.getTotal()', 'x + y', 'name.length()')") String expression,
@@ -534,6 +635,8 @@ public class JDWPTools {
             final Value result = expressionEvaluator.evaluate(frame, expression);
 
             return String.format("Result: %s", formatValue(result));
+        } catch (VMDisconnectedException vmDead) {
+            return vmDisconnectedMessage("jdwp_evaluate_expression");
         } catch (Exception e) {
             final String msg = e.getMessage() != null ? e.getMessage() : e.toString();
             final String enriched = enrichEvaluationError(msg, threadId, frameIndex);
@@ -541,7 +644,7 @@ public class JDWPTools {
         }
     }
 
-    @McpTool(description = "Evaluate a Java expression and compare its result against an expected value. Returns 'OK' on match, 'MISMATCH' with actual vs expected on failure. Comparison is string-based against the same formatting jdwp_evaluate_expression uses (so primitives auto-unbox, strings strip surrounding quotes).")
+    @McpTool(description = "Evaluate a Java expression and compare its result against an expected value. Returns 'OK' on match, 'MISMATCH' with actual vs expected on failure, or '[VM_DEATH] ...' if the target VM disconnects mid-call. Comparison is string-based against the same formatting jdwp_evaluate_expression uses (so primitives auto-unbox, strings strip surrounding quotes).")
     public String jdwp_assert_expression(
         @McpToolParam(description = "Java expression (e.g., 'order.getTotal()', 'session.getRole()', 'list.size() == 5')") String expression,
         @McpToolParam(description = "Expected value (string-compared against the formatted expression result)") String expected,
@@ -580,6 +683,8 @@ public class JDWPTools {
                 return String.format("OK — %s = %s", expression, actual);
             }
             return String.format("MISMATCH — %s\n  expected: %s\n  actual:   %s", expression, expected, actual);
+        } catch (VMDisconnectedException vmDead) {
+            return vmDisconnectedMessage("jdwp_assert_expression");
         } catch (Exception e) {
             return "Error: " + e.getMessage();
         }
@@ -650,7 +755,7 @@ public class JDWPTools {
         }
     }
 
-    @McpTool(description = "Resume the VM and BLOCK until the next breakpoint, step, or exception event fires (or timeout). Returns the same info as jdwp_get_current_thread on success. Replaces the manual 'resume → poll → poll' choreography.")
+    @McpTool(description = "Resume the VM and BLOCK until the next breakpoint, step, or exception event fires (or timeout). Returns the same info as jdwp_get_current_thread on success. Replaces the manual 'resume → poll → poll' choreography. Returns one of: 'Event fired ...' on a breakpoint/step/exception hit, '[TIMEOUT] ...' when the deadline expires, '[VM_DEATH] ...' when the target VM died/disconnected before any event, or 'Wait interrupted' on thread interruption.")
     public String jdwp_resume_until_event(
         @McpToolParam(required = false, description = "Maximum wait time in milliseconds (default: 30000)") @Nullable Integer timeoutMs) {
         final int deadlineMs = (timeoutMs != null && timeoutMs > 0) ? timeoutMs : 30_000;
@@ -665,16 +770,34 @@ public class JDWPTools {
                 return buildDiagnosticReport(true, deadlineMs);
             }
 
+            // Snapshot the last breakpoint BEFORE inspecting the event tail. A breakpoint that
+            // fired moments before the VM died is real, suspended state the user cares about —
+            // discarding it in favour of the terminal VM_DEATH event would erase the only context
+            // that explains why the BP fired. If both a live BP snapshot AND a VM_DEATH tail are
+            // present, render the BP context with a suffix noting the subsequent disconnect.
             final BreakpointTracker.LastBreakpoint snapshot = breakpointTracker.getLastBreakpoint();
+            final List<EventHistory.DebugEvent> tail = eventHistory.getRecent(1);
+            final boolean vmDeathTail = !tail.isEmpty() && "VM_DEATH".equals(tail.get(0).type());
+            final boolean haveLiveBpSnapshot = snapshot != null && snapshot.thread().isSuspended();
+
+            if (vmDeathTail && !haveLiveBpSnapshot) {
+                return "[VM_DEATH] Target VM disconnected/died while waiting. No more events will fire on this connection — "
+                    + "run jdwp_diagnose to inspect, or jdwp_connect / jdwp_wait_for_attach to re-attach.";
+            }
+
             if (snapshot == null) {
                 return "Event fired but no breakpoint thread recorded (this should not happen — check the listener logs).";
             }
             final ThreadReference thread = snapshot.thread();
             final Integer bpId = snapshot.id();
-            return String.format("Event fired. Thread: %s (ID=%d, suspended=%s, frames=%d, breakpoint=%s)",
+            final String base = String.format("Event fired. Thread: %s (ID=%d, suspended=%s, frames=%d, breakpoint=%s)",
                 thread.name(), thread.uniqueID(), thread.isSuspended(),
                 thread.isSuspended() ? thread.frameCount() : -1,
-                String.valueOf(bpId));
+                bpId);
+            if (vmDeathTail) {
+                return base + " (VM has since disconnected — this is the last captured breakpoint)";
+            }
+            return base;
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
             return "Wait interrupted";
@@ -683,13 +806,140 @@ public class JDWPTools {
         }
     }
 
-    @McpTool(description = "Read-only snapshot of debugger state: active vs pending breakpoints, recent events, last suspending event, and an interpretation hint. Use BEFORE waiting on a long jdwp_resume_until_event to verify breakpoints are actually armed (not pending), and after a [TIMEOUT] to understand why nothing fired. Does not resume or suspend anything.")
-    public String jdwp_diagnose() {
+    @McpTool(description = "Read-only snapshot of the WHOLE world: (1) this MCP server's status, (2) the JDWP connection (or last-attempt error if disconnected), (3) local JVMs visible to the user with their JDWP ports — answering 'did my target JVM come up, and on which port?' without ps/lsof/jps. When connected, the existing breakpoint+events report continues to appear inside block #2. Run this first when something isn't working.")
+    public String jdwp_diagnose(
+        @McpToolParam(required = false, description = "If true, briefly attach to each candidate JVM whose JDWP port could not be read from /proc, to discover the port via sun.jdwp.listenerAddress. Default false — costs one short attach per JVM and is visible to targets.") @Nullable Boolean inspectAll) {
         try {
-            return buildDiagnosticReport(false, null);
+            final boolean doInspectAll = inspectAll != null && inspectAll;
+            return buildFullDiagnosticReport(doInspectAll);
         } catch (Exception e) {
             return "Error: " + e.getMessage();
         }
+    }
+
+    @McpResource(
+        uri = "jdwp://diagnose",
+        name = "jdwp-diagnose",
+        title = "JDWP diagnostic report",
+        description = "Full diagnose snapshot: MCP-server status, JDWP connection (or last-attempt error), and local-JVM inventory with their JDWP ports. Same content as the jdwp_diagnose tool with inspectAll=false. Attach with @<server>:jdwp://diagnose to read live status without spending a model turn."
+    )
+    public String diagnoseResource() {
+        try {
+            return buildFullDiagnosticReport(false);
+        } catch (Exception e) {
+            return "Error: " + e.getMessage();
+        }
+    }
+
+    @McpResource(
+        uri = "jdwp://jvms",
+        name = "jdwp-jvms",
+        title = "Local JVMs with their JDWP ports",
+        description = "Local-JVM inventory only: which Java processes are running, which expose a JDWP agent, and the state of each port (LISTENING / SUSPENDED / UNREACHABLE / …). Cheaper than jdwp://diagnose when the only question is 'what can I attach to right now, and on which port?'"
+    )
+    public String jvmsResource() {
+        try {
+            JDIConnectionService.@Nullable ConnectionStatus status;
+            try {
+                status = jdiService.getConnectionStatus();
+            } catch (Exception e) {
+                log.debug("getConnectionStatus() threw — listing JVMs without connection context", e);
+                status = null;
+            }
+            return renderLocalJvmsBlock(status, false);
+        } catch (Exception e) {
+            return "Error: " + e.getMessage();
+        }
+    }
+
+    /**
+     * Composes the three-block diagnose report: MCP-server status, JDWP-connection status
+     * (with the existing breakpoint report inline when connected), and a local-JVM inventory.
+     * Falls back gracefully if discovery throws — the connection block is always rendered.
+     */
+    private String buildFullDiagnosticReport(boolean inspectAll) {
+        final StringBuilder out = new StringBuilder();
+        out.append(DiagnoseReportRenderer.renderHeader());
+
+        out.append(DiagnoseReportRenderer.renderMcpServerBlock(
+            ProcessHandle.current().pid(),
+            Duration.ofMillis(ManagementFactory.getRuntimeMXBean().getUptime()),
+            String.format("%s %s", System.getProperty("java.vm.name", "JVM"), System.getProperty("java.version", "?")),
+            countMcpTools(),
+            "localhost",
+            JVM_JDWP_PORT,
+            System.getProperty("user.dir", "?")
+        ));
+
+        JDIConnectionService.ConnectionStatus status;
+        try {
+            status = jdiService.getConnectionStatus();
+        } catch (Exception e) {
+            log.debug("getConnectionStatus() threw — rendering as disconnected", e);
+            status = null;
+        }
+        if (status == null) {
+            // Treat a null status the same as "disconnected" — downstream rendering expects a
+            // non-null object and a null here would NPE further down.
+            status = new JDIConnectionService.ConnectionStatus(false, null, 0, null, null);
+        }
+        out.append(DiagnoseReportRenderer.renderConnectionBlock(
+            new DiagnoseReportRenderer.JDIConnectionStatusView(
+                status.connected(), status.lastHost(), status.lastPort(),
+                status.lastConnectAttempt(), status.lastConnectError()
+            ),
+            JVM_JDWP_PORT
+        ));
+        // Always include the breakpoint+events report — even disconnected, pending breakpoints
+        // and stale watchers are useful debugging context. The renderer prefixes its own header
+        // so it slots cleanly under the connection block.
+        out.append('\n').append(buildDiagnosticReport(false, null));
+
+        out.append(renderLocalJvmsBlock(status, inspectAll));
+        return out.toString();
+    }
+
+    /**
+     * Runs discovery and renders the local-JVM inventory block. Discovery errors are caught
+     * and surfaced as a one-line note instead of breaking the whole report. Accepts a
+     * nullable status so callers don't need to construct an empty stub for the disconnected case.
+     */
+    private String renderLocalJvmsBlock(JDIConnectionService.@Nullable ConnectionStatus status, boolean inspectAll) {
+        try {
+            final String connectedHost = status == null ? null : status.lastHost();
+            final int connectedPort = status == null ? 0 : status.lastPort();
+            List<JvmDescriptor> descriptors = jvmDiscoveryService.discover();
+            descriptors = jvmDiscoveryService.confirmAll(descriptors, connectedHost, connectedPort);
+            if (inspectAll) {
+                descriptors = jvmDiscoveryService.inspectAll(descriptors);
+            }
+            final String user = System.getProperty("user.name", "?");
+            return DiagnoseReportRenderer.renderJvmListBlock(descriptors, user);
+        } catch (Exception e) {
+            // Preserve thread-interrupt semantics: discovery may run cooperative interruptible
+            // work and a swallowed InterruptedException would otherwise hide the interrupt from
+            // upstream callers.
+            if (e.getCause() instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            log.warn("JVM discovery failed", e);
+            return "\n▸ Local JVMs\n  (discovery failed: " + e.getMessage() + ")\n";
+        }
+    }
+
+    /**
+     * Reflection-based count of {@code @McpTool}-annotated methods on this class. Cheap (run
+     * once per {@code jdwp_diagnose} call) and avoids hard-coding a number that drifts every
+     * time a tool is added. We count public methods only — private helpers are not tools.
+     */
+    private static int countMcpTools() {
+        int n = 0;
+        for (java.lang.reflect.Method m : JDWPTools.class.getDeclaredMethods()) {
+            if (Modifier.isPublic(m.getModifiers()) && m.isAnnotationPresent(McpTool.class)) {
+                n++;
+            }
+        }
+        return n;
     }
 
     /**
@@ -924,14 +1174,9 @@ public class JDWPTools {
     }
 
     /**
-     * Counts how many active BPs are chained-and-waiting vs unchained-or-armed and remembers the
-     * first chained-waiting pair as a sample for the user-facing message. Mutable on purpose:
-     * {@link #describeChainStuckState} feeds it one entry at a time from two maps and only ever
-     * reads the final totals.
-     * <p>
-     * Pending BPs are tallied separately via {@link #observePending}: they cannot affect the
-     * active-side "WAITING vs ARMED" classification but their presence is still relevant to the
-     * user-facing interpretation, so the count is surfaced alongside an example pending ID.
+     * Bucket counts for {@link #describeChainStuckState}: active BPs split into chained-waiting vs
+     * unchained-or-armed, with pending BPs tallied separately because they cannot be ARMED until
+     * promotion. A sample ID from each bucket is kept so the user-facing message can name names.
      */
     private final class ChainStuckTally {
         int chainedWaiting;
@@ -1051,23 +1296,24 @@ public class JDWPTools {
                 return String.format("Error: Variable '%s' not found in frame %d", varName, frameIndex);
             }
 
-            String parsedValue = value;
-            if ("java.lang.String".equals(localVar.typeName())
-                && value.length() >= 2
-                && value.startsWith("\"") && value.endsWith("\"")) {
-                parsedValue = value.substring(1, value.length() - 1);
-            }
+            final String parsedValue = "java.lang.String".equals(localVar.typeName())
+                ? stripJavaStringQuotes(value) : value;
 
             final Value newValue = createJdiValue(vm, parsedValue, localVar.type());
             frame.setValue(localVar, newValue);
 
             return String.format("Variable '%s' set to %s in frame %d of thread %d", varName, value, frameIndex, threadId);
+        } catch (ClassNotLoadedException notLoaded) {
+            return String.format(
+                "Error setting variable: type '%s' is not yet loaded in the target VM, so JDI cannot validate the assignment. "
+                    + "Wait for the application to reference the type, or call jdwp_force_load_class(\"%s\") to load it now.",
+                notLoaded.className(), notLoaded.className());
         } catch (Exception e) {
             return "Error setting variable: " + e.getMessage();
         }
     }
 
-    @McpTool(description = "Set a field's value on a cached object")
+    @McpTool(description = "Set a field's value on a cached object. Returns '[ERROR] Object #N belongs to a previous VM session ...' if the ID came from a prior connection — re-fetch via jdwp_get_locals after re-attach.")
     public String jdwp_set_field(
         @McpToolParam(description = "Object unique ID (from jdwp_get_locals or jdwp_get_fields)") long objectId,
         @McpToolParam(description = "Field name") String fieldName,
@@ -1077,6 +1323,10 @@ public class JDWPTools {
             if (obj == null) {
                 return String.format("[ERROR] Object #%d not found in cache", objectId);
             }
+            final String staleVmHint = staleVmHintIfMismatched(objectId, obj);
+            if (staleVmHint != null) {
+                return staleVmHint;
+            }
 
             final VirtualMachine vm = jdiService.getVM();
             final Field field = obj.referenceType().fieldByName(fieldName);
@@ -1084,12 +1334,8 @@ public class JDWPTools {
                 return String.format("Error: Field '%s' not found on %s", fieldName, obj.referenceType().name());
             }
 
-            String parsedValue = value;
-            if ("java.lang.String".equals(field.typeName())
-                && value.length() >= 2
-                && value.startsWith("\"") && value.endsWith("\"")) {
-                parsedValue = value.substring(1, value.length() - 1);
-            }
+            final String parsedValue = "java.lang.String".equals(field.typeName())
+                ? stripJavaStringQuotes(value) : value;
 
             final Value newValue = createJdiValue(vm, parsedValue, field.type());
             obj.setValue(field, newValue);
@@ -1117,15 +1363,23 @@ public class JDWPTools {
 
             final EventRequestManager erm = vm.eventRequestManager();
 
-            // Delete any existing StepRequests for this thread — JDI allows only one per thread
-            erm.stepRequests().stream()
-                .filter(sr -> sr.thread().equals(thread))
-                .toList()
-                .forEach(erm::deleteEventRequest);
+            // Delete any existing StepRequests for this thread — JDI allows only one per thread.
+            // Two concurrent step calls on the same thread could otherwise interleave between the
+            // delete and the create (e.g. caller A deletes A's request, caller B creates B's, then
+            // caller A creates A's), leaving both requests live and producing a
+            // DuplicateRequestException. Synchronising on the EventRequestManager makes the
+            // delete-then-create pair atomic from this tool's perspective.
+            final StepRequest stepRequest;
+            synchronized (erm) {
+                erm.stepRequests().stream()
+                    .filter(sr -> sr.thread().equals(thread))
+                    .toList()
+                    .forEach(erm::deleteEventRequest);
 
-            final StepRequest stepRequest = erm.createStepRequest(thread, StepRequest.STEP_LINE, stepDepth);
-            stepRequest.addCountFilter(1);
-            stepRequest.enable();
+                stepRequest = erm.createStepRequest(thread, StepRequest.STEP_LINE, stepDepth);
+                stepRequest.addCountFilter(1);
+                stepRequest.enable();
+            }
 
             thread.resume();
 
@@ -1144,7 +1398,7 @@ public class JDWPTools {
         @McpToolParam(required = false, description = "Optional ID of a trigger breakpoint — this BP stays disarmed until the trigger fires. Sticky by default: once armed it stays so unless re-disarmed via jdwp_disarm_until_trigger or oneShot=true.") @Nullable Integer triggerBreakpointId,
         @McpToolParam(required = false, description = "If true, re-disarm this BP after each hit so the next trigger fire re-arms it (IntelliJ-style). Default: false (sticky).") @Nullable Boolean oneShot) {
         // Track the pending ID outside the try so the catch can clean it up if locationsOfLine
-        // (or any later step) throws after the pending entry has already been registered (Tier 1B).
+        // (or any later step) throws after the pending entry has already been registered.
         Integer pendingIdForCleanup = null;
         try {
             final VirtualMachine vm = jdiService.getVM();
@@ -1269,7 +1523,7 @@ public class JDWPTools {
         @McpToolParam(description = "Java expression to evaluate and log (e.g., '\"x=\" + x', 'order.getTotal()')") String expression,
         @McpToolParam(required = false, description = "Optional condition — only log when this evaluates to true (e.g., 'i > 100')") @Nullable String condition) {
         // Track the pending ID outside the try so the catch can clean it up if locationsOfLine
-        // (or any later step) throws after the pending entry has already been registered (Tier 1B).
+        // (or any later step) throws after the pending entry has already been registered.
         Integer pendingIdForCleanup = null;
         try {
             final VirtualMachine vm = jdiService.getVM();
@@ -1366,11 +1620,10 @@ public class JDWPTools {
             final VirtualMachine vm = jdiService.getVM();
             final EventRequestManager erm = vm.eventRequestManager();
 
-            // Find the class
             final List<ReferenceType> classes = vm.classesByName(className);
 
             if (classes.isEmpty()) {
-                // Class not loaded — check pending breakpoints
+                // Class not loaded yet — the BP can only exist as a pending entry.
                 int removedPending = 0;
                 for (Map.Entry<Integer, BreakpointTracker.PendingBreakpoint> entry :
                     breakpointTracker.getAllPendingBreakpoints().entrySet()) {
@@ -1389,7 +1642,6 @@ public class JDWPTools {
 
             final ReferenceType refType = classes.get(0);
 
-            // Find location
             final List<Location> locations = refType.locationsOfLine(lineNumber);
             if (locations.isEmpty()) {
                 return String.format("Error: No code at line %d in class %s%s",
@@ -1398,7 +1650,7 @@ public class JDWPTools {
 
             final Location location = locations.get(0);
 
-            // Find and delete matching breakpoint requests (copy list to avoid ConcurrentModificationException)
+            // Copy the live list — deleteEventRequest mutates it and would otherwise CME the loop.
             final List<BreakpointRequest> breakpoints = new ArrayList<>(erm.breakpointRequests());
             int removed = 0;
             int chainBreaks = 0;
@@ -1548,8 +1800,7 @@ public class JDWPTools {
                 return String.format("Breakpoint %d not found", breakpointId);
             }
 
-            // Safe to cascade: the ID is a real line BP / pending line BP. Cascading first keeps
-            // the CHAIN_BROKEN events ordered before the removal confirmation.
+            // Cascade BEFORE removal so CHAIN_BROKEN events land in front of the removal confirmation.
             final int detached = cascadeChainBreak(breakpointId);
             final boolean removed = breakpointTracker.removeBreakpoint(breakpointId);
             if (!removed) {
@@ -1937,6 +2188,7 @@ public class JDWPTools {
             breakpointTracker.clearAll(vm.eventRequestManager());
             vmCleared = true;
         } catch (Exception e) {
+            log.debug("VM unreachable during jdwp_reset — falling back to in-memory reset", e);
             breakpointTracker.reset();
         }
 
@@ -2014,8 +2266,7 @@ public class JDWPTools {
             final StringBuilder sb = new StringBuilder();
             sb.append("=== Breakpoint Context ===\n");
             sb.append(String.format("Thread: %s (ID=%d, breakpoint=%s)\n\n",
-                thread.name(), thread.uniqueID(),
-                String.valueOf(bpId)));
+                thread.name(), thread.uniqueID(), bpId));
 
             // Top frames (junit/maven/reflection collapsed via the same noise list as jdwp_get_stack)
             final List<StackFrame> frames = thread.frames();
@@ -2064,8 +2315,17 @@ public class JDWPTools {
                     sb.append("  (no instance fields)\n");
                 } else {
                     for (Field field : instanceFields) {
-                        final Value v = thisObj.getValue(field);
-                        sb.append(String.format("  %s %s = %s\n", field.typeName(), field.name(), formatValue(v)));
+                        // Per-field guard: a single dead reference (e.g. ObjectCollectedException)
+                        // must not torpedo the whole context dump. The user still benefits from
+                        // seeing every other field, so we emit "<unavailable>" for the offender
+                        // and continue rendering.
+                        try {
+                            final Value v = thisObj.getValue(field);
+                            sb.append(String.format("  %s %s = %s\n", field.typeName(), field.name(), formatValue(v)));
+                        } catch (Exception fieldErr) {
+                            sb.append(String.format("  %s %s = <unavailable: %s>\n",
+                                field.typeName(), field.name(), fieldErr.getClass().getSimpleName()));
+                        }
                     }
                 }
             } else if (includeThis) {
@@ -2090,7 +2350,7 @@ public class JDWPTools {
             return String.format("Current thread: %s (ID=%d, suspended=%s, frames=%d, breakpoint=%s)",
                 thread.name(), thread.uniqueID(), thread.isSuspended(),
                 thread.isSuspended() ? thread.frameCount() : -1,
-                String.valueOf(bpId));
+                bpId);
         } catch (Exception e) {
             return "Error: " + e.getMessage();
         }
@@ -2104,6 +2364,9 @@ public class JDWPTools {
         try {
             if (expression.trim().isEmpty()) {
                 return "Error: No expression provided";
+            }
+            if (label.trim().isEmpty()) {
+                return "Error: No label provided";
             }
 
             // Create the watcher
@@ -2237,12 +2500,12 @@ public class JDWPTools {
     /**
      * Evaluate watchers on a suspended thread's stack.
      * Can operate in two scopes:
-     * - 'current_frame': (Default & Recommended) Evaluates watchers only for the breakpoint
+     * - 'current_frame': (Default and Recommended) Evaluates watchers only for the breakpoint
      * that caused the suspension. Fast and precise.
      * - 'full_stack': Scans every frame of the stack to find any location matching any breakpoint
      * with a watcher. Powerful but slower.
      */
-    @McpTool(description = "Evaluate watchers on a suspended thread's stack based on a scope")
+    @McpTool(description = "Evaluate watchers on a suspended thread's stack based on a scope. Returns '[VM_DEATH] ...' if the target VM disconnects mid-call.")
     public String jdwp_evaluate_watchers(
         @McpToolParam(description = "Thread unique ID") long threadId,
         @McpToolParam(description = "Evaluation scope: 'current_frame' (default) or 'full_stack'") String scope,
@@ -2265,8 +2528,7 @@ public class JDWPTools {
                     Thread must be stopped at a breakpoint to evaluate watchers.""", threadId);
             }
 
-            // CRITICAL: Configure compiler classpath BEFORE any expression evaluation
-            // This must be done here (not inside evaluate()) to avoid nested JDI calls
+            // Configure classpath here, not inside evaluate(), to avoid nested JDI calls.
             expressionEvaluator.configureCompilerClasspath(thread);
 
             if (scope.isBlank()) {
@@ -2292,6 +2554,8 @@ public class JDWPTools {
 
             return result.toString();
 
+        } catch (VMDisconnectedException vmDead) {
+            return vmDisconnectedMessage("jdwp_evaluate_watchers");
         } catch (Exception e) {
             log.error("[Watcher] Error evaluating watchers", e);
             return "Error: " + e.getMessage();

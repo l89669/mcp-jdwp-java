@@ -15,6 +15,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import java.io.File;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -34,6 +35,8 @@ import static one.edee.mcp.jdwp.ThreadFormatting.isJvmInternalThread;
  * - Classpath discovery for expression evaluation: collaborates with {@link ClasspathDiscoverer}
  * and {@link JdkDiscoveryService} on the first breakpoint hit and caches
  * the result in {@link #cachedClasspath} / {@link #discoveredJdkPath} until disconnect.
+ * - Post-mortem cleanup driven by {@link JdiEventListener}'s VM-death hook (see
+ * {@link #notifyVmDied()}), distinct from the user-initiated {@link #disconnect()} path.
  * <p>
  * Thread-safety: all public mutators are `synchronized` on the service instance; the object cache
  * is a {@link ConcurrentHashMap}; the classpath/JDK fields are `volatile` for cross-thread reads.
@@ -70,9 +73,36 @@ public class JDIConnectionService {
     private final Map<Long, ObjectReference> objectCache = new ConcurrentHashMap<>();
     @Nullable
     private VirtualMachine vm;
+    /**
+     * Host of the last SUCCESSFUL attach. Drives {@link #ensureConnected}'s auto-reconnect path;
+     * stays null until an attach actually succeeds, so a failed first connect cannot bait a
+     * downstream tool call into silently retrying against a never-valid target.
+     */
     @Nullable
     private String lastHost;
+    /** Port of the last SUCCESSFUL attach. See {@link #lastHost} for semantics. */
     private int lastPort = 0;
+    /**
+     * Host of the most recent {@link #connect} attempt, successful or not. Distinct from
+     * {@link #lastHost} so a failed first connect can be rendered in {@code jdwp_diagnose}
+     * ("tried foo:5005 and got Connection refused") without seeding the reconnect target.
+     */
+    @Nullable
+    private String lastConnectAttemptHost;
+    /** Port of the most recent {@link #connect} attempt. See {@link #lastConnectAttemptHost}. */
+    private int lastConnectAttemptPort = 0;
+    /**
+     * Timestamp of the most recent {@link #connect} attempt (successful or not). Used by the
+     * {@code jdwp_diagnose} tool to render a "last attempt: ..." line when not connected.
+     */
+    @Nullable
+    private volatile Instant lastConnectAttempt;
+    /**
+     * Human-readable error from the most recent {@link #connect} failure, or {@code null} when
+     * the last attempt succeeded. Reset to null on a successful attach.
+     */
+    @Nullable
+    private volatile String lastConnectError;
     /**
      * Cached path-separated classpath of the target JVM. Populated by {@link #discoverClasspath}
      * on the first successful call and reused thereafter; cleared on disconnect.
@@ -100,6 +130,8 @@ public class JDIConnectionService {
         this.eventHistory = eventHistory;
         this.watcherManager = watcherManager;
         this.evaluationGuard = evaluationGuard;
+        // Wire post-mortem cleanup so the listener can null the VM the moment the target dies.
+        eventListener.setVmDeathHook(this::notifyVmDied);
     }
 
     /**
@@ -191,10 +223,10 @@ public class JDIConnectionService {
     }
 
     /**
-     * Cheap liveness probe — issues `vm.name()` and treats any exception as a dead connection.
-     * <p>
-     * Side effect: clears the {@link #vm} reference on failure so the next call to {@link #ensureConnected}
-     * triggers a fresh attach via the cached host/port.
+     * Pure liveness probe — issues {@code vm.name()} and returns false on any exception. Does NOT
+     * mutate the {@link #vm} field, so diagnostic callers like {@link #getConnectionStatus()} can
+     * read connection state without an observable side effect. Stale-state cleanup is handled by
+     * the connect/reconnect paths via {@link #cleanupSessionState()}.
      */
     private boolean isVMAlive() {
         final VirtualMachine local = vm;
@@ -202,37 +234,44 @@ public class JDIConnectionService {
             return false;
         }
         try {
-            // Try to call a simple method to check if connection is alive
             local.name();
             return true;
         } catch (Exception e) {
-            // Connection is dead
-            vm = null;
             return false;
         }
     }
 
     /**
-     * Connects to a JDWP server. Idempotent if already connected to a live VM.
+     * Attaches to a JDWP server. If a live connection to the same {@code host}/{@code port} already
+     * exists this is a no-op; if the requested target differs from the current one the existing
+     * session is torn down via {@link #cleanupSessionState()} before the fresh attach so breakpoints,
+     * watchers and cached object references cannot leak across targets.
      *
      * @param host hostname of the target JVM
      * @param port JDWP debug port
      * @return status message indicating connection result
      */
     public synchronized String connect(String host, int port) throws Exception {
-        // Check if already connected and alive
+        lastConnectAttempt = Instant.now();
+        lastConnectAttemptHost = host;
+        lastConnectAttemptPort = port;
         if (vm != null && isVMAlive()) {
-            return "Already connected to " + vm.name();
-        }
-
-        // Stale state from a dead VM (or first connection): wipe everything before reconnecting.
-        // This is what prevents memory leaks across many test-run sessions.
-        if (vm != null) {
+            if (host.equals(lastHost) && port == lastPort) {
+                lastConnectError = null;
+                return "Already connected to " + vm.name();
+            }
+            // Deliberate host/port change — release current session so the fresh attach below
+            // does not leak breakpoints / watchers / ObjectReferences across targets.
+            log.info("[JDI] Switching target from {}:{} to {}:{} — releasing current session",
+                lastHost, lastPort, host, port);
+            cleanupSessionState();
+        } else if (vm != null) {
+            // Probe said dead but the field is still non-null — wipe stale session caches
+            // before the fresh attach so they cannot leak across attachments.
             log.info("[JDI] Clearing stale state from previous (dead) VM connection");
             cleanupSessionState();
         }
 
-        // Find SocketAttachingConnector
         final VirtualMachineManager vmm = Bootstrap.virtualMachineManager();
         AttachingConnector connector = null;
 
@@ -244,24 +283,73 @@ public class JDIConnectionService {
         }
 
         if (connector == null) {
+            lastConnectError = "SocketAttach connector not found";
             throw new RuntimeException("SocketAttach connector not found");
         }
 
-        // Set connection arguments
         final Map<String, Connector.Argument> args = connector.defaultArguments();
         Objects.requireNonNull(args.get("hostname"), "SocketAttach connector missing 'hostname' argument").setValue(host);
         Objects.requireNonNull(args.get("port"), "SocketAttach connector missing 'port' argument").setValue(String.valueOf(port));
 
-        // Attach
-        vm = connector.attach(args);
+        try {
+            vm = connector.attach(args);
+        } catch (Exception e) {
+            lastConnectError = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
+            // Do NOT seed lastHost/lastPort on failure — ensureConnected() uses those for the
+            // auto-reconnect path and a never-valid target would otherwise be retried silently
+            // on the next tool call. The attempt host/port are tracked separately for diagnostics.
+            throw e;
+        }
         lastHost = host;
         lastPort = port;
+        lastConnectError = null;
 
-        // Start listening for JDI events (breakpoints, steps, etc.)
         eventListener.start(vm);
 
         return String.format("Connected to %s (version %s)", vm.name(), vm.version());
     }
+
+    /**
+     * Read-only snapshot of the connection target used by {@code jdwp_diagnose}. The
+     * {@code connected} field runs a fresh liveness probe ({@code vm.name()}) on every call,
+     * so callers must not cache the returned status — the underlying VM can die between calls.
+     */
+    public synchronized ConnectionStatus getConnectionStatus() {
+        return new ConnectionStatus(
+            vm != null && isVMAlive(),
+            lastConnectAttemptHost,
+            lastConnectAttemptPort,
+            lastConnectAttempt,
+            lastConnectError
+        );
+    }
+
+    /**
+     * Immutable snapshot of the JDI connection used for diagnostic rendering. {@code connected}
+     * is {@code true} only when there is a live {@link VirtualMachine}; the cached
+     * {@code lastHost}/{@code lastPort} reflect the most recent {@link #connect} attempt
+     * regardless of outcome, so diagnostics can describe what the user was trying to attach to.
+     * The internal reconnect target driven by {@code ensureConnected} is tracked separately
+     * and is only seeded after a successful attach.
+     *
+     * @param connected           {@code true} when a live VM exists right now (liveness-probed
+     *                            via {@code isVMAlive()}); not "was once connected"
+     * @param lastHost            host of the most recent {@link #connect} attempt, successful
+     *                            or not; {@code null} when no attempt was ever made
+     * @param lastPort            port of the most recent attempt; {@code 0} when no attempt
+     *                            was ever made
+     * @param lastConnectAttempt  wall-clock time of the most recent attempt; {@code null}
+     *                            when no attempt was ever made in this MCP-server lifetime
+     * @param lastConnectError    human-readable failure reason from the most recent attempt;
+     *                            {@code null} when the last attempt succeeded
+     */
+    public record ConnectionStatus(
+        boolean connected,
+        @Nullable String lastHost,
+        int lastPort,
+        @Nullable Instant lastConnectAttempt,
+        @Nullable String lastConnectError
+    ) {}
 
     /**
      * Verifies the VM connection is alive, attempting a single reconnect using the host/port from the
@@ -271,7 +359,6 @@ public class JDIConnectionService {
     private synchronized void ensureConnected() throws Exception {
         if (vm == null || !isVMAlive()) {
             if (lastHost != null && lastPort != 0) {
-                // Try to reconnect
                 connect(lastHost, lastPort);
             } else {
                 throw new Exception("Not connected to JDWP server. Use jdwp_connect first.");
@@ -293,13 +380,38 @@ public class JDIConnectionService {
     }
 
     /**
+     * Post-mortem cleanup invoked by {@link JdiEventListener} on VMDeath / VMDisconnect.
+     * Idempotent and best-effort: preserves {@link #eventHistory} (the listener's VM_DEATH entry
+     * stays queryable) and {@link #lastHost} / {@link #lastPort} (so {@link #ensureConnected()}
+     * can auto-reconnect on the next restart cycle).
+     */
+    public synchronized void notifyVmDied() {
+        if (vm == null) {
+            return;
+        }
+        try {
+            vm.dispose();
+        } catch (Exception ignored) {
+            // VM already gone — nothing to dispose.
+        }
+        vm = null;
+        breakpointTracker.reset();
+        watcherManager.clearAll();
+        objectCache.clear();
+        cachedClasspath = null;
+        discoveredJdkPath = null;
+        targetMajorVersion = 0;
+    }
+
+    /**
      * Releases all session-bound state held by the MCP server: JDI event requests, object cache,
      * watchers, classpath cache, event history, and the VM reference itself. Best-effort —
-     * tolerates a dead VM (uses `reset()` as a fallback when JDI calls would fail).
-     * <p>
-     * Called from both {@link #disconnect()} (clean shutdown) and {@link #connect(String, int)}
-     * when a stale connection is detected (target VM died but the user reconnects). Without this,
-     * the MCP server would accumulate breakpoints, watchers, and ObjectReferences across sessions.
+     * tolerates a dead VM (falls back to in-memory {@code reset()} when JDI calls would fail).
+     * Also clears the auto-reconnect seed ({@link #lastHost}/{@link #lastPort}) so a subsequent
+     * tool call cannot silently re-attach to the just-released target — this is the
+     * user-initiated semantics. For VM-death cleanup invoked by the event listener (which must
+     * preserve {@link #eventHistory} and the reconnect target so the next restart cycle can
+     * re-attach) see {@link #notifyVmDied()}.
      */
     private void cleanupSessionState() {
         eventListener.stop();
@@ -310,8 +422,7 @@ public class JDIConnectionService {
             try {
                 breakpointTracker.clearAll(vm.eventRequestManager());
             } catch (Exception e) {
-                // "VM died mid-session" path — JDI calls would fail anyway, so we zero the in-memory
-                // state instead. The breakpoint requests will be GC'd along with the dead VM.
+                // VM died mid-session — JDI calls would fail, so zero the in-memory state instead.
                 breakpointTracker.reset();
             }
         }
@@ -326,11 +437,14 @@ public class JDIConnectionService {
         if (vm != null) {
             try {
                 vm.dispose();
-            } catch (Exception e) {
-                // VM may already be disconnected
+            } catch (Exception ignored) {
+                // VM may already be disconnected.
             }
             vm = null;
         }
+
+        lastHost = null;
+        lastPort = 0;
     }
 
     /**
@@ -341,15 +455,13 @@ public class JDIConnectionService {
      */
     public synchronized VirtualMachine getVM() throws Exception {
         ensureConnected();
-        // Opportunistically retry pending breakpoints — handles bootstrap classes that don't fire
-        // ClassPrepareEvent and any other deferred items whose target class became visible since
-        // the last check. Best-effort; failures are swallowed.
+        // Opportunistic pending-breakpoint retry — handles bootstrap classes whose ClassPrepareEvent
+        // is never delivered. Best-effort; failures are swallowed.
         try {
             breakpointTracker.tryPromotePending(this, null);
         } catch (Exception e) {
             log.debug("[JDI] Pending promotion failed: {}", e.getMessage());
         }
-        // ensureConnected() guarantees vm != null or throws.
         return Objects.requireNonNull(vm);
     }
 
@@ -400,7 +512,6 @@ public class JDIConnectionService {
         }
 
         try {
-            // Check if it's an array
             if (obj instanceof ArrayReference arr) {
                 return getArrayElements(arr, objectId);
             }
@@ -408,16 +519,13 @@ public class JDIConnectionService {
             final ReferenceType refType = obj.referenceType();
             final String typeName = refType.name();
 
-            // Check for common Java collections and provide smart views
             if (typeName.startsWith("java.util.") && isCollection(typeName)) {
                 return getCollectionView(obj, objectId, typeName);
             }
 
-            // Regular object - get fields
             final StringBuilder result = new StringBuilder();
             result.append(String.format("Object #%d (%s):\n\n", objectId, refType.name()));
 
-            // Get all fields (including inherited)
             final List<Field> fields = refType.allFields();
 
             for (Field field : fields) {
@@ -447,7 +555,6 @@ public class JDIConnectionService {
         result.append(String.format("Object #%d (%s):\n\n", objectId, typeName));
 
         try {
-            // Get size
             final Field sizeField = obj.referenceType().fieldByName("size");
             if (sizeField != null) {
                 final Value sizeValue = obj.getValue(sizeField);
@@ -467,7 +574,6 @@ public class JDIConnectionService {
             }
 
             result.append("\n--- Internal fields ---\n\n");
-            // Also show internal fields
             for (Field field : obj.referenceType().allFields()) {
                 final Value value = obj.getValue(field);
                 final String valueStr = formatFieldValue(value);
@@ -620,15 +726,17 @@ public class JDIConnectionService {
     /**
      * In-order traversal of a TreeMap entry tree. Stops once {@link #COLLECTION_VIEW_LIMIT} entries
      * have been rendered or {@link #MAX_TREE_DEPTH} is exceeded (guards against corrupted/circular trees).
+     * A {@code null} node (empty TreeMap or missing child) is a benign no-op so an empty map renders
+     * as "Entries:" rather than an "Error: NullPointerException" line.
      */
-    private void walkTreeMapInOrder(ObjectReference node, int[] counter, StringBuilder out) {
+    private void walkTreeMapInOrder(@Nullable ObjectReference node, int[] counter, StringBuilder out) {
         walkTreeMapInOrder(node, counter, out, 0);
     }
 
     // Right-child traversal is iterative (tail-call optimization) to limit stack depth on right-leaning trees
-    private void walkTreeMapInOrder(ObjectReference node, int[] counter, StringBuilder out, int depth) {
+    private void walkTreeMapInOrder(@Nullable ObjectReference node, int[] counter, StringBuilder out, int depth) {
         while (true) {
-            if (counter[0] >= COLLECTION_VIEW_LIMIT || depth >= MAX_TREE_DEPTH) {
+            if (node == null || counter[0] >= COLLECTION_VIEW_LIMIT || depth >= MAX_TREE_DEPTH) {
                 return;
             }
             final ReferenceType type = node.referenceType();
@@ -710,7 +818,6 @@ public class JDIConnectionService {
 
         result.append(String.format("Array #%d (%s) - %d elements:\n\n", arrayId, typeName, length));
 
-        // Limit to first 100 elements for performance
         final int limit = Math.min(length, 100);
 
         for (int i = 0; i < limit; i++) {
@@ -757,7 +864,7 @@ public class JDIConnectionService {
             if (unboxed != null) {
                 return unboxed;
             }
-            cacheObject(obj); // Store in cache for later inspection
+            cacheObject(obj);
             return String.format("Object#%d (%s)", obj.uniqueID(), obj.referenceType().name());
         }
 
@@ -793,18 +900,14 @@ public class JDIConnectionService {
         }
 
         try {
-            // Capture vm reference via synchronized getVM() to avoid race with disconnect()
+            // Route through synchronized getVM() to avoid a race with disconnect().
             final VirtualMachine currentVm = getVM();
 
             log.info("[JDI] Discovering full classpath using breakpoint thread '{}'", suspendedThread.name());
 
-            // Use ClasspathDiscoverer to explore classloader hierarchy
             final ClasspathDiscoverer discoverer = new ClasspathDiscoverer(currentVm);
-
-            // Discover both JDK path and application classpath
             final DiscoveryResult result = discoverer.discoverFullClasspath(suspendedThread);
 
-            // Store discovered JDK path for later use by JDT compiler
             discoveredJdkPath = result.localJdkPath();
             targetMajorVersion = result.targetMajorVersion();
             log.info("[JDI] Using local JDK: {} (Java {})", discoveredJdkPath, targetMajorVersion);
@@ -816,13 +919,12 @@ public class JDIConnectionService {
                 return null;
             }
 
-            // Determine separator based on first entry (Windows uses backslash, Unix forward slash)
+            // Separator inferred from the first entry — Windows uses ';', Unix ':'.
             final String separator = classpathEntries.stream()
                 .findFirst()
                 .map(path -> path.contains("\\") ? ";" : ":")
                 .orElse(File.pathSeparator);
 
-            // Join all entries into a single classpath string
             cachedClasspath = String.join(separator, classpathEntries);
 
             log.info("[JDI] Full classpath discovered ({} entries)", classpathEntries.size());
@@ -830,7 +932,6 @@ public class JDIConnectionService {
             return cachedClasspath;
 
         } catch (JdkNotFoundException e) {
-            // Critical error: No matching JDK found locally
             log.error("[JDI] {}", e.getMessage());
             return null;
         } catch (Exception e) {
@@ -840,10 +941,10 @@ public class JDIConnectionService {
     }
 
     /**
-     * Get the discovered local JDK path matching the target JVM version.
-     * This path is discovered during classpath discovery and can be used by the JDT compiler.
+     * Local JDK path matching the target JVM version, populated as a side effect of
+     * {@link #discoverClasspath}.
      *
-     * @return Local JDK path, or null if not yet discovered
+     * @return absolute path to the local JDK, or {@code null} until {@link #discoverClasspath} runs
      */
     @Nullable
     public String getDiscoveredJdkPath() {

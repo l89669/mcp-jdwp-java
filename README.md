@@ -69,7 +69,7 @@ cd mcp-jdwp-java
 claude mcp add jdwp-inspector -s user \
   -e MCP_TIMEOUT=30000 \
   -e MCP_TOOL_TIMEOUT=120000 \
-  -- java --add-modules jdk.jdi -jar /path/to/mcp-jdwp-java.jar
+  -- java --add-modules jdk.jdi,jdk.attach -jar /path/to/mcp-jdwp-java.jar
 ```
 
 To change the JDWP port (default 5005), add `-DJVM_JDWP_PORT=12345` before `-jar`.
@@ -88,7 +88,7 @@ Drop `-s user` to scope to the current project only.
     "jdwp-inspector": {
       "command": "java",
       "args": [
-        "--add-modules", "jdk.jdi",
+        "--add-modules", "jdk.jdi,jdk.attach",
         "-jar", "/path/to/mcp-jdwp-java.jar"
       ],
       "env": {
@@ -491,9 +491,9 @@ Returns thread info, top stack frames, locals at frame 0, and `this` fields in a
 
 ### Diagnostics (1)
 
-| Tool            | Parameters | Description                                                                                                                                            |
-|-----------------|------------|--------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `jdwp_diagnose` | —          | Snapshot of active vs pending BPs, recent events, last suspending event, and an interpretation hint — recognises the chain-stuck state where every armed BP is WAITING on a non-fired trigger |
+| Tool            | Parameters    | Description                                                                                                                                            |
+|-----------------|---------------|--------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `jdwp_diagnose` | `inspectAll?` | Three-block "state of the world" snapshot: (1) MCP server (PID/uptime/configured target), (2) JDWP connection — last-attempt error when disconnected, breakpoints+events report when connected, (3) Local JVMs visible to the user with their JDWP ports (confirmed via handshake). Pass `inspectAll=true` to attach briefly to every same-user JVM whose port could not be read from `/proc`, to discover the port via `sun.jdwp.listenerAddress` (default false — attaches are visible to targets). Recognises the chain-stuck state where every armed BP is WAITING on a non-fired trigger. Run this first when nothing seems to work. |
 
 ### Watchers (6)
 
@@ -511,6 +511,17 @@ Returns thread info, top stack frames, locals at frame 0, and `this` fields in a
 | Tool         | Parameters | Description                                                                  |
 |--------------|------------|------------------------------------------------------------------------------|
 | `jdwp_reset` | —          | Clear all state (breakpoints, watchers, cache, events) without disconnecting |
+
+## Resources (2)
+
+In addition to tools, the server exposes two read-only MCP **resources**. In Claude Code, type `@` in the prompt and pick them from the autocomplete (URI form: `@jdwp-inspector:jdwp://...`). Attaching a resource pulls its rendered text straight into the prompt without spending a model turn on a tool call — handy for "is my target up, and on which port?" without involving the agent.
+
+| Resource          | URI               | Content                                                                                                                                |
+|-------------------|-------------------|----------------------------------------------------------------------------------------------------------------------------------------|
+| JDWP diagnose     | `jdwp://diagnose` | Same three-block snapshot as the `jdwp_diagnose` tool with `inspectAll=false`: MCP-server status, JDWP connection (or last-attempt error), local-JVM inventory with detected ports. |
+| Local JVMs        | `jdwp://jvms`     | Local-JVM inventory only — which Java processes are running, which expose a JDWP agent, and the state of each port (LISTENING / SUSPENDED / UNREACHABLE / …). Cheaper than `jdwp://diagnose` when you only need a port list. |
+
+Note: resource updates are not pushed to the client — re-attach the URI to see fresh content. For probe-the-world style refreshes (briefly attach to every same-user JVM to learn its port), use the `jdwp_diagnose` tool with `inspectAll=true`; the resources do not run those attaches.
 
 ## Usage workflows
 

@@ -59,7 +59,7 @@
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
                 <configuration>
-                    <jvmArguments>--add-modules jdk.jdi</jvmArguments>
+                    <jvmArguments>--add-modules jdk.jdi,jdk.attach</jvmArguments>
                 </configuration>
             </plugin>
             <plugin>
@@ -69,7 +69,7 @@
                     <!-- The argLine property comes from the empty default in the parent POM, or from
                          -DargLine on the command line. This pattern lets users append JVM args
                          (e.g. a JDWP agent) without losing the JDI module flag. -->
-                    <argLine>--add-modules jdk.jdi ${argLine}</argLine>
+                    <argLine>--add-modules jdk.jdi,jdk.attach ${argLine}</argLine>
                 </configuration>
             </plugin>
             <plugin>
@@ -84,7 +84,7 @@
                     <fork>true</fork>
                     <compilerArgs>
                         <arg>--add-modules</arg>
-                        <arg>jdk.jdi</arg>
+                        <arg>jdk.jdi,jdk.attach</arg>
                         <!-- Error Prone activation -->
                         <arg>-XDcompilePolicy=simple</arg>
                         <arg>--should-stop=ifError=FLOW</arg>
