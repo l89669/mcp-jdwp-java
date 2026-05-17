@@ -87,6 +87,33 @@ public final class DiagnoseReportRenderer {
     }
 
     /**
+     * Renders the "VM capabilities" block — only meaningful when connected. Surfaces the field
+     * watchpoint capabilities the live VM advertises plus a perf warning since field watchpoints
+     * fire on every read/write of the watched field and can dominate target-VM CPU for hot fields.
+     * <p>
+     * Returns the empty string when both capabilities are {@code false} AND we are disconnected —
+     * there is nothing actionable to print and an empty section would confuse the report layout.
+     * If even one capability is {@code true} we render the block so the caller knows the channel
+     * is available.
+     */
+    public static String renderVmCapabilitiesBlock(boolean canWatchFieldAccess,
+                                                   boolean canWatchFieldModification) {
+        if (!canWatchFieldAccess && !canWatchFieldModification) {
+            return "";
+        }
+        final StringBuilder out = new StringBuilder();
+        out.append("\n▸ VM capabilities (field watchpoints)\n");
+        out.append(String.format("  canWatchFieldAccess:       %s%n",
+            canWatchFieldAccess ? "yes" : "no"));
+        out.append(String.format("  canWatchFieldModification: %s%n",
+            canWatchFieldModification ? "yes" : "no"));
+        out.append("  ⚠ Field watchpoints fire on EVERY access/write of the field — for hot fields\n");
+        out.append("    they can dominate target-VM CPU. Prefer narrow filters (threadFilterId,\n");
+        out.append("    objectFilterId, condition) or restrict to short-lived debugging sessions.\n");
+        return out.toString();
+    }
+
+    /**
      * Renders the "Local JVMs" block. {@code descriptors} can be empty; we still emit a header
      * line so the user sees that discovery ran.
      */

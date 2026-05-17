@@ -165,6 +165,40 @@ class DiagnoseReportRendererTest {
 	}
 
 	@Nested
+	@DisplayName("renderVmCapabilitiesBlock")
+	class VmCapabilities {
+
+		@Test
+		@DisplayName("both capabilities yes: emits both lines and the perf warning")
+		void shouldRenderBothCapabilitiesAndPerfWarning() {
+			final String block = DiagnoseReportRenderer.renderVmCapabilitiesBlock(true, true);
+
+			assertThat(block).contains("▸ VM capabilities (field watchpoints)");
+			assertThat(block).contains("canWatchFieldAccess:       yes");
+			assertThat(block).contains("canWatchFieldModification: yes");
+			assertThat(block).contains("dominate target-VM CPU");
+			assertThat(block).contains("narrow filters");
+		}
+
+		@Test
+		@DisplayName("only one capability yes: still emits the block with the missing capability marked 'no'")
+		void shouldRenderBlockWhenOnlyOneCapabilityIsAvailable() {
+			final String block = DiagnoseReportRenderer.renderVmCapabilitiesBlock(false, true);
+
+			assertThat(block).contains("canWatchFieldAccess:       no");
+			assertThat(block).contains("canWatchFieldModification: yes");
+		}
+
+		@Test
+		@DisplayName("both capabilities false: returns empty string so the report layout isn't disturbed")
+		void shouldReturnEmptyStringWhenBothCapabilitiesAreFalse() {
+			final String block = DiagnoseReportRenderer.renderVmCapabilitiesBlock(false, false);
+
+			assertThat(block).isEmpty();
+		}
+	}
+
+	@Nested
 	@DisplayName("renderJvmListBlock")
 	class JvmList {
 

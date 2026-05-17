@@ -890,6 +890,21 @@ public class JDWPTools {
             ),
             JVM_JDWP_PORT
         ));
+        // Capabilities block — only meaningful when connected (the renderer collapses to empty
+        // string when both are false). We probe the live VM defensively because the call can
+        // race with a VM-death event; failure degrades to "no capabilities reported".
+        if (status.connected()) {
+            try {
+                final VirtualMachine vm = jdiService.getRawVM();
+                if (vm != null) {
+                    out.append(DiagnoseReportRenderer.renderVmCapabilitiesBlock(
+                        vm.canWatchFieldAccess(),
+                        vm.canWatchFieldModification()));
+                }
+            } catch (Exception e) {
+                log.debug("VM capability probe failed during diagnose", e);
+            }
+        }
         // Always include the breakpoint+events report — even disconnected, pending breakpoints
         // and stale watchers are useful debugging context. The renderer prefixes its own header
         // so it slots cleanly under the connection block.
@@ -957,6 +972,10 @@ public class JDWPTools {
             breakpointTracker.getAllExceptionBreakpoints();
         final Map<Integer, BreakpointTracker.PendingExceptionBreakpoint> pendingExBps =
             breakpointTracker.getAllPendingExceptionBreakpoints();
+        final Map<Integer, BreakpointTracker.FieldBreakpointInfo> activeFieldBps =
+            breakpointTracker.getAllFieldBreakpoints();
+        final Map<Integer, BreakpointTracker.PendingFieldBreakpoint> pendingFieldBps =
+            breakpointTracker.getAllPendingFieldBreakpoints();
         final List<EventHistory.DebugEvent> recent = eventHistory.getRecent(10);
         final BreakpointTracker.LastBreakpoint last = breakpointTracker.getLastBreakpoint();
 
@@ -1003,6 +1022,31 @@ public class JDWPTools {
             out.append(String.format("  - #%d %s%s%s%n",
                 e.getKey(), pb.getExceptionClass(), reason,
                 renderChainSuffixForPending(e.getKey())));
+        }
+
+        out.append(String.format("Active field breakpoints: %d%n", activeFieldBps.size()));
+        for (Map.Entry<Integer, BreakpointTracker.FieldBreakpointInfo> e : activeFieldBps.entrySet()) {
+            final BreakpointTracker.FieldBreakpointSpec spec = e.getValue().getSpec();
+            final EventRequest req = breakpointTracker.getEventRequestById(e.getKey());
+            final boolean enabled = req != null && req.isEnabled();
+            out.append(String.format("  - #%d %s.%s (%s%s)%s%n",
+                e.getKey(), spec.className(), spec.fieldName(),
+                spec.mode().name().toLowerCase(Locale.ROOT),
+                spec.logOnly() ? ", logOnly" : "",
+                renderChainSuffixForActive(e.getKey(), enabled)));
+        }
+
+        out.append(String.format("Pending field breakpoints: %d%n", pendingFieldBps.size()));
+        for (Map.Entry<Integer, BreakpointTracker.PendingFieldBreakpoint> e : pendingFieldBps.entrySet()) {
+            final BreakpointTracker.PendingFieldBreakpoint pf = e.getValue();
+            final BreakpointTracker.FieldBreakpointSpec spec = pf.getSpec();
+            final String reason = pf.getFailureReason() != null
+                ? "  [FAILED: " + pf.getFailureReason() + ']' : "";
+            out.append(String.format("  - #%d %s.%s (%s%s)%s%s%n",
+                e.getKey(), spec.className(), spec.fieldName(),
+                spec.mode().name().toLowerCase(Locale.ROOT),
+                spec.logOnly() ? ", logOnly" : "",
+                reason, renderChainSuffixForPending(e.getKey())));
         }
 
         out.append("\nLast suspending event: ");
