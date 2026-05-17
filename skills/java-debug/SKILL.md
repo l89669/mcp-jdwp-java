@@ -1,7 +1,7 @@
 ---
-description: Debug a live Java application via the jdwp-inspector MCP server — breakpoints, runtime state, expression eval, variable mutation, exception-throw-site catches, and non-intrusive line/exception logpoints.
+description: Debug a live Java application via the jdwp-inspector MCP server — breakpoints, runtime state, expression eval, variable mutation, exception-throw-site catches, non-intrusive line/exception logpoints, and field watchpoints (suspend or log on every read/write of a specific field).
 when_to_use: |
-  A test fails and the assertion message is unhelpful; an exception is buried under wrappers; a value is wrong but you can't tell where it changes; a race / partial-init / off-by-one / edge-case bug; stepping in your head doesn't match runtime. Triggers: "this test is failing", "why is X null/wrong", "trace this exception", "attach to JDWP", "port 5005/8003/...", "debug the issue".
+  A test fails and the assertion message is unhelpful; an exception is buried under wrappers; a value is wrong but you can't tell where it changes; a field gets mutated and you need to know who wrote it; a race / partial-init / off-by-one / edge-case bug; stepping in your head doesn't match runtime. Triggers: "this test is failing", "why is X null/wrong", "who's writing to field Y", "trace this exception", "attach to JDWP", "port 5005/8003/...", "debug the issue".
 argument-hint: "[port]"
 arguments: port
 allowed-tools: mcp__plugin_jdwp-debugging_jdwp-inspector__*
@@ -114,10 +114,28 @@ Test shows `CompletionException("Async task failed")`, but the real cause is 3 f
 
 A long-running service throws something occasionally and you want to see when/where without halting traffic.
 
-1. `jdwp_set_exception_breakpoint("java.sql.SQLException", logOnly=true, expression="$exception.getSQLState() + \\\": \\\" + $exception.getMessage()")` — `$exception` is bound to the thrown object; the listener auto-resumes after recording.
+1. `jdwp_set_exception_logpoint("java.sql.SQLException", expression="$exception.getSQLState() + \\\": \\\" + $exception.getMessage()")` — `$exception` is bound to the thrown object; the listener auto-resumes after recording.
 2. Let the service run. Each throw produces an `EXCEPTION_LOG` entry (or `EXCEPTION_LOG_ERROR` if the expression fails).
 3. `jdwp_get_events(50)` to inspect throw locations + evaluated expression results in chronological order.
-4. Pass `logOnly=true` with no `expression` for a pure non-intrusive trace (just type, throw location, catch location, thread).
+4. For a pure suspending exception BP without expression evaluation, use `jdwp_set_exception_breakpoint` instead — that tool no longer carries log-only flags.
+
+### "Who is overwriting this field?"
+
+A field has the wrong value at read time and you can't tell which of many code paths wrote it.
+
+1. `jdwp_set_field_breakpoint(className="com.example.OrderState", fieldName="status", mode="modification")` — suspends on every write of the field. Conditions and the `$oldValue` / `$newValue` / `$object` / `$fieldName` / `$mode` bindings narrow the catch.
+2. `jdwp_resume_until_event` — the next write to the field suspends the thread at the write site.
+3. `jdwp_get_stack` — the caller frame is the culprit.
+4. **Want to know the value AND keep going?** Use `jdwp_set_field_logpoint(..., expression="$oldValue + \" -> \" + $newValue")` instead — every write records a `FIELD_LOGPOINT` event with the transition, no suspends. `jdwp_get_events(50)` shows the full history.
+5. **Need only one instance?** Pass `objectFilterId=<instance-id from jdwp_get_locals or jdwp_get_fields>` to filter to that one object. Pass `threadFilterId=<thread uniqueID>` to restrict by thread.
+
+### "Field is mutated during `<clinit>` but my BP misses the first write"
+
+Static initializers run the moment the class loads. A line BP fires on the first event after load, but a static-init write inside the class itself happens *before* the class is fully visible.
+
+1. `jdwp_set_field_breakpoint(className="com.example.Config", fieldName="DEFAULTS", mode="modification")` — even when the class hasn't loaded yet, the watchpoint is registered as PENDING.
+2. On class load, the watchpoint promotes synchronously inside the ClassPrepareEvent — *before* the loading thread runs `<clinit>`. The first static-init write is caught.
+3. `jdwp_get_stack` shows whether the write came from `<clinit>` (static initializer) or a normal call site.
 
 ### "Object inside a HashMap is no longer findable"
 
@@ -177,6 +195,7 @@ Chains can be retrofitted to existing BPs via `jdwp_set_breakpoint_dependency(de
 - **VMStart suspension is special.** When connected to a JVM with `suspend=y`, all threads are suspended but no thread is at a breakpoint yet. `evaluate_expression`, `to_string`, and `set_exception_breakpoint` cannot work until at least one BP has been hit. Set breakpoints first, then resume.
 - **First `evaluate_expression` is slow** (~1-3s) — the expression compiler discovers the target's classpath lazily. Subsequent evals are fast (cached).
 - **Logpoints cost time** — each fires the expression evaluator. Don't put a logpoint inside a tight loop with millions of iterations.
+- **Field watchpoints are expensive.** Each access/modification of a watched field traps into the debugger; on a hot field this can dominate target-VM CPU. Use the narrowest mode that answers your question (`modification` is usually enough), and add `threadFilterId` / `objectFilterId` / `condition` to scope the catches. `jdwp_diagnose` reports `canWatchFieldAccess` / `canWatchFieldModification` plus this warning when connected. Pending field BPs registered before class load promote synchronously on `ClassPrepareEvent`, so `<clinit>` writes are caught.
 - **Object IDs are session-scoped.** They become invalid after `disconnect` or if GC collects the object. If you see "Object not found in cache", re-fetch via `jdwp_get_locals`.
 
 ## Anti-patterns
