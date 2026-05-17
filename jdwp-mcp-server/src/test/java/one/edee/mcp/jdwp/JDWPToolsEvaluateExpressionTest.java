@@ -11,14 +11,20 @@ import com.sun.jdi.VirtualMachine;
 import one.edee.mcp.jdwp.discovery.JvmDiscoveryService;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
 import one.edee.mcp.jdwp.evaluation.exceptions.JdiEvaluationException;
+import one.edee.mcp.jdwp.marks.MarkedInstanceRegistry;
 import one.edee.mcp.jdwp.watchers.WatcherManager;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 
 import java.util.List;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.anyMap;
+import static org.mockito.ArgumentMatchers.argThat;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -37,6 +43,7 @@ class JDWPToolsEvaluateExpressionTest {
 	private JdiExpressionEvaluator evaluator;
 	private JDWPTools tools;
 	private VirtualMachine vm;
+	private MarkedInstanceRegistry markedInstances;
 
 	@BeforeEach
 	void setUp() {
@@ -45,9 +52,10 @@ class JDWPToolsEvaluateExpressionTest {
 		final WatcherManager watcherManager = mock(WatcherManager.class);
 		evaluator = mock(JdiExpressionEvaluator.class);
 		final EventHistory eventHistory = new EventHistory();
+		markedInstances = new MarkedInstanceRegistry();
 		tools = JDWPToolsTestSupport.newTools(
 			jdiService, breakpointTracker, watcherManager, evaluator,
-			eventHistory, new EvaluationGuard(), new JvmDiscoveryService());
+			eventHistory, new EvaluationGuard(), new JvmDiscoveryService(), markedInstances);
 		vm = mock(VirtualMachine.class);
 	}
 
@@ -62,12 +70,13 @@ class JDWPToolsEvaluateExpressionTest {
 		when(thread.uniqueID()).thenReturn(1L);
 		when(thread.isSuspended()).thenReturn(true);
 		when(thread.frame(0)).thenReturn(frame);
-		when(evaluator.evaluate(frame, "1 + 2")).thenReturn(value);
+		when(evaluator.evaluate(eq(frame), eq("1 + 2"), anyMap())).thenReturn(value);
 		when(jdiService.formatFieldValue(value)).thenReturn("3");
 
 		final String result = tools.jdwp_evaluate_expression(1L, "1 + 2", null);
 
-		assertThat(result).isEqualTo("Result: 3");
+		// P3-5 echoes the expression in the result so batched evals can be attributed.
+		assertThat(result).isEqualTo("Result of 1 + 2: 3");
 		verify(evaluator).configureCompilerClasspath(thread);
 	}
 
@@ -106,7 +115,7 @@ class JDWPToolsEvaluateExpressionTest {
 		when(thread.uniqueID()).thenReturn(1L);
 		when(thread.isSuspended()).thenReturn(true);
 		when(thread.frame(0)).thenReturn(frame);
-		when(evaluator.evaluate(frame, "x")).thenReturn(null);
+		when(evaluator.evaluate(eq(frame), eq("x"), anyMap())).thenReturn(null);
 		when(jdiService.formatFieldValue(null)).thenReturn("null");
 
 		tools.jdwp_evaluate_expression(1L, "x", null);
@@ -126,7 +135,7 @@ class JDWPToolsEvaluateExpressionTest {
 		when(thread.uniqueID()).thenReturn(1L);
 		when(thread.isSuspended()).thenReturn(true);
 		when(thread.frame(2)).thenReturn(frame);
-		when(evaluator.evaluate(frame, "y")).thenReturn(null);
+		when(evaluator.evaluate(eq(frame), eq("y"), anyMap())).thenReturn(null);
 		when(jdiService.formatFieldValue(null)).thenReturn("null");
 
 		tools.jdwp_evaluate_expression(1L, "y", 2);
@@ -155,7 +164,7 @@ class JDWPToolsEvaluateExpressionTest {
 		when(thread.isSuspended()).thenReturn(true);
 		when(thread.frame(0)).thenReturn(frame);
 		// First evaluate() throws; the enrichment then re-resolves thread/frame to probe `this`.
-		when(evaluator.evaluate(frame, "secret"))
+		when(evaluator.evaluate(eq(frame), eq("secret"), anyMap()))
 			.thenThrow(new JdiEvaluationException("secret cannot be resolved to a variable"));
 		when(frame.thisObject()).thenReturn(thisObj);
 		when(thisObj.referenceType()).thenReturn(thisType);
@@ -191,7 +200,7 @@ class JDWPToolsEvaluateExpressionTest {
 		when(thread.uniqueID()).thenReturn(1L);
 		when(thread.isSuspended()).thenReturn(true);
 		when(thread.frame(0)).thenReturn(frame);
-		when(evaluator.evaluate(frame, "x")).thenThrow(new VMDisconnectedException("gone"));
+		when(evaluator.evaluate(eq(frame), eq("x"), anyMap())).thenThrow(new VMDisconnectedException("gone"));
 
 		final String result = tools.jdwp_evaluate_expression(1L, "x", null);
 
@@ -199,5 +208,71 @@ class JDWPToolsEvaluateExpressionTest {
 		assertThat(result).contains("jdwp_evaluate_expression");
 		assertThat(result).contains("jdwp_connect");
 		assertThat(result).contains("jdwp_wait_for_attach");
+	}
+
+	/**
+	 * Marks registered before evaluation must be exposed as synthetic {@code $label} bindings to the
+	 * expression. Regression test for P0-6 — prior to the fix, {@code jdwp_evaluate_expression}
+	 * called the 2-arg {@code evaluator.evaluate(frame, expr)} form and the user's expression
+	 * referencing {@code $marked} would fail with "cannot be resolved" even though
+	 * {@code jdwp_get_locals} advertised the binding as visible.
+	 */
+	@Test
+	@DisplayName("forwards marked-instance bindings to the evaluator")
+	void shouldForwardMarkedInstanceBindingsToEvaluator() throws Exception {
+		final ThreadReference thread = mock(ThreadReference.class);
+		final StackFrame frame = mock(StackFrame.class);
+		final IntegerValue value = mock(IntegerValue.class);
+		final ObjectReference markedObj = mock(ObjectReference.class);
+		when(jdiService.getVM()).thenReturn(vm);
+		when(vm.allThreads()).thenReturn(List.of(thread));
+		when(thread.uniqueID()).thenReturn(1L);
+		when(thread.isSuspended()).thenReturn(true);
+		when(thread.frame(0)).thenReturn(frame);
+		when(markedObj.uniqueID()).thenReturn(42L);
+		// MarkedInstanceRegistry.mark requires a real-ish ObjectReference; the registry just stores
+		// it without dereferencing.
+		markedInstances.mark("session", markedObj, false);
+
+		when(evaluator.evaluate(eq(frame), eq("$session.hashCode()"), anyMap())).thenReturn(value);
+		when(jdiService.formatFieldValue(value)).thenReturn("0xdeadbeef");
+
+		tools.jdwp_evaluate_expression(1L, "$session.hashCode()", null);
+
+		// Capture the bindings map actually passed to the evaluator and assert the mark is in it.
+		@SuppressWarnings("unchecked")
+		final ArgumentCaptor<Map<String, com.sun.jdi.Value>> bindingsCaptor =
+			ArgumentCaptor.forClass(Map.class);
+		verify(evaluator).evaluate(eq(frame), eq("$session.hashCode()"), bindingsCaptor.capture());
+		assertThat(bindingsCaptor.getValue()).containsKey("$session");
+	}
+
+	/**
+	 * Counterpart for {@link JDWPTools#jdwp_assert_expression}. Same wiring as above — marks must
+	 * be visible. Argument captor is intentionally separate (rather than a parameterised test) so
+	 * a single test failure points at exactly which tool regressed.
+	 */
+	@Test
+	@DisplayName("jdwp_assert_expression forwards marked-instance bindings to the evaluator")
+	void assertExpressionShouldForwardMarkedInstanceBindings() throws Exception {
+		final ThreadReference thread = mock(ThreadReference.class);
+		final StackFrame frame = mock(StackFrame.class);
+		final ObjectReference markedObj = mock(ObjectReference.class);
+		when(jdiService.getVM()).thenReturn(vm);
+		when(vm.allThreads()).thenReturn(List.of(thread));
+		when(thread.uniqueID()).thenReturn(1L);
+		when(thread.isSuspended()).thenReturn(true);
+		when(thread.frame(0)).thenReturn(frame);
+		when(markedObj.uniqueID()).thenReturn(42L);
+		markedInstances.mark("session", markedObj, false);
+
+		// Stub evaluate so the assert tool can compare; payload value doesn't matter — we only
+		// care that the evaluator received the marks map.
+		when(evaluator.evaluate(eq(frame), eq("$session.getRole()"), anyMap())).thenReturn(null);
+		when(jdiService.formatFieldValue(null)).thenReturn("null");
+
+		tools.jdwp_assert_expression("$session.getRole()", "null", 1L, null);
+
+		verify(evaluator).evaluate(eq(frame), eq("$session.getRole()"), argThat(m -> m.containsKey("$session")));
 	}
 }

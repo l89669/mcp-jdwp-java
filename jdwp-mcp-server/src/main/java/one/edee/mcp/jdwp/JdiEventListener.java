@@ -750,28 +750,28 @@ public class JdiEventListener {
 
     /**
      * Builds the synthetic-binding map exposed to conditions and logpoint expressions on a field
-     * watchpoint hit. {@code $oldValue} / {@code $object} are conditionally present (the JDI value
-     * may itself be a primitive null sentinel, in which case the binding is omitted so the user
-     * gets a compile error rather than a misleading NullPointerException at evaluation time).
-     * {@code $newValue} appears only for {@link ModificationWatchpointEvent}.
+     * watchpoint hit. {@code $oldValue} (always — null for the first write to an uninitialised
+     * reference field), {@code $newValue} (always for {@link ModificationWatchpointEvent}, otherwise
+     * absent), and {@code $object} (null for static-field events) are bound. Null values are bound
+     * as the typed-null literal by {@link JdiExpressionEvaluator#inferDeclaredType(Value)} ({@code
+     * java.lang.Object}), so string-concatenation expressions like {@code "$oldValue + \" -> \" +
+     * $newValue"} render the literal {@code "null"} instead of failing at compile time.
+     * <p>
+     * {@link HashMap} (not {@link java.util.LinkedHashMap}) is intentional — null values are
+     * supported by HashMap and the binding order is fixed by {@link JdiExpressionEvaluator}'s
+     * deterministic iteration of {@link com.sun.jdi.LocalVariable}s plus the wrapper method's
+     * parameter declaration order.
      */
     private static Map<String, Value> buildFieldEventBindings(WatchpointEvent event,
                                                               boolean isModification,
                                                               String fieldName, String modeStr) {
         final VirtualMachine vm = event.virtualMachine();
         final Map<String, Value> bindings = new HashMap<>();
-        if (event.valueCurrent() != null) {
-            bindings.put("$oldValue", event.valueCurrent());
-        }
+        bindings.put("$oldValue", event.valueCurrent());
         if (isModification) {
-            final Value newValue = ((ModificationWatchpointEvent) event).valueToBe();
-            if (newValue != null) {
-                bindings.put("$newValue", newValue);
-            }
+            bindings.put("$newValue", ((ModificationWatchpointEvent) event).valueToBe());
         }
-        if (event.object() != null) {
-            bindings.put("$object", event.object());
-        }
+        bindings.put("$object", event.object());
         bindings.put("$fieldName", vm.mirrorOf(fieldName));
         bindings.put("$mode", vm.mirrorOf(modeStr));
         // Map is method-scoped and the downstream consumers (condition + logpoint evaluators) read
@@ -938,6 +938,26 @@ public class JdiEventListener {
     }
 
     /**
+     * Marks the pending line BP as failed in the registry AND records a {@code BP_PROMOTION_FAILED}
+     * event in {@link EventHistory}. Without the event record, the failure is visible only by
+     * inspecting {@code jdwp_overview} — agents driving {@code jdwp_resume_until_event} would see
+     * {@code [VM_DEATH]} without any indication that their BP was never going to fire. See P0-1
+     * in plans/audit-2026-05-17/VERDICTS.md.
+     */
+    private void recordPromotionFailure(int id, String className, int lineNumber, @Nullable String reason) {
+        breakpointTracker.markPendingFailed(id, reason);
+        final String safeReason = reason != null ? reason : "(unspecified)";
+        eventHistory.record(new EventHistory.DebugEvent("BP_PROMOTION_FAILED",
+            String.format("Deferred BP #%d for %s:%d failed to install — %s",
+                id, className, lineNumber, safeReason),
+            Map.of("breakpointId", String.valueOf(id),
+                "class", className,
+                "line", String.valueOf(lineNumber),
+                "reason", safeReason)));
+        log.warn("[JDI] Deferred breakpoint {} failed: {}", id, safeReason);
+    }
+
+    /**
      * Promotes pending line breakpoints AND pending exception breakpoints for the freshly loaded
      * class. After promotion, deletes the {@link ClassPrepareRequest} for this class if no other
      * pending items still reference it — keeping a stale CPR around would deliver duplicate events
@@ -976,8 +996,7 @@ public class JdiEventListener {
                     final List<Location> locations = refType.locationsOfLine(pending.getLineNumber());
                     if (locations.isEmpty()) {
                         final String reason = String.format("No executable code at line %d in %s", pending.getLineNumber(), className);
-                        breakpointTracker.markPendingFailed(id, reason);
-                        log.warn("[JDI] Deferred breakpoint {} failed: {}", id, reason);
+                        recordPromotionFailure(id, className, pending.getLineNumber(), reason);
                         continue;
                     }
 
@@ -993,11 +1012,10 @@ public class JdiEventListener {
                     log.info("[JDI] Deferred breakpoint {} activated at {}:{}", id, className, pending.getLineNumber());
 
                 } catch (AbsentInformationException e) {
-                    breakpointTracker.markPendingFailed(id, "No debug info (compile with -g)");
-                    log.warn("[JDI] Deferred breakpoint {} failed: no debug info for {}", id, className);
+                    recordPromotionFailure(id, className, pending.getLineNumber(),
+                        "No debug info (compile with -g)");
                 } catch (Exception e) {
-                    breakpointTracker.markPendingFailed(id, e.getMessage());
-                    log.warn("[JDI] Deferred breakpoint {} failed: {}", id, e.getMessage());
+                    recordPromotionFailure(id, className, pending.getLineNumber(), e.getMessage());
                 }
             }
 

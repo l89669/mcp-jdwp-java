@@ -1,6 +1,7 @@
 package one.edee.mcp.jdwp;
 
 import com.sun.jdi.ThreadReference;
+import com.sun.jdi.VMDisconnectedException;
 import com.sun.jdi.VirtualMachine;
 import one.edee.mcp.jdwp.discovery.JvmDiscoveryService;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
@@ -229,5 +230,161 @@ class JDWPToolsResumeUntilEventVmDeathTest {
 		assertThat(result).startsWith("Event fired.");
 		assertThat(result).contains("breakpoint=11");
 		assertThat(result).contains("VM has since disconnected");
+	}
+
+	/**
+	 * Regression for P1-6: a follow-up {@code jdwp_resume_until_event} call after the VM has died
+	 * used to throw {@link NullPointerException} and render as "Error: null" because the catch
+	 * block did {@code "Error: " + e.getMessage()} without null-guarding. The new envelope must
+	 * include the exception class name when no message is available.
+	 */
+	@Test
+	@DisplayName("after VM is gone: [VM_GONE] envelope (never 'Error: null')")
+	void shouldReturnVmGoneEnvelopeWhenVmDisconnectedExceptionThrown() throws Exception {
+		// JDIConnectionService.getVM() typically throws IllegalStateException when no VM is attached.
+		when(jdiService.getVM()).thenThrow(new IllegalStateException("Not connected"));
+
+		final String result = tools.jdwp_resume_until_event(1_000);
+
+		assertThat(result).startsWith("[VM_GONE]");
+		assertThat(result).contains("jdwp_resume_until_event");
+		assertThat(result).contains("jdwp_connect");
+	}
+
+	@Test
+	@DisplayName("after VM is gone with null-message exception: envelope falls back to class name")
+	void shouldRenderClassNameWhenExceptionMessageIsNull() throws Exception {
+		// A naked NPE has no message — the previous code rendered "Error: null". The new
+		// envelope must always include enough information to identify the cause.
+		when(jdiService.getVM()).thenThrow(new RuntimeException((String) null));
+
+		final String result = tools.jdwp_resume_until_event(1_000);
+
+		assertThat(result).startsWith("Error in jdwp_resume_until_event");
+		assertThat(result).doesNotContain(": null");
+		assertThat(result).contains("RuntimeException");
+	}
+
+	@Test
+	@DisplayName("VMDisconnectedException routes through [VM_GONE] envelope")
+	void shouldRouteVmDisconnectedExceptionThroughVmGoneEnvelope() throws Exception {
+		when(jdiService.getVM()).thenThrow(new VMDisconnectedException("connection is closed"));
+
+		final String result = tools.jdwp_resume_until_event(1_000);
+
+		assertThat(result).startsWith("[VM_GONE]");
+		assertThat(result).contains("connection is closed");
+	}
+
+	/**
+	 * Regression for P0-1 polish: when the VM dies before any BP fires and pending BPs have been
+	 * marked FAILED (e.g. a deferred BP on a comment line), the {@code [VM_DEATH]} response must
+	 * proactively surface the FAILED state so the agent doesn't blame the system for a race
+	 * condition. Previously the agent had to follow up with {@code jdwp_overview} to discover this.
+	 */
+	@Test
+	@DisplayName("[VM_DEATH] hint lists deferred BPs that failed to install")
+	void shouldListFailedPendingBpsInVmDeathHint() throws Exception {
+		final VirtualMachine vm = mock(VirtualMachine.class);
+		when(jdiService.getVM()).thenReturn(vm);
+
+		final CountDownLatch latch = new CountDownLatch(1);
+		latch.countDown();
+		when(breakpointTracker.armNextEventLatch()).thenReturn(latch);
+		eventHistory.record(new EventHistory.DebugEvent("VM_DEATH", "VM disconnected"));
+
+		// Build a real pending BP with a failure reason — wraps the dual concerns of "tracker has
+		// the state" and "renderer surfaces it" in one assertion.
+		final BreakpointTracker realTracker = new BreakpointTracker();
+		final int pendingId = realTracker.registerPendingBreakpoint("com.example.Foo", 40, 2, "ALL");
+		realTracker.markPendingFailed(pendingId, "No executable code at line 40");
+		when(breakpointTracker.getAllPendingBreakpoints()).thenReturn(realTracker.getAllPendingBreakpoints());
+
+		final String result = tools.jdwp_resume_until_event(1_000);
+
+		assertThat(result).startsWith("[VM_DEATH]");
+		assertThat(result).contains("deferred breakpoint(s) were promoted but failed");
+		assertThat(result).contains("#" + pendingId);
+		assertThat(result).contains("com.example.Foo:40");
+		assertThat(result).contains("No executable code at line 40");
+		assertThat(result).contains("Set BPs on real executable lines");
+	}
+
+	/**
+	 * Regression for P0-2/P0-3: when an event has fired before {@code jdwp_resume_until_event} is
+	 * called (e.g. {@code jdwp_step_over} → other tool call → {@code resume_until_event}), the
+	 * tool must return the captured snapshot WITHOUT calling {@code vm.resume()} again. The
+	 * previous code path always re-armed and re-resumed, overshooting the suspended thread.
+	 */
+	@Test
+	@DisplayName("short-circuits without resume when pendingFire is set (step → other tool → resume_until_event)")
+	void shouldShortCircuitWhenPendingFireSet() throws Exception {
+		final VirtualMachine vm = mock(VirtualMachine.class);
+		when(jdiService.getVM()).thenReturn(vm);
+		// Pretend a STEP fired before the call — the listener would have set this via
+		// fireNextEvent(). consumePendingFire() returns true the first time and false thereafter.
+		when(breakpointTracker.consumePendingFire()).thenReturn(true).thenReturn(false);
+
+		final ThreadReference thread = mock(ThreadReference.class);
+		when(thread.name()).thenReturn("main");
+		when(thread.uniqueID()).thenReturn(1L);
+		when(thread.isSuspended()).thenReturn(true);
+		when(thread.frameCount()).thenReturn(3);
+		when(breakpointTracker.getLastBreakpoint())
+			.thenReturn(new BreakpointTracker.LastBreakpoint(thread, 7));
+
+		final String result = tools.jdwp_resume_until_event(5_000);
+
+		assertThat(result).startsWith("Event fired.");
+		assertThat(result).contains("breakpoint=7");
+		// The critical assertion: NO vm.resume() while a captured snapshot exists. Verifying this
+		// directly via Mockito.verify protects future renderer tweaks from masking a regression.
+		org.mockito.Mockito.verify(vm, org.mockito.Mockito.never()).resume();
+		// And NO armNextEventLatch — the short-circuit means we never set up a fresh latch.
+		org.mockito.Mockito.verify(breakpointTracker, org.mockito.Mockito.never()).armNextEventLatch();
+	}
+
+	@Test
+	@DisplayName("normal path arms + resumes when pendingFire is clear (no prior event)")
+	void shouldArmAndResumeWhenPendingFireClear() throws Exception {
+		final VirtualMachine vm = mock(VirtualMachine.class);
+		when(jdiService.getVM()).thenReturn(vm);
+		when(breakpointTracker.consumePendingFire()).thenReturn(false);
+
+		final CountDownLatch latch = new CountDownLatch(1);
+		latch.countDown();
+		when(breakpointTracker.armNextEventLatch()).thenReturn(latch);
+
+		final ThreadReference thread = mock(ThreadReference.class);
+		when(thread.name()).thenReturn("main");
+		when(thread.uniqueID()).thenReturn(1L);
+		when(thread.isSuspended()).thenReturn(true);
+		when(thread.frameCount()).thenReturn(2);
+		when(breakpointTracker.getLastBreakpoint())
+			.thenReturn(new BreakpointTracker.LastBreakpoint(thread, 11));
+
+		final String result = tools.jdwp_resume_until_event(1_000);
+
+		assertThat(result).startsWith("Event fired.");
+		org.mockito.Mockito.verify(vm).resume();
+		org.mockito.Mockito.verify(breakpointTracker).armNextEventLatch();
+	}
+
+	@Test
+	@DisplayName("[VM_DEATH] hint omits FAILED block when no pending BPs failed")
+	void shouldOmitFailedHintWhenNoPendingBpsFailed() throws Exception {
+		final VirtualMachine vm = mock(VirtualMachine.class);
+		when(jdiService.getVM()).thenReturn(vm);
+
+		final CountDownLatch latch = new CountDownLatch(1);
+		latch.countDown();
+		when(breakpointTracker.armNextEventLatch()).thenReturn(latch);
+		eventHistory.record(new EventHistory.DebugEvent("VM_DEATH", "VM disconnected"));
+		when(breakpointTracker.getAllPendingBreakpoints()).thenReturn(java.util.Map.of());
+
+		final String result = tools.jdwp_resume_until_event(1_000);
+
+		assertThat(result).startsWith("[VM_DEATH]");
+		assertThat(result).doesNotContain("deferred breakpoint(s) were promoted but failed");
 	}
 }

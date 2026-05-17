@@ -366,9 +366,14 @@ class DiagnoseReportRendererTest {
 			assertThat(block).contains("…");
 		}
 
+		/**
+		 * Regression for P1-5: after the THIS-PROCESS filter, the MCP server's own row is dropped
+		 * from the rendered block entirely. The renderer should report "0 found" when the only
+		 * descriptor is self, NOT include the row with a (THIS PROCESS) marker.
+		 */
 		@Test
-		@DisplayName("THIS PROCESS marker is preserved even when main class would overflow the column")
-		void shouldKeepThisProcessMarkerOnOverflow() {
+		@DisplayName("THIS PROCESS row is filtered out — does NOT appear in the rendered block (P1-5)")
+		void shouldFilterOutThisProcessRow() {
 			final String longName = "com.example.really.long.package.name.with.many.segments.MainClass";
 			final JvmDescriptor d = new JvmDescriptor(
 				1L, longName, null, null, null,
@@ -377,10 +382,9 @@ class DiagnoseReportRendererTest {
 
 			final String block = DiagnoseReportRenderer.renderJvmListBlock(List.of(d), "u");
 
-			// The marker is the most actionable piece of info on the row; the truncator must
-			// shorten the class name to make room for it instead of dropping the marker itself.
-			assertThat(block).contains("(THIS PROCESS)");
-			assertThat(block).contains("…");
+			assertThat(block).doesNotContain("(THIS PROCESS)");
+			assertThat(block).doesNotContain(longName);
+			assertThat(block).contains("(0 found)");
 		}
 	}
 

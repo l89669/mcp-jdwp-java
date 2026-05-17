@@ -16,6 +16,8 @@ import org.junit.jupiter.api.Test;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.anyMap;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -62,7 +64,7 @@ class JDWPToolsAssertExpressionTest {
 		when(jdiService.getVM()).thenReturn(vm);
 		when(vm.allThreads()).thenReturn(List.of(thread));
 		when(thread.frame(0)).thenReturn(frame);
-		when(evaluator.evaluate(frame, "x")).thenReturn(result);
+		when(evaluator.evaluate(eq(frame), eq("x"), anyMap())).thenReturn(result);
 		when(jdiService.formatFieldValue(result)).thenReturn("5");
 
 		final String out = tools.jdwp_assert_expression("x", "5", 1L, null);
@@ -79,7 +81,7 @@ class JDWPToolsAssertExpressionTest {
 		when(jdiService.getVM()).thenReturn(vm);
 		when(vm.allThreads()).thenReturn(List.of(thread));
 		when(thread.frame(0)).thenReturn(frame);
-		when(evaluator.evaluate(frame, "x")).thenReturn(result);
+		when(evaluator.evaluate(eq(frame), eq("x"), anyMap())).thenReturn(result);
 		when(jdiService.formatFieldValue(result)).thenReturn("5");
 
 		final String out = tools.jdwp_assert_expression("x", "6", 1L, null);
@@ -102,7 +104,7 @@ class JDWPToolsAssertExpressionTest {
 		when(jdiService.getVM()).thenReturn(vm);
 		when(vm.allThreads()).thenReturn(List.of(thread));
 		when(thread.frame(0)).thenReturn(frame);
-		when(evaluator.evaluate(frame, "name")).thenReturn(result);
+		when(evaluator.evaluate(eq(frame), eq("name"), anyMap())).thenReturn(result);
 		when(jdiService.formatFieldValue(result)).thenReturn("\"hello\"");
 
 		final String out = tools.jdwp_assert_expression("name", "hello", 1L, null);
@@ -118,7 +120,7 @@ class JDWPToolsAssertExpressionTest {
 		final Value result = mock(Value.class);
 		when(breakpointTracker.getLastBreakpointThread()).thenReturn(thread);
 		when(thread.frame(0)).thenReturn(frame);
-		when(evaluator.evaluate(frame, "x")).thenReturn(result);
+		when(evaluator.evaluate(eq(frame), eq("x"), anyMap())).thenReturn(result);
 		when(jdiService.formatFieldValue(result)).thenReturn("1");
 
 		final String out = tools.jdwp_assert_expression("x", "1", null, null);
@@ -158,7 +160,7 @@ class JDWPToolsAssertExpressionTest {
 		when(jdiService.getVM()).thenReturn(vm);
 		when(vm.allThreads()).thenReturn(List.of(thread));
 		when(thread.frame(0)).thenReturn(frame);
-		when(evaluator.evaluate(frame, "boom"))
+		when(evaluator.evaluate(eq(frame), eq("boom"), anyMap()))
 			.thenThrow(new JdiEvaluationException("compile error"));
 
 		final String out = tools.jdwp_assert_expression("boom", "x", 1L, null);
@@ -179,7 +181,7 @@ class JDWPToolsAssertExpressionTest {
 		when(jdiService.getVM()).thenReturn(vm);
 		when(vm.allThreads()).thenReturn(List.of(thread));
 		when(thread.frame(0)).thenReturn(frame);
-		when(evaluator.evaluate(frame, "x")).thenThrow(new VMDisconnectedException("gone"));
+		when(evaluator.evaluate(eq(frame), eq("x"), anyMap())).thenThrow(new VMDisconnectedException("gone"));
 
 		final String out = tools.jdwp_assert_expression("x", "5", 1L, null);
 

@@ -177,7 +177,7 @@ A value gets set in many places and you want to know which write produced the ba
 You found the interesting object at one breakpoint (a particular `Cart`, `Session`, `User`, etc.) and want to reference it by name later — in conditions, in logpoint expressions, in watchers — even from frames where the variable name is different or absent.
 
 1. At the BP where you spotted it, label it: `jdwp_mark_instance(label="cart_42", objectId=<id from jdwp_get_locals>)`. By default the object is **pinned** in the target heap (`disableCollection`) so the label remains valid across the rest of the session even if the application drops every other reference.
-2. Now reference it in any later expression as `$cart_42`. Works in conditional breakpoints, logpoint expressions, watchers, and exception logpoint expressions.
+2. Now reference it in any later expression as `$cart_42`. Works in: conditional breakpoints, logpoint expressions, watchers, exception logpoint expressions, **and** `jdwp_evaluate_expression` / `jdwp_assert_expression` (so you can `jdwp_assert_expression("$cart_42.getTotal()", "0")` at any later BP).
 3. List active marks: `jdwp_overview(types="mark")`. They also appear in the "Marked instances visible to expressions" footer of `jdwp_get_locals` and `jdwp_get_breakpoint_context`, so you see them at every stop without an extra call.
 4. Done with it: `jdwp_unmark_instance("cart_42")` (releases the pin).
 
@@ -196,6 +196,26 @@ jdwp_set_logpoint("PaymentService", 42, "\"cart total: \" + $cart_42.getTotal()"
 **Reserved labels** (will be rejected): `exception`, `oldValue`, `newValue`, `object`, `fieldName`, `mode`, `_this`. Plus any Java keyword. Plus the label of an already-marked object — `jdwp_unmark_instance` or `jdwp_rename_mark` first.
 
 **Pinning caveat:** if you want to observe natural GC of the marked object, pass `pin=false`. The mark then survives in the registry but `buildBindings` will skip it once `isCollected()` returns true; the overview shows it with `[collected — binding will be skipped]`.
+
+### "Verify an invariant in one call"
+
+You think the state at a BP should be `X` and want a one-line yes/no instead of an eyeballed `evaluate_expression` result.
+
+```
+jdwp_assert_expression(expression="order.getStatus()", expected="CONFIRMED")
+→ "OK — order.getStatus() = CONFIRMED"
+or "MISMATCH — order.getStatus()  expected: CONFIRMED  actual: PENDING"
+```
+
+Cheapest possible verification step. `threadId` defaults to the last breakpoint thread, so chained `jdwp_assert_expression` calls work without re-specifying it. Mark bindings (`$cart_42` etc.) are available here too.
+
+### "Watcher panel — see a fixed set of values on every hit"
+
+Several values are interesting at one BP and you don't want to issue N separate `jdwp_evaluate_expression` calls each time.
+
+1. Attach watchers (one per expression): `jdwp_attach_watcher(breakpointId=1, label="total", expression="order.getTotal()")`, then `(breakpointId=1, label="items", expression="order.getItems().size()")`, ...
+2. At each BP hit: `jdwp_evaluate_watchers(threadId, scope="current_frame", breakpointId=1)` — returns every watcher's value (and an inline `[ERROR: ...]` per watcher that fails — others continue). The total line splits succeeded vs errored so partial failures are explicit.
+3. `jdwp_list_watchers_for_breakpoint(1)` / `jdwp_overview(types="watcher", filter="...")` to list, `jdwp_detach_watcher(<short-id>)` to remove.
 
 ### "Same method runs 1000× but I only care about the call after login"
 
@@ -255,3 +275,13 @@ When you land at a breakpoint and don't know what to look at:
 3. `jdwp_assert_expression(<expression>, <expected>)` to test "is the state what I expected?" — much terser than evaluating and eyeballing.
 
 **When something isn't working:** call `jdwp_diagnose` first — it returns the MCP server status, the JDWP connection (with last-attempt error if disconnected), and a list of local JVMs with their JDWP ports in a single call. Skips the `ps`/`lsof`/`jps` round-trip. See [references/troubleshooting.md](references/troubleshooting.md) for more.
+
+**Cheaper status checks:** the server also exposes two MCP resources — `jdwp://diagnose` and `jdwp://jvms`. Attach `@jdwp-inspector:jdwp://diagnose` (or `:jdwp://jvms` for just the JVM inventory) from the autocomplete to read live status into the conversation without a model turn.
+
+## When the [VM_DEATH] message lists FAILED breakpoints
+
+`jdwp_resume_until_event` returning `[VM_DEATH]` always means "the target VM is gone — nothing more to wait on." If the response includes a `Note: deferred breakpoint(s) were promoted but failed to install: #N at Class:line (reason)` line, that BP was set on a non-executable position (comment, blank line, method signature, or a class with no debug info). Re-set the BP on a real statement line and re-attach.
+
+## State-checking semantics of resume_until_event
+
+`jdwp_resume_until_event` is state-aware, not just signal-driven. If a BP / STEP / exception event has fired since your last call, it returns immediately with the captured snapshot rather than re-resuming the thread (which would overshoot the suspended location). So `jdwp_step_over` → any number of intervening tool calls → `jdwp_resume_until_event` is safe — you'll land on the STEP event, not the BP after it.

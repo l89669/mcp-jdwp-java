@@ -68,13 +68,18 @@ class JDWPToolsChainToolsTest {
 		erm = mock(EventRequestManager.class);
 		when(jdiService.getVM()).thenReturn(vm);
 		when(vm.eventRequestManager()).thenReturn(erm);
+		// jdwp_diagnose suppresses its debugger-state block when disconnected (P1-4). The chain
+		// rendering / interpretation tests below all expect that block, so we report CONNECTED
+		// from the mocked connection-status surface.
+		when(jdiService.getConnectionStatus()).thenReturn(new JDIConnectionService.ConnectionStatus(
+			true, "localhost", 5005, java.time.Instant.now(), null));
 	}
 
 	// ── Helpers ────────────────────────────────────────────────────────────
 
 	/**
 	 * Wires a {@link BreakpointRequest} mock with a location report of
-	 * {@code className}/{@code lineNumber} so {@link JDWPTools#jdwp_overview(String, String)} can render
+	 * {@code className}/{@code lineNumber} so {@link JDWPTools#jdwp_overview(String, String, null)} can render
 	 * it without throwing. {@code suspendPolicy} mirrors the JDI {@link EventRequest} constants
 	 * (2 = SUSPEND_ALL on the JDI ABI).
 	 */
@@ -655,7 +660,7 @@ class JDWPToolsChainToolsTest {
 			int depId = tracker.registerBreakpoint(depBp);
 			tracker.registerDependency(depId, triggerId, false);
 
-			String result = tools.jdwp_overview("breakpoint", null);
+			String result = tools.jdwp_overview("breakpoint", null, null);
 
 			assertThat(result).contains("chain=trigger=#" + triggerId)
 				.contains("sticky")
@@ -669,7 +674,7 @@ class JDWPToolsChainToolsTest {
 			int pendingDepId = tracker.registerPendingBreakpoint("com.example.Foo", 99, 2, "all");
 			tracker.registerDependency(pendingDepId, triggerId, true);
 
-			String result = tools.jdwp_overview("breakpoint", null);
+			String result = tools.jdwp_overview("breakpoint", null, null);
 
 			assertThat(result).contains("chain=trigger=#" + triggerId)
 				.contains("one-shot");
@@ -686,7 +691,7 @@ class JDWPToolsChainToolsTest {
 				ExceptionBreakpointSpec.suspending("java.lang.RuntimeException", true, true));
 			tracker.registerDependency(exId, triggerId, false);
 
-			String result = tools.jdwp_overview("exception_breakpoint", null);
+			String result = tools.jdwp_overview("exception_breakpoint", null, null);
 
 			assertThat(result).contains("chain=trigger=#" + triggerId)
 				.contains("sticky")

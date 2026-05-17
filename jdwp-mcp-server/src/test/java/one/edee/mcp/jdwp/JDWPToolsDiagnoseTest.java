@@ -84,8 +84,13 @@ class JDWPToolsDiagnoseTest {
 		assertThat(result).contains("INTERPRETATION:");
 	}
 
+	/**
+	 * Regression for P1-5: the MCP server's own JVM row must be filtered out of the rendered
+	 * inventory — the agent can never attach to it, so the row is pure noise. Other JVMs on the
+	 * list continue to render normally.
+	 */
 	@Test
-	@DisplayName("THIS PROCESS marker appears on the matching JVM row")
+	@DisplayName("THIS PROCESS row is filtered from the JVM block (P1-5)")
 	void shouldFlagThisProcessRow() {
 		when(jdiService.getConnectionStatus()).thenReturn(new JDIConnectionService.ConnectionStatus(
 			false, null, 0, null, null
@@ -101,7 +106,9 @@ class JDWPToolsDiagnoseTest {
 
 		final String result = tools.jdwp_diagnose(null);
 
-		assertThat(result).contains("(THIS PROCESS)");
+		assertThat(result).doesNotContain("(THIS PROCESS)");
+		assertThat(result).doesNotContain("JdwpMcpServerApplication");
+		// Sibling row must still render normally.
 		assertThat(result).contains("98765");
 		assertThat(result).contains(":5005");
 		assertThat(result).contains("LISTENING");
@@ -138,8 +145,12 @@ class JDWPToolsDiagnoseTest {
 		assertThat(result).contains("discovery failed: attach api blew up");
 	}
 
+	/**
+	 * Regression for P1-5: a long-named THIS-PROCESS JVM is now filtered entirely — neither the
+	 * truncated form nor the marker appear. The block reports "0 found" instead.
+	 */
 	@Test
-	@DisplayName("long main class is truncated in the rendered JVM row while THIS PROCESS marker survives")
+	@DisplayName("long main class on THIS PROCESS row is filtered out (P1-5)")
 	void shouldTruncateLongMainClassPreservingThisProcessMarker() {
 		when(jdiService.getConnectionStatus()).thenReturn(new JDIConnectionService.ConnectionStatus(
 			false, null, 0, null, null
@@ -152,11 +163,9 @@ class JDWPToolsDiagnoseTest {
 
 		final String result = tools.jdwp_diagnose(null);
 
-		// Truncated form ends with the horizontal ellipsis, full name is dropped.
-		assertThat(result).contains("…");
 		assertThat(result).doesNotContain(longMain);
-		// The marker is preserved even though the class name had to be cut.
-		assertThat(result).contains("(THIS PROCESS)");
+		assertThat(result).doesNotContain("(THIS PROCESS)");
+		assertThat(result).contains("(0 found)");
 	}
 
 	@Test

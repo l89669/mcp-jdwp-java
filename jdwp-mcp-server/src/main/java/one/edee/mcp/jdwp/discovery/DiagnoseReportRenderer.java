@@ -118,15 +118,21 @@ public final class DiagnoseReportRenderer {
      * line so the user sees that discovery ran.
      */
     public static String renderJvmListBlock(List<JvmDescriptor> descriptors, String currentUser) {
+        // P1-5: filter out the MCP server's own PID before rendering. Listing ourselves as a
+        // (THIS PROCESS) row is pure noise — the agent can never attach the JDWP server to its
+        // own JVM, so the row offers no actionable information.
+        final List<JvmDescriptor> filtered = descriptors.stream()
+            .filter(d -> !d.isThisProcess())
+            .toList();
         final StringBuilder out = new StringBuilder();
-        out.append(String.format("%n▸ Local JVMs visible to user '%s' (%d found)%n", currentUser, descriptors.size()));
-        if (descriptors.isEmpty()) {
+        out.append(String.format("%n▸ Local JVMs visible to user '%s' (%d found)%n", currentUser, filtered.size()));
+        if (filtered.isEmpty()) {
             out.append("  (no JVMs discovered — discovery may have been blocked by sandbox restrictions)\n");
             return out.toString();
         }
         out.append("  PID    Main class / JAR                          JDWP            State\n");
         out.append("  ─────  ────────────────────────────────────────  ──────────────  ──────────\n");
-        for (JvmDescriptor d : descriptors) {
+        for (JvmDescriptor d : filtered) {
             out.append("  ");
             out.append(padLeft(String.valueOf(d.pid()), 5));
             out.append("  ");
@@ -137,7 +143,7 @@ public final class DiagnoseReportRenderer {
         }
         out.append("\n  Legend: (s)=suspend=y. LISTENING confirms a JDWP handshake; UNKNOWN means the\n");
         out.append("          endpoint was reported but not probed (off-host or off-budget).\n");
-        out.append(renderAttachHints(descriptors));
+        out.append(renderAttachHints(filtered));
         return out.toString();
     }
 

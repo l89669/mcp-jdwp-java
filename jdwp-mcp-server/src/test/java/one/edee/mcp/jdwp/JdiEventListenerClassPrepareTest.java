@@ -135,7 +135,7 @@ class JdiEventListenerClassPrepareTest {
 	}
 
 	@Test
-	@DisplayName("Empty locationsOfLine marks the pending BP as FAILED")
+	@DisplayName("Empty locationsOfLine marks the pending BP as FAILED AND records BP_PROMOTION_FAILED event")
 	void shouldRecordFailureWhenLocationsOfLineEmpty() throws Exception {
 		ReferenceType refType = mock(ReferenceType.class);
 		when(refType.name()).thenReturn("com.example.Foo");
@@ -151,10 +151,22 @@ class JdiEventListenerClassPrepareTest {
 		BreakpointTracker.PendingBreakpoint pending = tracker.getPendingBreakpoint(pendingId);
 		assertThat(pending).isNotNull();
 		assertThat(pending.getFailureReason()).contains("No executable code at line 42");
+
+		// Regression coverage for P0-1 polish: the failure must also surface as an EventHistory
+		// entry so agents reading jdwp_get_events / the [VM_DEATH] hint can see why their BP
+		// never fired — silent-slf4j-log-only is what made the original audit misdiagnose this
+		// as a race condition.
+		assertThat(eventHistory.getRecent(10))
+			.anySatisfy(e -> {
+				assertThat(e.type()).isEqualTo("BP_PROMOTION_FAILED");
+				assertThat(e.summary()).contains("#" + pendingId);
+				assertThat(e.summary()).contains("com.example.Foo:42");
+				assertThat(e.summary()).contains("No executable code");
+			});
 	}
 
 	@Test
-	@DisplayName("AbsentInformationException from locationsOfLine marks the pending BP as FAILED")
+	@DisplayName("AbsentInformationException from locationsOfLine marks the pending BP as FAILED AND records event")
 	void shouldRecordFailureWhenAbsentInformationException() throws Exception {
 		ReferenceType refType = mock(ReferenceType.class);
 		when(refType.name()).thenReturn("com.example.Foo");
@@ -170,6 +182,12 @@ class JdiEventListenerClassPrepareTest {
 		BreakpointTracker.PendingBreakpoint pending = tracker.getPendingBreakpoint(pendingId);
 		assertThat(pending).isNotNull();
 		assertThat(pending.getFailureReason()).contains("No debug info");
+
+		assertThat(eventHistory.getRecent(10))
+			.anySatisfy(e -> {
+				assertThat(e.type()).isEqualTo("BP_PROMOTION_FAILED");
+				assertThat(e.summary()).contains("No debug info");
+			});
 	}
 
 	/**

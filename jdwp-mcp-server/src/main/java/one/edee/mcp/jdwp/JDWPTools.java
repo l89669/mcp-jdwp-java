@@ -308,7 +308,14 @@ public class JDWPTools {
             attempts++;
             try {
                 final String result = jdiService.connect(resolvedHost, resolvedPort);
-                return String.format("%s (attached after %d attempt(s))", result, attempts);
+                // P3-4: tell the agent what to do next. At VM_START (the common suspend=y case),
+                // no thread is parked at a method-invocation event yet, so jdwp_evaluate_expression
+                // / jdwp_to_string would fail with IncompatibleThreadStateException — the agent
+                // needs to set BPs and resume first.
+                return String.format("%s (attached after %d attempt(s))%n"
+                    + "Next: set breakpoints, then call jdwp_resume_until_event. The VM is currently "
+                    + "suspended at VM_START — expression evaluation requires landing at a real BP first.",
+                    result, attempts);
             } catch (IllegalConnectorArgumentsException e) {
                 // Configuration error — retrying will never make this succeed. Fail fast.
                 return String.format("[ERROR] Invalid connector arguments for %s:%d — %s",
@@ -358,18 +365,22 @@ public class JDWPTools {
     public String jdwp_get_version() {
         try {
             final VirtualMachine vm = jdiService.getVM();
-            return String.format("VM: %s\nVersion: %s\nDescription: %s",
-                vm.name(), vm.version(), vm.description());
+            // P2-13: collapse the 3-line Description block. vm.description() returns three lines of
+            // "JDI/JDWP/JVM Debug Interface version 21.0" boilerplate which adds no agent-actionable
+            // info beyond vm.name() + vm.version(). One line is sufficient.
+            return String.format("VM: %s %s", vm.name(), vm.version());
         } catch (Exception e) {
             return "Error: " + e.getMessage();
         }
     }
 
-    @McpTool(description = "List user threads in the JVM (status, frame count). System/JVM-internal threads (Reference Handler, Finalizer, surefire workers, etc.) are hidden unless includeSystemThreads=true.")
+    @McpTool(description = "List user threads in the JVM (status, frame count). System/JVM-internal threads (Reference Handler, Finalizer, surefire workers, etc.) are hidden unless includeSystemThreads=true. Default renders a 1-line table per thread for compactness; pass verbose=true for the legacy block-per-thread format.")
     public String jdwp_get_threads(
-        @McpToolParam(required = false, description = "Include JVM/JDK/test-runner internal threads (default: false)") @Nullable Boolean includeSystemThreads) {
+        @McpToolParam(required = false, description = "Include JVM/JDK/test-runner internal threads (default: false)") @Nullable Boolean includeSystemThreads,
+        @McpToolParam(required = false, description = "If true, render each thread as a 5-line block (legacy format). Default false — compact 1-line table per thread. The compact form fits a 200-thread Tomcat in ~25 lines vs ~1000 lines verbose.") @Nullable Boolean verbose) {
         try {
             final boolean includeSystem = includeSystemThreads != null && includeSystemThreads;
+            final boolean isVerbose = verbose != null && verbose;
             final VirtualMachine vm = jdiService.getVM();
             final List<ThreadReference> all = vm.allThreads();
             final List<ThreadReference> threads = includeSystem
@@ -382,30 +393,81 @@ public class JDWPTools {
                 threads.size(),
                 hidden > 0 ? String.format(" (%d system thread(s) hidden — pass includeSystemThreads=true to show)", hidden) : ""));
 
-            for (int i = 0; i < threads.size(); i++) {
-                final ThreadReference thread = threads.get(i);
-                result.append(String.format("Thread %d:\n", i));
-                result.append(String.format("  ID: %d\n", thread.uniqueID()));
-                result.append(String.format("  Name: %s\n", thread.name()));
-                result.append(String.format("  Status: %s\n", ThreadFormatting.formatStatus(thread.status())));
-                result.append(String.format("  Suspended: %s\n", thread.isSuspended()));
-
-                if (thread.isSuspended()) {
-                    try {
-                        final int frameCount = thread.frameCount();
-                        result.append(String.format("  Frames: %d\n", frameCount));
-                    } catch (IncompatibleThreadStateException e) {
-                        // Thread resumed in the gap between isSuspended() and frameCount();
-                        // skip the frame count rather than failing the whole listing.
-                    }
-                }
-
-                result.append('\n');
+            if (isVerbose) {
+                renderThreadsVerbose(result, threads);
+            } else {
+                renderThreadsCompact(result, threads);
             }
 
             return result.toString();
         } catch (Exception e) {
             return "Error: " + e.getMessage();
+        }
+    }
+
+    /**
+     * Legacy 5-line-block-per-thread rendering, kept behind the {@code verbose=true} flag. Splits
+     * status / suspended / frames onto separate lines for readability when a few threads are being
+     * inspected closely.
+     */
+    private static void renderThreadsVerbose(StringBuilder out, List<ThreadReference> threads) {
+        for (int i = 0; i < threads.size(); i++) {
+            final ThreadReference thread = threads.get(i);
+            out.append(String.format("Thread %d:\n", i));
+            out.append(String.format("  ID: %d\n", thread.uniqueID()));
+            out.append(String.format("  Name: %s\n", thread.name()));
+            out.append(String.format("  Status: %s\n", ThreadFormatting.formatStatus(thread.status())));
+            out.append(String.format("  Suspended: %s\n", thread.isSuspended()));
+
+            if (thread.isSuspended()) {
+                try {
+                    final int frameCount = thread.frameCount();
+                    out.append(String.format("  Frames: %d\n", frameCount));
+                } catch (IncompatibleThreadStateException e) {
+                    // Thread resumed in the gap between isSuspended() and frameCount();
+                    // skip the frame count rather than failing the whole listing.
+                }
+            }
+
+            out.append('\n');
+        }
+    }
+
+    /**
+     * Compact 1-line-per-thread table (P2-5). Saves ~4 lines per thread vs the legacy block form —
+     * the difference between a screenful and a thousand lines on a Tomcat with hundreds of worker
+     * threads. Column widths are derived from the data; long names truncate with an ellipsis.
+     */
+    private static void renderThreadsCompact(StringBuilder out, List<ThreadReference> threads) {
+        if (threads.isEmpty()) {
+            return;
+        }
+        // Reserve max(name length, 16) for the Name column so common widths stay readable. Cap at
+        // 40 to keep a long Tomcat worker name from blowing out the line — agents that need the
+        // full name can re-fetch with verbose=true.
+        final int nameColWidth = Math.min(40, Math.max(16, threads.stream()
+            .mapToInt(t -> t.name().length()).max().orElse(16)));
+        out.append(String.format("  %-8s  %-" + nameColWidth + "s  %-9s  %-9s  %s%n",
+            "ID", "Name", "Status", "Suspended", "Frames"));
+        for (ThreadReference thread : threads) {
+            String name = thread.name();
+            if (name.length() > nameColWidth) {
+                name = name.substring(0, nameColWidth - 1) + "…";
+            }
+            final boolean suspended = thread.isSuspended();
+            String framesCell = "—";
+            if (suspended) {
+                try {
+                    framesCell = String.valueOf(thread.frameCount());
+                } catch (IncompatibleThreadStateException ignore) {
+                    // Same race as the verbose path — fall back to "—" and continue.
+                }
+            }
+            out.append(String.format("  %-8d  %-" + nameColWidth + "s  %-9s  %-9s  %s%n",
+                thread.uniqueID(), name,
+                ThreadFormatting.formatStatus(thread.status()),
+                suspended ? "yes" : "no",
+                framesCell));
         }
     }
 
@@ -640,8 +702,15 @@ public class JDWPTools {
             }
 
             if (result instanceof StringReference strRef) {
-                return String.format("Object #%d (%s).toString() = \"%s\"",
-                    objectId, obj.referenceType().name(), strRef.value());
+                final String value = strRef.value();
+                // P3-7: flag the default Object.toString() output ("FQN@hexhash") so the agent
+                // knows the value is not meaningful state — they should use jdwp_get_fields
+                // for that class instead of trusting the string.
+                final String suffix = isDefaultObjectToString(value)
+                    ? " (default Object.toString — class did not override; use jdwp_get_fields instead)"
+                    : "";
+                return String.format("Object #%d (%s).toString() = \"%s\"%s",
+                    objectId, obj.referenceType().name(), value, suffix);
             }
             return String.format("Object #%d (%s).toString() = %s",
                 objectId, obj.referenceType().name(), formatValue(result));
@@ -651,6 +720,18 @@ public class JDWPTools {
             return "Error invoking toString(): " + e.getMessage();
         }
     }
+
+    /**
+     * Recognises the {@code Object.toString()} default form {@code "<FQN>@<hex-hash>"} so callers
+     * can flag the output as "class did not override toString()". The check uses a regex anchored
+     * at end of string with {@code @[0-9a-f]+} because user toString implementations almost never
+     * end on a bare identity hash even when they include one. Helps the agent distinguish a
+     * meaningful render from a placeholder.
+     */
+    private static boolean isDefaultObjectToString(String value) {
+        return value != null && value.matches("[\\w.$]+@[0-9a-f]+");
+    }
+
 
     @McpTool(description = "Evaluate a Java expression in the context of a suspended thread's stack frame. Returns '[VM_DEATH] ...' if the target VM disconnects mid-call.")
     public String jdwp_evaluate_expression(
@@ -670,9 +751,11 @@ public class JDWPTools {
             expressionEvaluator.configureCompilerClasspath(thread);
 
             final StackFrame frame = thread.frame(frameIndex != null ? frameIndex : 0);
-            final Value result = expressionEvaluator.evaluate(frame, expression);
+            final Value result = expressionEvaluator.evaluate(frame, expression, markedInstances.buildBindings());
 
-            return String.format("Result: %s", formatValue(result));
+            // P3-5: echo the expression so the agent can attribute results when several evals are
+            // batched in one turn ("Result of foo.bar(): 42" instead of just "Result: 42").
+            return String.format("Result of %s: %s", expression, formatValue(result));
         } catch (VMDisconnectedException vmDead) {
             return vmDisconnectedMessage("jdwp_evaluate_expression");
         } catch (Exception e) {
@@ -708,7 +791,7 @@ public class JDWPTools {
 
             expressionEvaluator.configureCompilerClasspath(thread);
             final StackFrame stackFrame = thread.frame(frame);
-            final Value result = expressionEvaluator.evaluate(stackFrame, expression);
+            final Value result = expressionEvaluator.evaluate(stackFrame, expression, markedInstances.buildBindings());
             final String actual = formatValue(result);
 
             // Strip wrapping quotes from formatted strings so users can pass `expected="hello"` or `expected=hello`.
@@ -799,13 +882,31 @@ public class JDWPTools {
         final int deadlineMs = (timeoutMs != null && timeoutMs > 0) ? timeoutMs : 30_000;
         try {
             final VirtualMachine vm = jdiService.getVM();
-            // Arm BEFORE resume so we don't race with a near-instant event firing.
-            final CountDownLatch latch = breakpointTracker.armNextEventLatch();
-            vm.resume();
 
-            final boolean fired = latch.await(deadlineMs, TimeUnit.MILLISECONDS);
-            if (!fired) {
-                return buildDiagnosticReport(true, deadlineMs);
+            // State-checking short-circuit (P0-2/P0-3). If a BP / step / exception fired since the
+            // last call (e.g. the agent called jdwp_step_over and an intervening tool call meant
+            // we missed the signal-armed latch), don't re-resume — just return the snapshot.
+            // Without this guard, jdwp_resume_until_event would call vm.resume() while the thread
+            // is already suspended at the captured event, overshooting it.
+            final boolean alreadyFired = breakpointTracker.consumePendingFire();
+            final CountDownLatch latch;
+            if (alreadyFired) {
+                // Skip the resume + await — there's nothing to wait for, the snapshot already
+                // exists. We still fall through to the existing snapshot/VM_DEATH handling below
+                // so the caller sees a consistent response shape.
+                latch = null;
+            } else {
+                // Arm BEFORE resume so we don't race with a near-instant event firing.
+                latch = breakpointTracker.armNextEventLatch();
+                vm.resume();
+
+                final boolean fired = latch.await(deadlineMs, TimeUnit.MILLISECONDS);
+                if (!fired) {
+                    return buildDiagnosticReport(true, deadlineMs);
+                }
+                // The waiter consumed the signal; clear the pending flag so the NEXT call doesn't
+                // immediately short-circuit on this same event.
+                breakpointTracker.consumePendingFire();
             }
 
             // Snapshot the last breakpoint BEFORE inspecting the event tail. A breakpoint that
@@ -820,7 +921,8 @@ public class JDWPTools {
 
             if (vmDeathTail && !haveLiveBpSnapshot) {
                 return "[VM_DEATH] Target VM disconnected/died while waiting. No more events will fire on this connection — "
-                    + "run jdwp_diagnose to inspect, or jdwp_connect / jdwp_wait_for_attach to re-attach.";
+                    + "run jdwp_diagnose to inspect, or jdwp_connect / jdwp_wait_for_attach to re-attach."
+                    + renderFailedPendingHint();
             }
 
             if (snapshot == null) {
@@ -828,7 +930,23 @@ public class JDWPTools {
             }
             final ThreadReference thread = snapshot.thread();
             final Integer bpId = snapshot.id();
-            final String base = String.format("Event fired. Thread: %s (ID=%d, suspended=%s, frames=%d, breakpoint=%s)",
+            // P3-1: append source location to the happy path. The previous "Event fired. Thread: …"
+            // line forced the agent to follow up with get_breakpoint_context just to learn which
+            // line they landed on. Capturing it here saves one round-trip per BP hit.
+            String locationSuffix = "";
+            if (thread.isSuspended()) {
+                try {
+                    if (thread.frameCount() > 0) {
+                        final com.sun.jdi.Location loc = thread.frame(0).location();
+                        locationSuffix = String.format(" at %s:%d",
+                            loc.declaringType().name(), loc.lineNumber());
+                    }
+                } catch (Exception ignore) {
+                    // Best-effort enrichment — fall back to the bare line when frame() throws.
+                }
+            }
+            final String base = String.format("Event fired%s. Thread: %s (ID=%d, suspended=%s, frames=%d, breakpoint=%s)",
+                locationSuffix,
                 thread.name(), thread.uniqueID(), thread.isSuspended(),
                 thread.isSuspended() ? thread.frameCount() : -1,
                 bpId);
@@ -839,9 +957,54 @@ public class JDWPTools {
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
             return "Wait interrupted";
+        } catch (VMDisconnectedException vmDead) {
+            return vmGoneEnvelope("jdwp_resume_until_event", vmDead);
+        } catch (IllegalStateException disposed) {
+            // JDIConnectionService.getVM() throws this when the VM has been disposed underneath us.
+            // Treat it identically to a JDI-side disconnect — the user wants to re-attach either way.
+            return vmGoneEnvelope("jdwp_resume_until_event", disposed);
         } catch (Exception e) {
-            return "Error: " + e.getMessage();
+            // Defensive: never let a null-message exception render as "Error: null" — the previous
+            // behaviour confused agents into thinking the call had a literal "null" error. Always
+            // include the exception class name so the cause is identifiable even with no message.
+            final String msg = e.getMessage();
+            return "Error in jdwp_resume_until_event: " + (msg != null ? msg : e.getClass().getSimpleName());
         }
+    }
+
+    /**
+     * Builds a one-line, optional note listing any pending breakpoints whose deferred promotion
+     * has failed. Surfaced inside the {@code [VM_DEATH]} response so an agent debugging "my BP
+     * never fired" sees the {@code [FAILED]} state without having to call {@code jdwp_overview}
+     * separately. Returns empty when no pending BP is in the failed state.
+     */
+    private String renderFailedPendingHint() {
+        final List<String> failed = breakpointTracker.getAllPendingBreakpoints().entrySet().stream()
+            .filter(e -> e.getValue().getFailureReason() != null)
+            .map(e -> String.format("#%d at %s:%d (%s)",
+                e.getKey(),
+                e.getValue().getClassName(),
+                e.getValue().getLineNumber(),
+                e.getValue().getFailureReason()))
+            .toList();
+        if (failed.isEmpty()) {
+            return "";
+        }
+        return "\nNote: deferred breakpoint(s) were promoted but failed to install: "
+            + String.join("; ", failed)
+            + ". Set BPs on real executable lines (comments / blank lines / signatures have no bytecode).";
+    }
+
+    /**
+     * Uniform {@code [VM_GONE]} envelope for the resume-until-event path. Centralised because the
+     * raw exception messages drift wildly across JDI implementations ("Connection refused",
+     * "connection is closed", null, etc.) and the agent needs one stable string to recover on.
+     */
+    private static String vmGoneEnvelope(String tool, Throwable cause) {
+        final String reason = cause.getMessage() != null ? cause.getMessage() : cause.getClass().getSimpleName();
+        return String.format("[VM_GONE] %s: target VM is no longer reachable (%s). "
+            + "Run jdwp_diagnose to inspect, or jdwp_connect / jdwp_wait_for_attach to re-attach.",
+            tool, reason);
     }
 
     @McpTool(description = "Read-only snapshot of the WHOLE world: (1) this MCP server's status, (2) the JDWP connection (or last-attempt error if disconnected), (3) local JVMs visible to the user with their JDWP ports — answering 'did my target JVM come up, and on which port?' without ps/lsof/jps. When connected, the existing breakpoint+events report continues to appear inside block #2. Run this first when something isn't working.")
@@ -943,10 +1106,13 @@ public class JDWPTools {
                 log.debug("VM capability probe failed during diagnose", e);
             }
         }
-        // Always include the breakpoint+events report — even disconnected, pending breakpoints
-        // and stale watchers are useful debugging context. The renderer prefixes its own header
-        // so it slots cleanly under the connection block.
-        out.append('\n').append(buildDiagnosticReport(false, null));
+        // P1-4: include the breakpoint+events report only while CONNECTED. When disconnected,
+        // the block was 12 lines of zeroed counters + an INTERPRETATION line that read as if
+        // nothing was set up — confusing in a session that previously had a full BP rig, since
+        // disconnect wipes the registry. Skipping it removes the contradiction and saves tokens.
+        if (status.connected()) {
+            out.append('\n').append(buildDiagnosticReport(false, null));
+        }
 
         out.append(renderLocalJvmsBlock(status, inspectAll));
         return out.toString();
@@ -965,6 +1131,16 @@ public class JDWPTools {
             descriptors = jvmDiscoveryService.confirmAll(descriptors, connectedHost, connectedPort);
             if (inspectAll) {
                 descriptors = jvmDiscoveryService.inspectAll(descriptors);
+            }
+            // P2-3: once we're attached to a target, drop every other JVM that has no JDWP agent
+            // from the inventory. The user already picked one — neighbour JVMs without JDWP are
+            // not actionable, and a typical machine has many of them (IDE processes, build tools,
+            // Spring devtools, etc.). The block still renders attachable neighbours for the rare
+            // "I want to swap targets" case.
+            if (status != null && status.connected()) {
+                descriptors = descriptors.stream()
+                    .filter(d -> d.jdwp() != null)
+                    .toList();
             }
             final String user = System.getProperty("user.name", "?");
             return DiagnoseReportRenderer.renderJvmListBlock(descriptors, user);
@@ -1477,10 +1653,29 @@ public class JDWPTools {
                 stepRequest.enable();
             }
 
+            // P3-3: capture the starting location BEFORE resume so the response says where we
+            // stepped FROM. Helps the agent verify they're at the expected line without an
+            // extra get_breakpoint_context call.
+            String startLocation = "";
+            try {
+                if (thread.frameCount() > 0) {
+                    final com.sun.jdi.Location loc = thread.frame(0).location();
+                    startLocation = String.format(" from %s:%d",
+                        loc.declaringType().name(), loc.lineNumber());
+                }
+            } catch (Exception ignore) {
+                // Best-effort — fall back to unannotated message.
+            }
+
+            // Arm the next-event latch BEFORE resuming. Without this, the STEP event can fire
+            // before the caller's follow-up jdwp_resume_until_event has armed its own latch, and
+            // the signal is lost — see P0-2/P0-3. The arm-then-resume ordering matches what
+            // jdwp_resume_until_event itself does for the same reason.
+            breakpointTracker.armNextEventLatch();
             thread.resume();
 
-            return String.format("Step %s executed on thread %d (%s). Call jdwp_resume_until_event to wait for the STEP event.",
-                label, thread.uniqueID(), thread.name());
+            return String.format("Step %s executed%s on thread %d (%s). Call jdwp_resume_until_event to wait for the STEP event.",
+                label, startLocation, thread.uniqueID(), thread.name());
         } catch (Exception e) {
             return "Error: " + e.getMessage();
         }
@@ -1916,15 +2111,10 @@ public class JDWPTools {
             final List<EventHistory.DebugEvent> events = eventHistory.getRecent(resolvedCount);
 
             if (events.isEmpty()) {
-                return """
-                    No events recorded yet.
-                    
-                    Events are captured automatically when connected:
-                      - Breakpoint hits
-                      - Step completions
-                      - Exception throws
-                      - Logpoint evaluations
-                      - VM lifecycle events""";
+                // P2-8: the previous 7-line "what counts as an event" reminder repeated on every
+                // empty call. One line is enough — the tool description already tells the agent
+                // what's captured.
+                return "No events recorded yet.";
             }
 
             final StringBuilder result = new StringBuilder();
@@ -2383,6 +2573,14 @@ public class JDWPTools {
         final String header = vmCleared
             ? "Reset complete (VM connection preserved)."
             : "Reset complete (VM unreachable — server-local state cleared).";
+        // P2-14: terse one-line summary when nothing was set up. The full 7-line breakdown is
+        // only useful when there was actually something to clear; for the common
+        // "agent connects, runs jdwp_reset before starting" warm-up, repeating zeros adds noise.
+        final int total = activeBp + pendingBp + activeExBp + pendingExBp
+            + activeFieldBp + pendingFieldBp + watchers + events;
+        if (total == 0) {
+            return header + " Nothing was set.";
+        }
         return String.format("""
                 %s
                   Breakpoints cleared:           %d active + %d pending
@@ -2429,9 +2627,15 @@ public class JDWPTools {
             }
             final boolean effectivePin = pin == null || pin;
             markedInstances.mark(label, ref, effectivePin);
-            return String.format("✓ Marked Object#%d (%s) as $%s%s",
+            // P3-10: tell the agent where the new $label is usable. After P0-6 the binding works
+            // in evaluate_expression / assert_expression too, so list every site the mark can be
+            // referenced from without forcing the agent to discover it by trial-and-error.
+            return String.format("✓ Marked Object#%d (%s) as $%s%s%n"
+                + "Reference as $%s in: jdwp_evaluate_expression, jdwp_assert_expression, "
+                + "conditional BPs, logpoint expressions, watchers, exception logpoint expressions.",
                 objectId, ref.referenceType().name(), label,
-                effectivePin ? " [pinned]" : " [unpinned — may be GC'd]");
+                effectivePin ? " [pinned]" : " [unpinned — may be GC'd]",
+                label);
         } catch (IllegalArgumentException badLabel) {
             return "[ERROR] " + badLabel.getMessage();
         } catch (IllegalStateException badState) {
@@ -2473,13 +2677,18 @@ public class JDWPTools {
         }
     }
 
-    @McpTool(description = "Read-only overview of MCP-side debug state — breakpoints, exception breakpoints, field breakpoints, logpoints, watchers, and marked instances — in one call. Filter by 'types' (comma-separated subset of breakpoint, exception_breakpoint, field_breakpoint, logpoint, watcher, mark — defaults to all) and/or by 'filter' substring (matches class / label / expression / type, case-insensitive).")
+    @McpTool(description = "Read-only overview of MCP-side debug state — breakpoints, exception breakpoints, field breakpoints, logpoints, watchers, and marked instances — in one call. Filter by 'types' (comma-separated subset of breakpoint, exception_breakpoint, field_breakpoint, logpoint, watcher, mark — defaults to all) and/or by 'filter' substring (matches class / label / expression / type, case-insensitive). Empty sections are hidden by default; pass showEmpty=true to render every category header even when zero entries match.")
     public String jdwp_overview(
         @McpToolParam(required = false, description = "Comma-separated subset of: breakpoint, exception_breakpoint, field_breakpoint, logpoint, watcher, mark. Defaults to all.") @Nullable String types,
-        @McpToolParam(required = false, description = "Optional case-insensitive substring filter applied to class / label / expression / type") @Nullable String filter) {
+        @McpToolParam(required = false, description = "Optional case-insensitive substring filter applied to class / label / expression / type") @Nullable String filter,
+        @McpToolParam(required = false, description = "If true, also render category headers for categories with zero entries (e.g. 'Watchers (0):'). Default false — saves ~5 lines per call for sessions that only use BPs.") @Nullable Boolean showEmpty) {
         try {
             final Set<String> wanted = parseOverviewTypes(types);
             final String needle = (filter == null || filter.isBlank()) ? null : filter.toLowerCase(Locale.ROOT);
+            // P2-9: terse default. The previous behaviour always emitted every category header
+            // (Marks (0), Breakpoints (0), Logpoints (0), ...) which was ~5 lines of noise on a
+            // typical session with only line BPs set.
+            final boolean renderEmpty = showEmpty != null && showEmpty;
 
             final StringBuilder out = new StringBuilder();
             out.append("=== Overview ===\n");
@@ -2489,22 +2698,22 @@ public class JDWPTools {
 
             int totalShown = 0;
             if (wanted.contains("mark")) {
-                totalShown += appendMarkOverview(out, needle);
+                totalShown += appendMarkOverview(out, needle, renderEmpty);
             }
             if (wanted.contains("breakpoint")) {
-                totalShown += appendBreakpointOverview(out, needle, false);
+                totalShown += appendBreakpointOverview(out, needle, false, renderEmpty);
             }
             if (wanted.contains("logpoint")) {
-                totalShown += appendBreakpointOverview(out, needle, true);
+                totalShown += appendBreakpointOverview(out, needle, true, renderEmpty);
             }
             if (wanted.contains("exception_breakpoint")) {
-                totalShown += appendExceptionBreakpointOverview(out, needle);
+                totalShown += appendExceptionBreakpointOverview(out, needle, renderEmpty);
             }
             if (wanted.contains("field_breakpoint")) {
-                totalShown += appendFieldBreakpointOverview(out, needle);
+                totalShown += appendFieldBreakpointOverview(out, needle, renderEmpty);
             }
             if (wanted.contains("watcher")) {
-                totalShown += appendWatcherOverview(out, needle);
+                totalShown += appendWatcherOverview(out, needle, renderEmpty);
             }
 
             if (totalShown == 0) {
@@ -2619,13 +2828,16 @@ public class JDWPTools {
      * Renders the marked-instance section. Returns the number of rows emitted; emits the header
      * even when no rows match so the agent can confirm the type was actually inspected.
      */
-    private int appendMarkOverview(StringBuilder out, @Nullable String needle) {
+    private int appendMarkOverview(StringBuilder out, @Nullable String needle, boolean showEmpty) {
         final List<MarkInfo> all = markedInstances.list().stream()
             .sorted(Comparator.comparing(MarkInfo::label))
             .toList();
         final List<MarkInfo> shown = all.stream()
             .filter(m -> matchesFilter(needle, m.label(), m.typeName()))
             .toList();
+        if (shown.isEmpty() && !showEmpty) {
+            return 0;
+        }
         appendSectionHeader(out, "Marks", shown.size(), all.size());
         if (shown.isEmpty()) {
             return 0;
@@ -2665,7 +2877,7 @@ public class JDWPTools {
      * logpoint expression are included; otherwise plain breakpoints (no logpoint expression) are
      * shown. Pending entries always render with their stored class name.
      */
-    private int appendBreakpointOverview(StringBuilder out, @Nullable String needle, boolean logpoints) {
+    private int appendBreakpointOverview(StringBuilder out, @Nullable String needle, boolean logpoints, boolean showEmpty) {
         final Map<Integer, BreakpointRequest> active = breakpointTracker.getAllBreakpoints();
         final Map<Integer, BreakpointTracker.PendingBreakpoint> pending = breakpointTracker.getAllPendingBreakpoints();
         final List<String> rows = new ArrayList<>();
@@ -2699,6 +2911,9 @@ public class JDWPTools {
                 }
             }
         }
+        if (rows.isEmpty() && !showEmpty) {
+            return 0;
+        }
         out.append(logpoints
             ? String.format("\nLogpoints (%d):\n", rows.size())
             : String.format("\nBreakpoints (%d):\n", rows.size()));
@@ -2710,7 +2925,7 @@ public class JDWPTools {
      * Renders the exception-breakpoint section. Pending entries (class not yet loaded) are tagged
      * `[PENDING]` so the agent can tell them apart from active ones at a glance.
      */
-    private int appendExceptionBreakpointOverview(StringBuilder out, @Nullable String needle) {
+    private int appendExceptionBreakpointOverview(StringBuilder out, @Nullable String needle, boolean showEmpty) {
         final Map<Integer, BreakpointTracker.ExceptionBreakpointInfo> active =
             breakpointTracker.getAllExceptionBreakpoints();
         final Map<Integer, BreakpointTracker.PendingExceptionBreakpoint> pending =
@@ -2739,6 +2954,9 @@ public class JDWPTools {
                     id, pb.getExceptionClass(), chainSuffix(id, null)));
             }
         }
+        if (rows.isEmpty() && !showEmpty) {
+            return 0;
+        }
         out.append(String.format("\nException breakpoints (%d):\n", rows.size()));
         rows.forEach(r -> out.append(r).append('\n'));
         return rows.size();
@@ -2748,7 +2966,7 @@ public class JDWPTools {
      * Renders the field-breakpoint section. Pending entries (class not yet loaded) are tagged
      * `[PENDING]` so the agent can tell them apart from active ones at a glance.
      */
-    private int appendFieldBreakpointOverview(StringBuilder out, @Nullable String needle) {
+    private int appendFieldBreakpointOverview(StringBuilder out, @Nullable String needle, boolean showEmpty) {
         final Map<Integer, BreakpointTracker.FieldBreakpointInfo> active =
             breakpointTracker.getAllFieldBreakpoints();
         final Map<Integer, BreakpointTracker.PendingFieldBreakpoint> pending =
@@ -2771,12 +2989,22 @@ public class JDWPTools {
         }
         for (Map.Entry<Integer, BreakpointTracker.PendingFieldBreakpoint> e : pending.entrySet()) {
             final int id = e.getKey();
-            final BreakpointTracker.FieldBreakpointSpec spec = e.getValue().getSpec();
+            final BreakpointTracker.PendingFieldBreakpoint pf = e.getValue();
+            final BreakpointTracker.FieldBreakpointSpec spec = pf.getSpec();
             final String label = spec.className() + '.' + spec.fieldName();
             if (matchesFilter(needle, label, spec.expression())) {
-                rows.add(String.format("  #%d  %s  mode=%s  [PENDING]%s",
-                    id, label, spec.mode(), chainSuffix(id, null)));
+                // P1-2: surface the FAILED reason when promotion couldn't bind the field
+                // (typo / non-static + objectId filter / ambiguous declaring type). The
+                // promotion path in BreakpointTracker.promoteSinglePendingField already records
+                // the reason — the previous renderer just hardcoded "[PENDING]" and hid it.
+                final String state = pf.getFailureReason() != null
+                    ? "FAILED: " + pf.getFailureReason() : "PENDING";
+                rows.add(String.format("  #%d  %s  mode=%s  [%s]%s",
+                    id, label, spec.mode(), state, chainSuffix(id, null)));
             }
+        }
+        if (rows.isEmpty() && !showEmpty) {
+            return 0;
         }
         out.append(String.format("\nField breakpoints (%d):\n", rows.size()));
         rows.forEach(r -> out.append(r).append('\n'));
@@ -2788,12 +3016,15 @@ public class JDWPTools {
      * the same BP cluster together — the agent typically wants to see "what fires at BP #7" rather
      * than an alphabetical label list.
      */
-    private int appendWatcherOverview(StringBuilder out, @Nullable String needle) {
+    private int appendWatcherOverview(StringBuilder out, @Nullable String needle, boolean showEmpty) {
         final List<Watcher> all = watcherManager.getAllWatchers();
         final List<Watcher> shown = all.stream()
             .filter(w -> matchesFilter(needle, w.getLabel(), w.getExpression()))
             .sorted(Comparator.comparingInt(Watcher::getBreakpointId))
             .toList();
+        if (shown.isEmpty() && !showEmpty) {
+            return 0;
+        }
         appendSectionHeader(out, "Watchers", shown.size(), all.size());
         for (Watcher w : shown) {
             out.append(String.format("  [%s] %s  on BP #%d  \"%s\"\n",
@@ -3113,10 +3344,19 @@ public class JDWPTools {
             }
             final ThreadReference thread = snapshot.thread();
             final Integer bpId = snapshot.id();
-            return String.format("Current thread: %s (ID=%d, suspended=%s, frames=%d, breakpoint=%s)",
-                thread.name(), thread.uniqueID(), thread.isSuspended(),
-                thread.isSuspended() ? thread.frameCount() : -1,
-                bpId);
+            // P1-7: render the synthetic exception sentinel (id = -1, planted by handleExceptionEvent)
+            // as a human-readable event tag instead of "breakpoint=-1". Same surface for the agent;
+            // none of the downstream tools key on the sentinel value.
+            final String bpDisplay = bpId != null && bpId == -1 ? "event=EXCEPTION" : "breakpoint=" + bpId;
+            // P1-8: when the thread is RUNNING but a snapshot exists, the captured BP id is stale —
+            // it points at the LAST place the thread suspended, which the thread has since moved
+            // past. Annotate so the agent doesn't mistake "snapshot exists" for "thread is parked".
+            final boolean suspended = thread.isSuspended();
+            final String staleNote = suspended ? "" : " (stale — thread has resumed since the snapshot)";
+            return String.format("Current thread: %s (ID=%d, suspended=%s, frames=%s, %s)%s",
+                thread.name(), thread.uniqueID(), suspended,
+                suspended ? String.valueOf(thread.frameCount()) : "N/A",
+                bpDisplay, staleNote);
         } catch (Exception e) {
             return "Error: " + e.getMessage();
         }
@@ -3134,22 +3374,22 @@ public class JDWPTools {
             if (label.trim().isEmpty()) {
                 return "Error: No label provided";
             }
+            // P1-1: refuse watchers targeting a BP id that doesn't exist. The previous "silently
+            // accept any id" behaviour produced inert watchers and a misleading success message.
+            if (!breakpointTracker.isKnownBreakpointId(breakpointId)) {
+                return String.format(
+                    "[ERROR] No breakpoint with ID %d — use jdwp_overview() to list active and pending BPs.",
+                    breakpointId);
+            }
 
             // Create the watcher
             final String watcherId = watcherManager.createWatcher(label, breakpointId, expression.trim());
 
-            return String.format("""
-                    ✓ Watcher attached successfully
-                    
-                      Watcher ID: %s
-                      Label: %s
-                      Breakpoint: %d
-                      Expression: %s
-                    
-                    The watcher will evaluate this expression when breakpoint %d is hit.
-                    Use jdwp_detach_watcher(watcherId) to remove it.""",
-                watcherId, label, breakpointId, expression.trim(), breakpointId
-            );
+            // P2-10: terse one-line success. The previous 7-line block repeated the same metadata
+            // four times. The agent already knows the BP and label they passed in; what they need
+            // back is the short watcher id for follow-up detach calls.
+            return String.format("✓ Watcher [%s] \"%s\" attached to BP #%d (expr: %s)",
+                watcherId.substring(0, 8), label, breakpointId, expression.trim());
 
         } catch (Exception e) {
             log.error("[Watcher] Error attaching watcher", e);
@@ -3263,9 +3503,10 @@ public class JDWPTools {
 
             if (watchersEvaluated == 0) {
                 result.append("No watchers found or evaluated for the given scope.\n");
-            } else {
-                result.append(String.format("Total: Evaluated %d expression(s)\n", watchersEvaluated));
             }
+            // Per-call tally (split into succeeded/errored on partial failure) is appended inside
+            // the evaluator helpers via appendWatcherTally — the outer "Evaluated N expression(s)"
+            // line was double-counting when both halves emitted their own totals.
 
             return result.toString();
 
@@ -3291,9 +3532,14 @@ public class JDWPTools {
             return 0;
         }
 
-        final StackFrame frame = thread.frame(0);
-        final Location location = frame.location();
-        int watchersEvaluated = 0;
+        // Capture an initial frame just to read the location for the header — we MUST NOT reuse
+        // this reference inside the per-watcher loop. JDI invalidates every StackFrame on the
+        // thread the moment invokeMethod returns, so a reused frame would throw
+        // InvalidStackFrameException("Thread has been resumed") on every watcher after the first.
+        // See P0-5 in plans/audit-2026-05-17/VERDICTS.md.
+        final Location location = thread.frame(0).location();
+        int succeeded = 0;
+        int errored = 0;
 
         if (breakpointId == null) {
             result.append("No breakpoint ID available — cannot resolve watchers for current frame.\n");
@@ -3312,14 +3558,18 @@ public class JDWPTools {
         for (Watcher watcher : watchers) {
             result.append(String.format("  • [%s] %s\n", watcher.getId().substring(0, 8), watcher.getLabel()));
             try {
-                final Value value = expressionEvaluator.evaluate(frame, watcher.getExpression(), markBindings);
+                // Re-fetch the frame on every iteration — see comment at top of method.
+                final StackFrame freshFrame = thread.frame(0);
+                final Value value = expressionEvaluator.evaluate(freshFrame, watcher.getExpression(), markBindings);
                 result.append(String.format("    %s = %s\n\n", watcher.getExpression(), formatValue(value)));
-                watchersEvaluated++;
+                succeeded++;
             } catch (Exception e) {
                 result.append(String.format("    %s = [ERROR: %s]\n\n", watcher.getExpression(), e.getMessage()));
+                errored++;
             }
         }
-        return watchersEvaluated;
+        appendWatcherTally(result, succeeded, errored);
+        return succeeded + errored;
     }
 
     /**
@@ -3337,13 +3587,19 @@ public class JDWPTools {
             return 0;
         }
 
-        int watchersEvaluated = 0;
-        final List<StackFrame> frames = thread.frames();
+        int succeeded = 0;
+        int errored = 0;
+        // Snapshot the frame count + matching frame metadata up front so we can re-fetch each
+        // frame fresh from the thread inside the loop. Capturing StackFrame references in advance
+        // and re-using them after an invokeMethod would throw InvalidStackFrameException
+        // ("Thread has been resumed") — same root cause as the current-frame variant above.
+        final int frameCount = thread.frameCount();
         final Map<String, Value> markBindings = markedInstances.buildBindings();
 
-        for (int frameIndex = 0; frameIndex < frames.size(); frameIndex++) {
-            final StackFrame frame = frames.get(frameIndex);
-            final Location location = frame.location();
+        for (int frameIndex = 0; frameIndex < frameCount; frameIndex++) {
+            // Probe the location once per outer iteration; SAFE because no invokeMethod has run
+            // since the previous probe in this iteration.
+            final Location location = thread.frame(frameIndex).location();
             final String locationKey = location.declaringType().name() + ':' + location.lineNumber();
 
             final Integer breakpointId = locationToBreakpointId.get(locationKey);
@@ -3362,14 +3618,36 @@ public class JDWPTools {
             for (Watcher watcher : watchers) {
                 result.append(String.format("  • [%s] %s\n", watcher.getId().substring(0, 8), watcher.getLabel()));
                 try {
-                    final Value value = expressionEvaluator.evaluate(frame, watcher.getExpression(), markBindings);
+                    // Fresh frame per watcher — see comment above.
+                    final StackFrame freshFrame = thread.frame(frameIndex);
+                    final Value value = expressionEvaluator.evaluate(freshFrame, watcher.getExpression(), markBindings);
                     result.append(String.format("    %s = %s\n\n", watcher.getExpression(), formatValue(value)));
-                    watchersEvaluated++;
+                    succeeded++;
                 } catch (Exception e) {
                     result.append(String.format("    %s = [ERROR: %s]\n\n", watcher.getExpression(), e.getMessage()));
+                    errored++;
                 }
             }
         }
-        return watchersEvaluated;
+        appendWatcherTally(result, succeeded, errored);
+        return succeeded + errored;
+    }
+
+    /**
+     * Renders the per-call tally line for both watcher-evaluation paths. Differentiates succeeded
+     * from errored so the caller can see partial failures at a glance instead of trusting a single
+     * "Evaluated N" number that conflates both. Skipped when no watchers ran at all — the
+     * "No watchers found" branch at the caller covers that case.
+     */
+    private static void appendWatcherTally(StringBuilder result, int succeeded, int errored) {
+        if (succeeded == 0 && errored == 0) {
+            return;
+        }
+        if (errored == 0) {
+            result.append(String.format("Total: Evaluated %d expression(s)\n", succeeded));
+        } else {
+            result.append(String.format("Total: Evaluated %d (%d succeeded, %d errored)\n",
+                succeeded + errored, succeeded, errored));
+        }
     }
 }

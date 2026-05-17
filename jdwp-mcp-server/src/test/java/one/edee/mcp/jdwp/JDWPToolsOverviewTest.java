@@ -101,7 +101,9 @@ class JDWPToolsOverviewTest {
 			registerLineBreakpoint("com.example.Service", 12);
 			watchers.createWatcher("user", 1, "user.getEmail()");
 
-			final String out = tools.jdwp_overview(null, null);
+			// showEmpty=true opts back into the legacy "render every section header" behaviour
+			// — P2-9 made empty sections hidden by default.
+			final String out = tools.jdwp_overview(null, null, true);
 
 			assertThat(out)
 				.startsWith("=== Overview ===")
@@ -114,9 +116,9 @@ class JDWPToolsOverviewTest {
 		}
 
 		@Test
-		@DisplayName("blank types → same as null, every section emitted")
+		@DisplayName("blank types → same as null, every section emitted (with showEmpty)")
 		void shouldTreatBlankTypesAsAll() {
-			final String out = tools.jdwp_overview("   ", null);
+			final String out = tools.jdwp_overview("   ", null, true);
 
 			assertThat(out)
 				.contains("Marks (0):")
@@ -127,7 +129,7 @@ class JDWPToolsOverviewTest {
 		@Test
 		@DisplayName("with no entries registered → '(no entries matched)' footer")
 		void shouldReportEmptyOverviewWhenNothingRegistered() {
-			final String out = tools.jdwp_overview(null, null);
+			final String out = tools.jdwp_overview(null, null, null);
 
 			assertThat(out).contains("(no entries matched)");
 		}
@@ -144,7 +146,7 @@ class JDWPToolsOverviewTest {
 			registerLineBreakpoint("com.example.Service", 12);
 			watchers.createWatcher("user", 1, "user.getEmail()");
 
-			final String out = tools.jdwp_overview("mark", null);
+			final String out = tools.jdwp_overview("mark", null, null);
 
 			assertThat(out)
 				.contains("Marks (1)")
@@ -160,7 +162,7 @@ class JDWPToolsOverviewTest {
 			watchers.createWatcher("user", 1, "user.getEmail()");
 			registerLineBreakpoint("com.example.Service", 12);
 
-			final String out = tools.jdwp_overview("mark,watcher", null);
+			final String out = tools.jdwp_overview("mark,watcher", null, null);
 
 			assertThat(out)
 				.contains("Marks (1)")
@@ -172,9 +174,9 @@ class JDWPToolsOverviewTest {
 		}
 
 		@Test
-		@DisplayName("types=\"all\" → wildcard, every section rendered")
+		@DisplayName("types=\"all\" with showEmpty=true → wildcard, every section rendered")
 		void shouldHonorAllWildcard() {
-			final String out = tools.jdwp_overview("all", null);
+			final String out = tools.jdwp_overview("all", null, true);
 
 			assertThat(out)
 				.contains("Marks (0):")
@@ -184,9 +186,24 @@ class JDWPToolsOverviewTest {
 		}
 
 		@Test
+		@DisplayName("default (showEmpty=null) hides empty section headers (P2-9)")
+		void shouldHideEmptySectionsByDefault() {
+			final String out = tools.jdwp_overview("all", null, null);
+
+			// No section is registered → every section header should be hidden, leaving only the
+			// banner and the "no entries matched" footer.
+			assertThat(out)
+				.startsWith("=== Overview ===")
+				.doesNotContain("Marks (")
+				.doesNotContain("Breakpoints (")
+				.doesNotContain("Watchers (")
+				.contains("(no entries matched)");
+		}
+
+		@Test
 		@DisplayName("unknown type token → [ERROR] surfacing the supported list")
 		void shouldRejectUnknownTypeToken() {
-			final String out = tools.jdwp_overview("bogus", null);
+			final String out = tools.jdwp_overview("bogus", null, null);
 
 			assertThat(out)
 				.startsWith("[ERROR]")
@@ -200,7 +217,7 @@ class JDWPToolsOverviewTest {
 			// The 'all' wildcard must not short-circuit token validation: every token in the
 			// comma-separated list has to be a known type, otherwise the agent could pass
 			// "bogus,all" and silently get the full overview while their typo goes unnoticed.
-			final String out = tools.jdwp_overview("bogus,all", null);
+			final String out = tools.jdwp_overview("bogus,all", null, null);
 
 			assertThat(out)
 				.startsWith("[ERROR]")
@@ -214,7 +231,7 @@ class JDWPToolsOverviewTest {
 			// Mirror of the previous test for the reverse ordering: "all,bogus" must produce the
 			// same error as "bogus,all". The validator must inspect every token before honouring
 			// the wildcard.
-			final String out = tools.jdwp_overview("all,bogus", null);
+			final String out = tools.jdwp_overview("all,bogus", null, null);
 
 			assertThat(out)
 				.startsWith("[ERROR]")
@@ -230,7 +247,7 @@ class JDWPToolsOverviewTest {
 		@Test
 		@DisplayName("filter echoed in header line")
 		void shouldEchoFilterInHeader() {
-			final String out = tools.jdwp_overview(null, "Cart");
+			final String out = tools.jdwp_overview(null, "Cart", null);
 
 			assertThat(out).contains("(filter: 'Cart')");
 		}
@@ -241,7 +258,7 @@ class JDWPToolsOverviewTest {
 			registry.mark("shoppingCart", ref(1L, "com.example.X"), false);
 			registry.mark("user", ref(2L, "com.example.Y"), false);
 
-			final String out = tools.jdwp_overview("mark", "CART");
+			final String out = tools.jdwp_overview("mark", "CART", null);
 
 			assertThat(out)
 				.contains("$shoppingCart")
@@ -254,7 +271,7 @@ class JDWPToolsOverviewTest {
 			registry.mark("first", ref(1L, "com.example.Order"), false);
 			registry.mark("second", ref(2L, "com.example.User"), false);
 
-			final String out = tools.jdwp_overview("mark", "order");
+			final String out = tools.jdwp_overview("mark", "order", null);
 
 			assertThat(out)
 				.contains("$first")
@@ -268,7 +285,7 @@ class JDWPToolsOverviewTest {
 			registry.mark("banana", ref(2L, "com.example.X"), false);
 			registry.mark("apricot", ref(3L, "com.example.X"), false);
 
-			final String out = tools.jdwp_overview("mark", "ap");
+			final String out = tools.jdwp_overview("mark", "ap", null);
 
 			// Two of three labels start with 'ap' (apple, apricot) — banana is filtered out.
 			assertThat(out)
@@ -283,7 +300,7 @@ class JDWPToolsOverviewTest {
 		void shouldReportNoMatchesWhenFilterExcludesAll() {
 			registry.mark("alpha", ref(1L, "com.example.X"), false);
 
-			final String out = tools.jdwp_overview("mark", "zzz-nope");
+			final String out = tools.jdwp_overview("mark", "zzz-nope", null);
 
 			assertThat(out).contains("(no entries matched)");
 		}
@@ -298,7 +315,7 @@ class JDWPToolsOverviewTest {
 		void shouldRenderPinnedAdornment() {
 			registry.mark("cart", ref(1L, "com.example.Cart"), true);
 
-			final String out = tools.jdwp_overview("mark", null);
+			final String out = tools.jdwp_overview("mark", null, null);
 
 			assertThat(out).contains("$cart -> Object#1 (com.example.Cart) [pinned]");
 		}
@@ -308,7 +325,7 @@ class JDWPToolsOverviewTest {
 		void shouldRenderUnpinnedAdornment() {
 			registry.mark("cart", ref(1L, "com.example.Cart"), false);
 
-			final String out = tools.jdwp_overview("mark", null);
+			final String out = tools.jdwp_overview("mark", null, null);
 
 			assertThat(out).contains("$cart -> Object#1 (com.example.Cart) [unpinned]");
 		}
@@ -321,7 +338,7 @@ class JDWPToolsOverviewTest {
 			// Simulate the underlying object dying after mark time.
 			when(r.isCollected()).thenReturn(true);
 
-			final String out = tools.jdwp_overview("mark", null);
+			final String out = tools.jdwp_overview("mark", null, null);
 
 			assertThat(out).contains("$dead -> Object#7 (com.example.D) [unpinned, collected]");
 		}
@@ -333,7 +350,7 @@ class JDWPToolsOverviewTest {
 			registry.mark("alpha", ref(2L, "T"), false);
 			registry.mark("mike", ref(3L, "T"), false);
 
-			final String out = tools.jdwp_overview("mark", null);
+			final String out = tools.jdwp_overview("mark", null, null);
 
 			final int alpha = out.indexOf("$alpha");
 			final int mike = out.indexOf("$mike");
@@ -348,7 +365,7 @@ class JDWPToolsOverviewTest {
 			final int id = registerLineBreakpoint("com.example.Service", 42);
 			tracker.setCondition(id, "x > 0");
 
-			final String out = tools.jdwp_overview("breakpoint", null);
+			final String out = tools.jdwp_overview("breakpoint", null, null);
 
 			assertThat(out)
 				.contains("#" + id)
@@ -363,7 +380,7 @@ class JDWPToolsOverviewTest {
 			final int logId = registerLineBreakpoint("com.example.B", 2);
 			tracker.setLogpointExpression(logId, "user.getEmail()");
 
-			final String overview = tools.jdwp_overview(null, null);
+			final String overview = tools.jdwp_overview(null, null, null);
 
 			assertThat(overview)
 				.contains("Breakpoints (1):")
@@ -378,7 +395,7 @@ class JDWPToolsOverviewTest {
 		void shouldRenderWatcherRow() {
 			final String watcherId = watchers.createWatcher("user.email", 11, "user.getEmail()");
 
-			final String out = tools.jdwp_overview("watcher", null);
+			final String out = tools.jdwp_overview("watcher", null, null);
 
 			assertThat(out)
 				.contains("[" + watcherId.substring(0, 8) + "]")
@@ -396,7 +413,7 @@ class JDWPToolsOverviewTest {
 					"java.lang.IllegalStateException", true, true, "$exception.getMessage()");
 			final int id = tracker.registerExceptionBreakpoint(req, spec);
 
-			final String out = tools.jdwp_overview("exception_breakpoint", null);
+			final String out = tools.jdwp_overview("exception_breakpoint", null, null);
 
 			assertThat(out)
 				.contains("#" + id)
@@ -420,7 +437,7 @@ class JDWPToolsOverviewTest {
 			// stays the single source of truth that the listener consults at fire time.
 			tracker.setCondition(id, "$newValue > 100");
 
-			final String out = tools.jdwp_overview("field_breakpoint", null);
+			final String out = tools.jdwp_overview("field_breakpoint", null, null);
 
 			assertThat(out)
 				.contains("#" + id)

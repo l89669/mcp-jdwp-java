@@ -384,9 +384,16 @@ class JdiEventListenerFieldWatchpointTest {
 		assertThat(dependentId).isPositive();
 	}
 
+	/**
+	 * Regression test for P0-4: prior to the fix, null JDI values caused the corresponding bindings
+	 * to be omitted from the wrapper's parameter list, so an expression like {@code "$oldValue +
+	 * \" -> \" + $newValue"} failed at COMPILE time with "$oldValue cannot be resolved" on the
+	 * first write to an uninitialised reference field. The contract now is "always bind, even null
+	 * — the evaluator infers Object type and string-concat renders the literal 'null'".
+	 */
 	@Test
-	@DisplayName("Null JDI values → $oldValue / $newValue / $object keys absent from condition bindings")
-	void shouldOmitNullBindingsFromFieldEventBindings() throws Exception {
+	@DisplayName("Null JDI values → $oldValue / $newValue / $object keys still PRESENT (null-valued) in bindings")
+	void shouldStillBindNullValuedFieldEventBindings() throws Exception {
 		ModificationWatchpointRequest req = mock(ModificationWatchpointRequest.class);
 		int bpId = tracker.registerFieldBreakpoint(
 			BreakpointTracker.FieldBreakpointSpec.suspending(
@@ -408,17 +415,17 @@ class JdiEventListenerFieldWatchpointTest {
 		when(evaluator.evaluate(any(StackFrame.class), anyString(), bindingsCaptor.capture()))
 			.thenReturn(trueResult);
 
-		// Null valueCurrent, null valueToBe, null object — these correspond to a static reference
-		// field being written from null to null. All three should be omitted from the bindings map.
+		// Null valueCurrent, null valueToBe, null object — a static reference field written from
+		// null to null. After P0-4, all three keys are present, mapped to null.
 		ModificationWatchpointEvent event = mockModificationEvent(thread, req, "com.Foo", "session",
 			null, null);
 		runListenerWith(listener, mockEventSet(event));
 
 		java.util.Map<String, Value> captured = bindingsCaptor.getValue();
-		assertThat(captured).containsKeys("$fieldName", "$mode");
-		assertThat(captured).doesNotContainKey("$oldValue");
-		assertThat(captured).doesNotContainKey("$newValue");
-		assertThat(captured).doesNotContainKey("$object");
+		assertThat(captured).containsKeys("$fieldName", "$mode", "$oldValue", "$newValue", "$object");
+		assertThat(captured.get("$oldValue")).as("$oldValue must be present with null value").isNull();
+		assertThat(captured.get("$newValue")).as("$newValue must be present with null value").isNull();
+		assertThat(captured.get("$object")).as("$object must be present with null value").isNull();
 	}
 
 	// ── Helpers ──────────────────────────────────────────────────────────────

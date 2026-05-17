@@ -158,6 +158,76 @@ class BreakpointTrackerLatchTest {
 		assertThat(firedFlag[0]).isTrue();
 	}
 
+	// ── pendingFire flag (P0-2/P0-3) ─────────────────────────────────────────
+
+	@Test
+	@DisplayName("consumePendingFire returns false when no event has fired")
+	void shouldReturnFalseFromConsumeWhenNoEventFired() {
+		BreakpointTracker tracker = new BreakpointTracker();
+		assertThat(tracker.consumePendingFire()).isFalse();
+	}
+
+	@Test
+	@DisplayName("fireNextEvent sets pendingFire; first consume returns true; second returns false")
+	void shouldLatchPendingFireOnceUntilConsumed() {
+		BreakpointTracker tracker = new BreakpointTracker();
+		tracker.fireNextEvent();
+
+		assertThat(tracker.consumePendingFire()).isTrue();
+		assertThat(tracker.consumePendingFire())
+			.as("consume must be one-shot — a second call returns false until the next fire")
+			.isFalse();
+	}
+
+	@Test
+	@DisplayName("multiple fires before consume coalesce into a single 'true' signal")
+	void shouldCoalesceMultipleFiresIntoOneConsume() {
+		BreakpointTracker tracker = new BreakpointTracker();
+		tracker.fireNextEvent();
+		tracker.fireNextEvent();
+		tracker.fireNextEvent();
+
+		// The flag is not a counter — a STEP followed by a BREAKPOINT on the same line should
+		// still consume as a single "something happened" signal. The caller distinguishes the
+		// specific event via getLastBreakpoint() / EventHistory.
+		assertThat(tracker.consumePendingFire()).isTrue();
+		assertThat(tracker.consumePendingFire()).isFalse();
+	}
+
+	@Test
+	@DisplayName("pendingFire is cleared by reset() so a stale signal does not carry across sessions")
+	void shouldClearPendingFireOnReset() {
+		BreakpointTracker tracker = new BreakpointTracker();
+		tracker.fireNextEvent();
+
+		tracker.reset();
+
+		assertThat(tracker.consumePendingFire())
+			.as("reset() wipes session state — any unconsumed pendingFire must also be discarded")
+			.isFalse();
+	}
+
+	@Test
+	@DisplayName("pendingFire is cleared by clearAll(erm) for the same reason as reset()")
+	void shouldClearPendingFireOnClearAll() {
+		BreakpointTracker tracker = new BreakpointTracker();
+		tracker.fireNextEvent();
+
+		tracker.clearAll(null);
+
+		assertThat(tracker.consumePendingFire()).isFalse();
+	}
+
+	@Test
+	@DisplayName("fireNextEvent without an armed latch still latches pendingFire (the step-race fix)")
+	void shouldSetPendingFireEvenWithoutArmedLatch() {
+		BreakpointTracker tracker = new BreakpointTracker();
+		// No armNextEventLatch() — simulates the STEP signal arriving before
+		// jdwp_resume_until_event has armed its own latch.
+		tracker.fireNextEvent();
+		assertThat(tracker.consumePendingFire()).isTrue();
+	}
+
 	@Test
 	@DisplayName("a worker thread awaiting the latch wakes up when fireNextEvent is called from another thread")
 	void shouldWakeWaitingThreadAcrossThreads() throws InterruptedException {

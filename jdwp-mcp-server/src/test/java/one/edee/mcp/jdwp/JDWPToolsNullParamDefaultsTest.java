@@ -195,7 +195,7 @@ class JDWPToolsNullParamDefaultsTest {
 			when(system.status()).thenReturn(ThreadReference.THREAD_STATUS_RUNNING);
 			when(system.isSuspended()).thenReturn(false);
 
-			final String result = tools.jdwp_get_threads(null);
+			final String result = tools.jdwp_get_threads(null, null);
 
 			assertThat(result).contains("main");
 			assertThat(result).contains("system thread(s) hidden");

@@ -211,9 +211,10 @@ class JDWPToolsFieldBreakpointTest {
 	}
 
 	@Test
-	@DisplayName("jdwp_overview(types=\"field_breakpoint\") emits an empty section when nothing is set")
+	@DisplayName("jdwp_overview(types=\"field_breakpoint\", showEmpty=true) emits an empty section when nothing is set")
 	void shouldEmitEmptyFieldBreakpointSection() {
-		final String result = tools.jdwp_overview("field_breakpoint", null);
+		// P2-9 hides empty sections by default — explicit opt-in renders the legacy header.
+		final String result = tools.jdwp_overview("field_breakpoint", null, true);
 		assertThat(result).contains("Field breakpoints (0):");
 	}
 
@@ -234,7 +235,7 @@ class JDWPToolsFieldBreakpointTest {
 				"com.Bar", "session", BreakpointTracker.FieldWatchMode.MODIFICATION,
 				"$newValue", null, null, null));
 
-		final String result = tools.jdwp_overview("field_breakpoint", null);
+		final String result = tools.jdwp_overview("field_breakpoint", null, null);
 
 		assertThat(result)
 			.contains("Field breakpoints (2):")

@@ -138,6 +138,18 @@ public class BreakpointTracker {
     private volatile CountDownLatch nextEventLatch;
 
     /**
+     * "An event fired and no waiter has consumed the signal yet" flag. Set by {@link #fireNextEvent()}
+     * regardless of latch state, cleared by {@link #consumePendingFire()}. Required so that a tool
+     * sequence like {@code step_X → otherTool() → resume_until_event} doesn't lose the STEP signal:
+     * the STEP fires while no latch is armed (or while a stale latch is in the slot), the flag
+     * latches the fact that something happened, and {@link JDWPTools#jdwp_resume_until_event}
+     * can return immediately based on {@link #lastBreakpoint} instead of issuing a second
+     * {@code vm.resume()} that would overshoot the suspended state. See P0-2/P0-3 in
+     * plans/audit-2026-05-17/VERDICTS.md.
+     */
+    private volatile boolean pendingFire = false;
+
+    /**
      * Dependent → trigger relationship for chained breakpoints. A dependent BP is registered with
      * {@code setEnabled(false)} and stays disarmed until its trigger fires. With {@code oneShot=false}
      * (the default, "sticky" mode) the dependent stays armed forever after the first trigger fire;
@@ -339,6 +351,9 @@ public class BreakpointTracker {
         dependentsByTrigger.clear();
         triggersFiredAtLeastOnce.clear();
         lastBreakpoint = null;
+        // Drop any unconsumed "pending fire" signal — a state wipe invalidates the snapshot it
+        // was about to be processed against.
+        pendingFire = false;
         idCounter.set(1);
     }
 
@@ -1283,6 +1298,7 @@ public class BreakpointTracker {
         return null;
     }
 
+
     /**
      * Kind-agnostic enable/disable of every JDI request that backs the logical breakpoint
      * identified by {@code id}. Chain machinery treats a synthetic ID as "the BP" rather than
@@ -1486,11 +1502,34 @@ public class BreakpointTracker {
      * hanging.
      */
     public synchronized void fireNextEvent() {
+        // Signal "something happened" independently of whether a latch is currently armed. A
+        // waiter that arrives AFTER this method runs will still see the flag via
+        // consumePendingFire() and short-circuit without re-resuming the VM.
+        pendingFire = true;
         final CountDownLatch latch = this.nextEventLatch;
         if (latch != null) {
             latch.countDown();
             this.nextEventLatch = null;
         }
+    }
+
+    /**
+     * Atomically reads and clears the "pending fire" flag. Returns {@code true} when an event
+     * (BP / step / exception / VM_DEATH) has fired since the last call to this method and no
+     * other waiter consumed it. The waiter is responsible for processing
+     * {@link #getLastBreakpoint()} or the latest {@link EventHistory} entry based on the
+     * returned value.
+     * <p>
+     * Used by {@link JDWPTools#jdwp_resume_until_event(Integer)} to avoid the
+     * "step fired → no waiter armed → resume_until_event overshoots" race documented in
+     * P0-2/P0-3.
+     */
+    public synchronized boolean consumePendingFire() {
+        if (pendingFire) {
+            pendingFire = false;
+            return true;
+        }
+        return false;
     }
 
     /**
