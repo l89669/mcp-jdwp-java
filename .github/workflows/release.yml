@@ -1,0 +1,143 @@
+name: Release
+
+# Creates a GitHub Release when a v* tag is pushed. Release body is generated
+# from commits in the previous v* tag's range by .github/scripts/release-notes.sh
+# (Conventional-Commit buckets with emoji headers, mirroring the Release
+# Generator template). The MCP server JAR and the standalone sandbox zip are
+# attached as release assets.
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+# Default permissions are read-only; this job needs write for gh release create.
+permissions:
+  contents: read
+
+# Serialize tag-push runs so two near-simultaneous tags can't race on
+# gh release upload. cancel-in-progress=false because release jobs should
+# always complete (we don't want a half-uploaded release).
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # job-level scope for gh release create + upload assets
+    steps:
+      # Action pinned to SHA — protects against the major-version tag (v4)
+      # being moved to a malicious commit. Comment shows the tag at pin time
+      # so Dependabot updates are reviewable.
+      - name: Check out repository (full history for tag diffing)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+        with:
+          fetch-depth: 0
+          # We use gh with GH_TOKEN; nothing here uses raw authenticated git,
+          # so don't leave GITHUB_TOKEN sitting in .git/config after checkout.
+          persist-credentials: false
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9  # v4.8.0
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Resolve current and previous tag
+        id: tags
+        env:
+          # GITHUB_REF_NAME comes from the runner; safe but mirror through
+          # env: for consistency with the defense-in-depth pattern.
+          CUR: ${{ github.ref_name }}
+        run: |
+          # Previous v* tag in semver order, excluding the current one.
+          prev=$(git tag --list 'v*' --sort=-v:refname | grep -vxF "$CUR" | head -n1 || true)
+          {
+            echo "cur=$CUR"
+            echo "prev=$prev"
+            echo "version=${CUR#v}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Current:  $CUR"
+          echo "Previous: ${prev:-<none>}"
+
+      - name: Build MCP server JAR
+        run: ./mvnw -pl jdwp-mcp-server -am clean package -DskipTests
+
+      - name: Stage JAR with versioned filename
+        id: jar
+        env:
+          VERSION: ${{ steps.tags.outputs.version }}
+        run: |
+          src="jdwp-mcp-server/target/mcp-jdwp-java.jar"
+          dst_versioned="dist/mcp-jdwp-java-${VERSION}.jar"
+          dst_alias="dist/mcp-jdwp-java.jar"
+          mkdir -p dist
+          if [[ ! -f "$src" ]]; then
+            echo "error: $src was not produced by the build" >&2
+            exit 1
+          fi
+          cp "$src" "$dst_versioned"
+          cp "$src" "$dst_alias"
+          {
+            echo "versioned=$dst_versioned"
+            echo "alias=$dst_alias"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Assemble standalone sandbox zip
+        id: sandbox
+        env:
+          VERSION: ${{ steps.tags.outputs.version }}
+        run: |
+          chmod +x release/sandbox/assemble.sh
+          release/sandbox/assemble.sh "$VERSION"
+          # Unversioned alias so /releases/latest/download/jdwp-sandbox.zip
+          # works across releases.
+          cp "release/sandbox/dist/jdwp-sandbox-${VERSION}.zip" \
+             "release/sandbox/dist/jdwp-sandbox.zip"
+          {
+            echo "versioned=release/sandbox/dist/jdwp-sandbox-${VERSION}.zip"
+            echo "alias=release/sandbox/dist/jdwp-sandbox.zip"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Generate release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CUR: ${{ steps.tags.outputs.cur }}
+          PREV: ${{ steps.tags.outputs.prev }}
+        run: |
+          chmod +x .github/scripts/release-notes.sh
+          .github/scripts/release-notes.sh "$CUR" "$PREV" > release-body.md
+          echo "── release-body.md ──"
+          cat release-body.md
+          echo "── end ──"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CUR: ${{ steps.tags.outputs.cur }}
+          JAR_VERSIONED: ${{ steps.jar.outputs.versioned }}
+          JAR_ALIAS: ${{ steps.jar.outputs.alias }}
+          ZIP_VERSIONED: ${{ steps.sandbox.outputs.versioned }}
+          ZIP_ALIAS: ${{ steps.sandbox.outputs.alias }}
+        run: |
+          # Idempotent: edit if a release for this tag already exists
+          # (e.g. retroactively-created), otherwise create.
+          if gh release view "$CUR" >/dev/null 2>&1; then
+            echo "Release $CUR exists — updating notes and re-uploading assets."
+            gh release edit "$CUR" \
+              --notes-file release-body.md \
+              --title "$CUR"
+            gh release upload "$CUR" \
+              "$JAR_VERSIONED" "$JAR_ALIAS" \
+              "$ZIP_VERSIONED" "$ZIP_ALIAS" \
+              --clobber
+          else
+            gh release create "$CUR" \
+              --title "$CUR" \
+              --notes-file release-body.md \
+              "$JAR_VERSIONED" "$JAR_ALIAS" \
+              "$ZIP_VERSIONED" "$ZIP_ALIAS"
+          fi
