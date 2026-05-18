@@ -414,7 +414,7 @@ jdwp_evaluate_expression(
 
 Compiles arbitrary Java expressions to bytecode using Eclipse JDT, injects them into the target JVM via `ClassLoader.defineClass()`, and executes them in the context of the suspended frame. Full classpath is discovered automatically (including container classloaders like Tomcat). Results are cached for performance. Handles Guice/CGLIB proxies automatically.
 
-See [docs/EXPRESSION_EVALUATION.md](docs/EXPRESSION_EVALUATION.md) for the compilation pipeline details.
+See [docs/expression-evaluation.md](docs/expression-evaluation.md) for the compilation pipeline details, or [docs/index.md](docs/index.md) for the full developer reference.
 
 ### Assertions
 
@@ -771,6 +771,22 @@ mcp-jdwp-java/
 - **JDI** (`jdk.jdi` module) — Java Debug Interface
 - **Eclipse JDT Compiler (ECJ)** — In-memory expression compilation
 - **JSpecify + NullAway** — Compile-time nullness enforcement
+
+## Technical documentation
+
+For Java developers who want to understand the internals — safety guarantees, memory allocation, threading, bootstrapping, state clearing, the test architecture — the [`docs/`](docs/) folder is the developer reference.
+
+Start at **[docs/index.md](docs/index.md)** for navigation and a reading guide. The chapters cover:
+
+- [architecture.md](docs/architecture.md) — system overview, components, data flow
+- [lifecycle.md](docs/lifecycle.md) — bootstrapping, connect, disconnect, reset, the clearing matrix
+- [threading-and-safety.md](docs/threading-and-safety.md) — concurrency, MCP SYNC, `INVOKE_SINGLE_THREADED`, the `EvaluationGuard` reentrancy mechanism
+- [memory-and-references.md](docs/memory-and-references.md) — JDI mirrors, the object cache, marks, the compilation cache, byte-array mirroring
+- [event-pipeline.md](docs/event-pipeline.md) — the JDI event listener loop and the suspension decision matrix
+- [breakpoints.md](docs/breakpoints.md) — the registry, synthetic IDs, deferred breakpoints, conditions, logpoints, chains
+- [expression-evaluation.md](docs/expression-evaluation.md) — the compile-and-inject pipeline (ECJ, `defineClass`, `invokeMethod`)
+- [diagnostics.md](docs/diagnostics.md) — `jdwp_diagnose`, JVM discovery, the handshake probe, transport-loss envelopes, logging
+- [testing.md](docs/testing.md) — test architecture for contributors
 
 ## Troubleshooting
 
