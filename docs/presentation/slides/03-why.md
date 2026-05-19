@@ -7,7 +7,7 @@
 
 ### <span class="accent">Goal #1</span> · failing tests
 
-<pre><code>mvn test -Dmaven.surefire.debug</code></pre>
+<pre><code class="nohighlight">mvn test -Dmaven.surefire.debug</code></pre>
 
 - JVM halts on port 5005
 - Agent attaches **before** any user code runs
@@ -20,7 +20,7 @@
 
 ### <span class="accent">Goal #2</span> · running apps
 
-<pre><code>-agentlib:jdwp=…,suspend=n,address=*:5005</code></pre>
+<pre><code class="nohighlight">-agentlib:jdwp=…,suspend=n,address=*:5005</code></pre>
 
 - Attach **while it's running**
 - **Logpoints** + field watchpoints trace without stopping traffic
