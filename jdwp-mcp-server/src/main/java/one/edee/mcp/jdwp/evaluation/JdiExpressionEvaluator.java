@@ -528,6 +528,7 @@ public class JdiExpressionEvaluator {
         // thread dies mid-evaluation, re-querying uniqueID() on the dead ThreadReference would
         // throw ObjectCollectedException and leak a dangling entry in the guard's depth map.
         final long guardedThreadId = frame.thread().uniqueID();
+        final long startTime = System.currentTimeMillis();
         evaluationGuard.enter(guardedThreadId);
         try {
             // NOTE: Classpath configuration must be done BEFORE calling evaluate() to avoid nested JDI calls
@@ -610,7 +611,7 @@ public class JdiExpressionEvaluator {
             final ClassLoaderReference classLoader = findClassLoader(frame);
 
             // 4. Execute the code remotely
-            return RemoteCodeExecutor.execute(
+            final Value value = RemoteCodeExecutor.execute(
                 frame.virtualMachine(),
                 frame.thread(),
                 classLoader,
@@ -619,7 +620,12 @@ public class JdiExpressionEvaluator {
                 EVALUATION_METHOD_NAME,
                 context.getValues()
             );
+            log.info("[Evaluator] Expression evaluated in {}ms (cache {})",
+                System.currentTimeMillis() - startTime, cached != null ? "hit" : "miss");
+            return value;
         } catch (Exception e) {
+            log.warn("[Evaluator] Expression evaluation failed after {}ms: {}",
+                System.currentTimeMillis() - startTime, e.getMessage());
             // Un-wrap runtime exception from cache computation
             if (e instanceof RuntimeException && e.getCause() instanceof JdiEvaluationException jdiEx) {
                 throw jdiEx;

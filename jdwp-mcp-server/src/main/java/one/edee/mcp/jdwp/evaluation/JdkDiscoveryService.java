@@ -25,9 +25,12 @@ import java.util.stream.Stream;
  * <p>
  * Search strategy (in order):
  * 1. The target JVM's own `java.home` if accessible from the MCP server's filesystem.
- * 2. Common per-OS install paths (Adoptium, Oracle, OpenJDK, Zulu on Windows; `/usr/lib/jvm`,
- * `/opt` on Linux/Unix).
- * 3. Directory scan of those parent paths for any subdirectory matching a `<name>-<version>`
+ * 2. The `JAVA_HOME` environment variable, but only when its `<jdkHome>/release` file confirms
+ * a matching major version (a mismatched JAVA_HOME would later trigger cryptic JDT class-file
+ * errors).
+ * 3. Common per-OS install paths (Adoptium, Oracle, OpenJDK, Zulu on Windows; `/usr/lib/jvm`,
+ * `/opt`, SDKMAN under `~/.sdkman/candidates/java` on Linux/macOS).
+ * 4. Directory scan of those parent paths for any subdirectory matching a `<name>-<version>`
  * pattern containing the major version.
  */
 public class JdkDiscoveryService {
@@ -64,7 +67,7 @@ public class JdkDiscoveryService {
     }
 
     /**
-     * Three-strategy fallback search documented on the class. Returns the first valid JDK home
+     * Four-strategy fallback search documented on the class. Returns the first valid JDK home
      * found, or `null` if every strategy fails (the caller throws {@link JdkNotFoundException}).
      */
     @Nullable
@@ -75,7 +78,20 @@ public class JdkDiscoveryService {
             return targetHome;
         }
 
-        // Strategy 2: Search common JDK installation directories
+        // Strategy 2: JAVA_HOME env var, only if its major version matches the target.
+        // A mismatched JAVA_HOME would silently produce class-file-version errors from JDT later.
+        final String javaHomeEnv = System.getenv("JAVA_HOME");
+        if (javaHomeEnv != null && !javaHomeEnv.isEmpty() && isValidJdkHome(javaHomeEnv)) {
+            final int javaHomeMajor = readMajorVersionFromRelease(javaHomeEnv);
+            if (javaHomeMajor == majorVersion) {
+                log.debug("[JDK Discovery] JAVA_HOME matches Java {}: {}", majorVersion, javaHomeEnv);
+                return javaHomeEnv;
+            }
+            log.debug("[JDK Discovery] JAVA_HOME points at Java {} but target is Java {} — skipping",
+                javaHomeMajor, majorVersion);
+        }
+
+        // Strategy 3: Search common JDK installation directories
         final List<String> searchPaths = getCommonJdkPaths(majorVersion);
 
         for (String path : searchPaths) {
@@ -85,14 +101,40 @@ public class JdkDiscoveryService {
             }
         }
 
-        // Strategy 3: Search for any JDK with matching major version
+        // Strategy 4: Search for any JDK with matching major version
         return searchDirectoriesForJdk(majorVersion);
     }
 
     /**
+     * Reads {@code JAVA_VERSION="…"} from the `<jdkHome>/release` file (Java 9+ ships it
+     * unconditionally) and returns the parsed major version. Returns 0 if the file is missing
+     * or malformed — callers should treat that as "version unknown, don't use".
+     */
+    private static int readMajorVersionFromRelease(String jdkHome) {
+        final Path release = Paths.get(jdkHome, "release");
+        if (!Files.isRegularFile(release)) {
+            return 0;
+        }
+        try (Stream<String> lines = Files.lines(release)) {
+            return lines
+                .filter(l -> l.startsWith("JAVA_VERSION="))
+                .findFirst()
+                .map(l -> l.substring("JAVA_VERSION=".length()).replace("\"", "").trim())
+                .map(JdkDiscoveryService::extractMajorVersion)
+                .orElse(0);
+        } catch (Exception e) {
+            log.debug("[JDK Discovery] Failed to read {}: {}", release, e.getMessage());
+            return 0;
+        }
+    }
+
+    /**
      * Returns OS-sensitive list of common JDK install paths. On Windows checks Adoptium, Oracle
-     * Java, OpenJDK, and Zulu directories under `Program Files`; on Linux/Unix checks
-     * `/usr/lib/jvm` and `/opt`.
+     * Java, OpenJDK, and Zulu directories under `Program Files`; on Linux/macOS checks
+     * `/usr/lib/jvm`, `/opt`, and SDKMAN (`~/.sdkman/candidates/java/<version>-<vendor>`).
+     * <p>
+     * SDKMAN entries are enumerated dynamically (the patch and vendor suffix make a static path
+     * impractical) and ordered with the newest patch first by numeric semver comparison.
      */
     private static List<String> getCommonJdkPaths(int majorVersion) {
         final List<String> paths = new ArrayList<>();
@@ -104,14 +146,56 @@ public class JdkDiscoveryService {
             paths.add(String.format("C:\\Program Files\\OpenJDK\\jdk-%d", majorVersion));
             paths.add(String.format("C:\\Program Files\\Zulu\\zulu-%d", majorVersion));
         } else {
-            // Linux/Unix paths
+            // Linux/macOS paths
             paths.add(String.format("/usr/lib/jvm/java-%d-openjdk", majorVersion));
             paths.add(String.format("/usr/lib/jvm/java-%d-openjdk-amd64", majorVersion));
             paths.add(String.format("/usr/lib/jvm/jdk-%d", majorVersion));
             paths.add(String.format("/opt/jdk-%d", majorVersion));
+
+            // SDKMAN: ~/.sdkman/candidates/java/<major>.<minor>.<patch>-<vendor>
+            final File sdkmanDir = new File(System.getProperty("user.home"), ".sdkman/candidates/java");
+            if (sdkmanDir.isDirectory()) {
+                final File[] candidates = sdkmanDir.listFiles();
+                if (candidates != null) {
+                    final String prefix = majorVersion + ".";
+                    Arrays.stream(candidates)
+                        .filter(File::isDirectory)
+                        .filter(c -> c.getName().startsWith(prefix))
+                        .sorted(Comparator.comparing(File::getName, JdkDiscoveryService::compareSdkmanVersion).reversed())
+                        .forEach(c -> paths.add(c.getAbsolutePath()));
+                }
+            }
         }
 
         return paths;
+    }
+
+    /**
+     * Numeric comparator for SDKMAN folder names like `17.0.18-tem` vs `17.0.5-tem`. Splits the
+     * part before the first dash by `.`, compares dot-separated segments as integers, and falls
+     * back to natural string ordering for any non-numeric segment. This avoids the lexicographic
+     * trap where "17.0.5" sorts higher than "17.0.18".
+     */
+    private static int compareSdkmanVersion(String a, String b) {
+        final String[] aParts = a.split("-", 2)[0].split("\\.");
+        final String[] bParts = b.split("-", 2)[0].split("\\.");
+        final int len = Math.max(aParts.length, bParts.length);
+        for (int i = 0; i < len; i++) {
+            final String ap = i < aParts.length ? aParts[i] : "0";
+            final String bp = i < bParts.length ? bParts[i] : "0";
+            try {
+                final int cmp = Integer.compare(Integer.parseInt(ap), Integer.parseInt(bp));
+                if (cmp != 0) {
+                    return cmp;
+                }
+            } catch (NumberFormatException e) {
+                final int cmp = ap.compareTo(bp);
+                if (cmp != 0) {
+                    return cmp;
+                }
+            }
+        }
+        return a.compareTo(b);
     }
 
     /**
@@ -236,22 +320,27 @@ public class JdkDiscoveryService {
             // 4. Not found - throw explicit error
             final String errorMessage = String.format("""
                     No local JDK installation found for Java %d.
-                    
+
                     The target JVM is running Java %s, but the MCP server cannot find a matching JDK.
-                    
+
                     To fix this:
-                      1. Install a Java %d JDK on the MCP server
-                      2. Common locations checked:
+                      1. Install a Java %d JDK on the MCP server, or
+                      2. Point JAVA_HOME at an existing Java %d installation before launching the MCP server.
+                      3. Locations searched automatically:
+                         - $JAVA_HOME (when JAVA_VERSION in <jdkHome>/release matches)
                          - C:\\Program Files\\Eclipse Adoptium\\jdk-%d.*
                          - C:\\Program Files\\Java\\jdk-%d.*
                          - C:\\Program Files\\OpenJDK\\jdk-%d.*
                          - /usr/lib/jvm/java-%d-openjdk*
                          - /usr/lib/jvm/jdk-%d*
-                    
+                         - /opt/jdk-%d*
+                         - ~/.sdkman/candidates/java/%d.*
+
                     Expression evaluation requires access to JDK system classes.""",
-                targetMajorVersion, targetVersion, targetMajorVersion,
+                targetMajorVersion, targetVersion, targetMajorVersion, targetMajorVersion,
                 targetMajorVersion, targetMajorVersion, targetMajorVersion,
-                targetMajorVersion, targetMajorVersion
+                targetMajorVersion, targetMajorVersion, targetMajorVersion,
+                targetMajorVersion
             );
 
             throw new JdkNotFoundException(errorMessage);

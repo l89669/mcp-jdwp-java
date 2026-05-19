@@ -912,6 +912,7 @@ public class JDIConnectionService {
             return null;
         }
 
+        final long startTime = System.currentTimeMillis();
         try {
             // Route through synchronized getVM() to avoid a race with disconnect().
             final VirtualMachine currentVm = getVM();
@@ -928,7 +929,7 @@ public class JDIConnectionService {
             final Set<String> classpathEntries = result.applicationClasspath();
 
             if (classpathEntries.isEmpty()) {
-                log.warn("[JDI] No classpath entries discovered");
+                log.warn("[JDI] No classpath entries discovered after {}ms", System.currentTimeMillis() - startTime);
                 return null;
             }
 
@@ -940,15 +941,16 @@ public class JDIConnectionService {
 
             cachedClasspath = String.join(separator, classpathEntries);
 
-            log.info("[JDI] Full classpath discovered ({} entries)", classpathEntries.size());
+            log.info("[JDI] Full classpath discovered ({} entries) in {}ms",
+                classpathEntries.size(), System.currentTimeMillis() - startTime);
 
             return cachedClasspath;
 
         } catch (JdkNotFoundException e) {
-            log.error("[JDI] {}", e.getMessage());
+            log.error("[JDI] {} (after {}ms)", e.getMessage(), System.currentTimeMillis() - startTime);
             return null;
         } catch (Exception e) {
-            log.error("[JDI] Failed to discover classpath", e);
+            log.error("[JDI] Failed to discover classpath after {}ms", System.currentTimeMillis() - startTime, e);
             return null;
         }
     }

@@ -5,6 +5,43 @@ All notable changes to the `jdwp-debugging` plugin are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.1.2] — 2026-05-19
+
+### Fixed — JDK discovery on SDKMAN / honors JAVA_HOME
+
+Expression evaluation silently failed on machines where the local JDK was
+installed via SDKMAN (typical macOS / Linux developer setup): the discovery
+service only probed `/usr/lib/jvm`, `/opt/jdk-*`, and a few Windows paths,
+so `~/.sdkman/candidates/java/17.0.18-tem/` never matched. The MCP server
+logged `[ERROR] JDK path not discovered, cannot configure compiler` and
+every `evaluate_expression` then returned `Compiler is not configured`.
+
+- **SDKMAN paths now enumerated dynamically** —
+  `~/.sdkman/candidates/java/<major>.*` entries are listed at discovery
+  time and ordered with the newest patch first by numeric semver compare
+  (so `17.0.18-tem` outranks `17.0.5-tem`, which a naive lexicographic
+  sort would invert).
+- **`JAVA_HOME` now used as a fast shortcut** — when set, the env var is
+  honored ahead of the directory scan, but only after reading
+  `<jdkHome>/release` and confirming the `JAVA_VERSION` major matches the
+  target VM. A mismatched JAVA_HOME is skipped with a debug log instead of
+  feeding the JDT compiler a wrong-version `--system` and producing
+  cryptic class-file-version errors downstream.
+- **Error message updated** to list `$JAVA_HOME`, `/opt/jdk-*`, and the
+  SDKMAN path alongside the Windows / `/usr/lib/jvm` locations.
+
+### Added — forensic elapsed-time logging on the hot path
+
+So the next incident leaves enough breadcrumbs to localize the cost:
+
+- `JDIConnectionService.discoverClasspath` logs `… in {}ms` on every
+  exit branch (success, empty result, `JdkNotFoundException`, generic
+  failure).
+- `JdiExpressionEvaluator.evaluate` logs
+  `Expression evaluated in {}ms (cache hit/miss)` on success and
+  `Expression evaluation failed after {}ms: …` on exception. The
+  cache-hit/miss tag separates compile-bound runs from invoke-bound ones.
+
 ## [2.1.1] — 2026-05-18
 
 ### Fixed — log file no longer dirties the user's working directory
