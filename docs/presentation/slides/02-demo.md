@@ -26,7 +26,16 @@ JVM halts on **:5005** until the agent attaches.
 
 **3 · Hand Claude Code the gauntlet**
 
-> *"Play cat-and-mouse with the jdwp-sandbox: 6 deliberately broken Java classes, each failing its own test. For every flight (#1 → #6) attach via JDWP, hunt down the root cause **without peeking at the source** until you've cracked it, then disconnect cleanly. Finish with a **scorecard** — one line per flight: bug name · root cause · the JDWP tool that nailed it."*
+<pre><code class="nohighlight">Play cat-and-mouse with the jdwp-sandbox.
+
+For each flight (#1 → #6):
+  attach via JDWP, find the root cause
+  WITHOUT peeking at source, disconnect.
+
+End with a scorecard — one line per flight:
+  bug name · root cause · JDWP tool used.</code></pre>
+
+Copy-paste verbatim. No source-peeking is enforced by `CLAUDE.md` in the sandbox.
 
 </div>
 </div>
@@ -46,16 +55,14 @@ Note:
 
 ### The 6 flights
 
-| # | Flight                       | Test class                  | Star tool                 |
-|---|------------------------------|-----------------------------|---------------------------|
-| 1 | The Vanishing Pennies        | `OrderProcessorTest`        | step + eval               |
-| 2 | The Phantom Session          | `SessionStoreTest`          | hashCode assertion        |
-| 3 | The Swallowed Exception      | `EventBusTest`              | exception breakpoint      |
-| 4 | The Time Traveler's Config   | `ConfigurationProviderTest` | per-thread inspection     |
-| 5 | The Audit That Lies          | `TransferServiceTest`       | stepwise balance eval     |
-| 6 | The Field That Lies          | `UserProfileTest`           | field watchpoint          |
-
-<small class="muted">Each test class is named after the Java class containing the bug — standard JUnit convention.</small>
+| # | Flight                       | Root cause to find                          | Star tool             |
+|---|------------------------------|---------------------------------------------|-----------------------|
+| 1 | The Vanishing Pennies        | logger truncates total via `(int)` cast     | step + eval           |
+| 2 | The Phantom Session          | HashMap key mutated after insert            | hashCode assertion    |
+| 3 | The Swallowed Exception      | wrapper exception hides root cause          | exception breakpoint  |
+| 4 | The Time Traveler's Config   | partial init published before `init()`      | per-thread inspection |
+| 5 | The Audit That Lies          | non-atomic transfer, mid-state snapshot     | stepwise balance eval |
+| 6 | The Field That Lies          | reflective `Field.set` bypasses setter      | field watchpoint      |
 
 Note:
 - Backup story if the live hunt stalls: evita-db `OffsetIndexTest.generationalProofTest` off-by-one in `countDifference()` — found in minutes

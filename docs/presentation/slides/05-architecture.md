@@ -2,11 +2,11 @@
 
 ## Architecture
 
-![Architecture: Claude Code ↔ MCP Server ↔ Target JVM](images/architecture.png) <!-- .element: class="diagram" -->
+![Architecture: Claude Code ↔ MCP Server ↔ Target JVM](images/architecture.png) <!-- .element: class="diagram diagram-compact" -->
 
-- **Spring AI MCP 2.0** scans `@McpTool` → JSON schema → wires the transport
-- Server is the **only** piece we ship — JDI lives in the JDK (`jdk.jdi` module)
-- Long-lived session: VM ref, object cache, BP registry, chain deps, event queue persist across tool calls
+- **Spring AI MCP**: `@McpTool` → JSON schema → STDIO
+- Only the server ships; JDI lives in `jdk.jdi`
+- Session keeps VM, cache, BPs, chains, events alive
 
 Note:
 - Why this layer: Claude can't speak JDWP (binary, stateful); server keeps VM ref, object cache, BPs, chains, events alive across tool calls
