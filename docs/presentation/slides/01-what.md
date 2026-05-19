@@ -2,21 +2,17 @@
 
 An **MCP server** that gives Claude Code a debugger.
 
-- Attaches to any JVM with **JDWP** open (the protocol your IDE already uses)
-- Exposes ~40 tools: breakpoints, stack, locals, fields, expression eval, watchers, logpoints…
-- Read **and** write: mutate locals, set fields, call methods at the breakpoint
-- Pure STDIO — no extra daemon, no extra port
+- Speaks **JDWP** — the protocol your IDE already uses
+- Attaches to *any* JVM with port 5005 (or wherever) open
+- **46 tools** + 2 MCP resources: breakpoints, stack, locals, fields, expression eval, watchers, logpoints, **field watchpoints**, **chained breakpoints**, marks…
+- Read **and** write: mutate locals, set fields at the breakpoint
+- Pure STDIO → no daemon, no extra port, no GUI
 
 Note:
-JDWP = Java Debug Wire Protocol. Same wire IntelliJ / Eclipse / VS Code speak when you click "Attach". We just speak it for the agent instead.
+JDWP = Java Debug Wire Protocol. Same wire IntelliJ / Eclipse / VS Code speak when you click "Attach". We translate it for the agent. JDI (the high-level Java API) is what we actually use server-side; JDWP is what travels over the socket.
 
----
+Why "agent-driven" matters: the agent sees what the *debugger* sees, not what the log printed. Stack traces lie; runtime state doesn't.
 
-## Live demo
+Two MCP resources beyond the tools: `jdwp://diagnose` (state-of-the-world snapshot) and `jdwp://jvms` (local-JVM inventory) — attaching either via `@` in the prompt pulls the rendered text in without burning a model turn on a tool call.
 
-I'm kicking off a test-flight **right now**, in the background.
-
-We'll come back to it once it has output.
-
-Note:
-Speaker — before this slide opens a separate terminal: trigger the test-flight session. While it runs, walk through the rest of the deck. Return at the end for actual interactive output. The next slide shows a complete session from a previous flight in case the live one is slow.
+Key constraint: this is a Claude Code plugin. Users `git clone` it. That's why the presentation lives on a separate orphan `gh-pages` branch — to keep their clones slim.

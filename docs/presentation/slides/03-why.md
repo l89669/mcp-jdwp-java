@@ -1,35 +1,33 @@
 ## Why bother?
 
-Two goals, in priority order.
+<div class="cols">
+<div>
 
----
+### <span class="accent">Goal #1</span> · failing tests
 
-## Goal #1 — failing tests
+- `mvn test -Dmaven.surefire.debug`<br/>→ JVM halts on port 5005
+- Agent attaches **before** any user code runs
+- Sets breakpoint at the failing assertion
+- Reads locals, evaluates Java, walks object graphs
+- **Sees runtime state, not stack traces.**
 
-When a test fails, **don't** read the stack trace and guess.
+</div>
+<div>
 
-- Re-run the test with `-Dmaven.surefire.debug` (Maven sets `suspend=y` by default)
-- Agent attaches at port 5005 **before** any user code runs
-- Sets a breakpoint at the failing assertion
-- Inspects locals, evaluates expressions, walks object graphs
+### <span class="accent">Goal #2</span> · running apps
 
-The agent now sees what the **debugger** sees — not what the log printed.
+- `-agentlib:jdwp=…,suspend=n,address=*:5005`
+- Attach **while it's running**
+- **Logpoints** + field watchpoints trace without stopping traffic
+- **Conditional breakpoints** fire only on the bad request
+- No restart, no extra logging, no print-statement-and-redeploy loop.
 
-Note:
-This is the killer use case. Today most agents pattern-match on the stack trace and hallucinate the cause. With JDWP they observe runtime state. The Maven-suspend integration matters because by the time a slow agent process attaches, ordinary test runs are already over — `suspend=y` holds the JVM until we say go.
-
----
-
-## Goal #2 — running applications
-
-Production-like Spring Boot app misbehaving locally?
-
-- Start it with `-agentlib:jdwp=...,suspend=n,address=*:5005`
-- Agent attaches **while it's running**
-- Logpoints + field watchpoints trace state without stopping traffic
-- Conditional breakpoints fire only on the bad request
-
-No restart, no extra logging, no print-statement-and-redeploy loop.
+</div>
+</div>
 
 Note:
-Secondary goal but a huge time-saver for "why is this only broken in staging" investigations. Mention that field watchpoints are new — they let you trace *who* mutates a field without instrumenting code.
+**Primary goal — failing tests** is the killer use case. Today most agents pattern-match on stack traces and hallucinate the cause. With JDWP they observe runtime state directly. The Maven-suspend integration matters because a slow agent process loses the attach race — by the time it connects, ordinary test runs are already over. `suspend=y` (which `-Dmaven.surefire.debug` sets by default) holds the JVM until we say go.
+
+**Secondary goal — running apps** is the time-saver for "why is this only broken in staging" investigations. Logpoints replace println-and-redeploy. Field watchpoints (new) let you trace *who* mutates a field without instrumenting code. Conditional breakpoints mean the agent isn't flooded with thousands of irrelevant hits in a hot loop.
+
+Why this is hard without us: raw JDWP/JDI gives you threads, stack frames, and variables — fine for a human staring at IntelliJ. An agent needs conditions, deferred breakpoints, expression evaluation, value mutation, recursive-evaluation guards — none of which JDI gives you out of the box.

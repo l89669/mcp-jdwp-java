@@ -1,9 +1,92 @@
-.reveal pre code {
-	max-height: 600px;
-	font-size: 0.55em;
-	line-height: 1.3;
+/* ---- base sizing ---- */
+.reveal {
+	font-size: 30px;
 }
 
-.reveal .slide-number {
-	font-size: 16px;
+.reveal h1 { font-size: 2.0em; line-height: 1.1; margin-bottom: 0.4em; }
+.reveal h2 { font-size: 1.55em; line-height: 1.1; margin-bottom: 0.45em; text-transform: none; }
+.reveal h3 { font-size: 1.2em;  line-height: 1.15; margin-bottom: 0.4em;  text-transform: none; }
+.reveal h4 { font-size: 1.0em;  line-height: 1.15; margin-bottom: 0.3em;  text-transform: none; }
+
+.reveal p { margin: 0.35em 0; line-height: 1.35; }
+.reveal ul, .reveal ol { margin: 0.3em 0 0.3em 1.2em; }
+.reveal li { margin: 0.15em 0; line-height: 1.35; }
+.reveal li > ul, .reveal li > ol { margin-top: 0.1em; margin-bottom: 0.1em; }
+
+.reveal small { font-size: 0.55em; opacity: 0.75; }
+.reveal .slide-number { font-size: 14px; }
+
+/* ---- tables ---- */
+.reveal table {
+	font-size: 0.65em;
+	margin: 0.3em auto;
+	border-collapse: collapse;
 }
+.reveal table th,
+.reveal table td {
+	padding: 0.25em 0.7em;
+	border-bottom: 1px solid rgba(255, 255, 255, 0.15);
+	vertical-align: top;
+}
+.reveal table th {
+	border-bottom-color: rgba(255, 255, 255, 0.4);
+	text-align: left;
+}
+
+/* ---- code blocks ---- */
+.reveal pre {
+	width: 92%;
+	margin: 0.4em auto;
+	box-shadow: 0 2px 14px rgba(0, 0, 0, 0.5);
+}
+.reveal pre code {
+	max-height: 480px;
+	font-size: 0.55em;
+	line-height: 1.35;
+	padding: 0.7em 1em;
+	border-radius: 4px;
+}
+.reveal code {
+	font-size: 0.95em;
+}
+
+/* ---- accent helpers (use via inline class in markdown) ---- */
+.reveal .tag {
+	display: inline-block;
+	padding: 0.05em 0.5em;
+	border-radius: 0.6em;
+	background: rgba(66, 175, 250, 0.18);
+	color: #7ec6ff;
+	font-size: 0.8em;
+	margin-right: 0.25em;
+}
+.reveal .muted { opacity: 0.7; }
+.reveal .accent { color: #7ec6ff; }
+.reveal .warn   { color: #ffb86c; }
+.reveal .ok     { color: #6ee7a7; }
+
+/* ---- two-column layout (use: <div class="cols">...</div>) ---- */
+.reveal .cols {
+	display: flex;
+	gap: 1.2em;
+	align-items: flex-start;
+	text-align: left;
+	font-size: 0.82em;
+	max-width: 100%;
+}
+.reveal .cols > div { flex: 1; min-width: 0; }
+.reveal .cols code {
+	word-break: break-all;
+	white-space: normal;
+}
+
+/* ---- title slide flourish ---- */
+.reveal .title-slide h2 { color: #7ec6ff; }
+
+/* ---- dense-table: for overview slides with many rows ---- */
+.reveal .dense-table h2 { font-size: 1.1em; margin-bottom: 0.2em; }
+.reveal .dense-table > p { font-size: 0.75em; margin: 0.2em 0; }
+.reveal .dense-table table { font-size: 0.48em; margin: 0.2em auto; }
+.reveal .dense-table table th,
+.reveal .dense-table table td { padding: 0.12em 0.6em; }
+.reveal .dense-table small { font-size: 0.5em; }

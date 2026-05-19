@@ -1,44 +1,23 @@
-## How is this different from the IntelliJ MCP?
+## Why not just use the IntelliJ MCP?
 
-JetBrains ships their own MCP server. We don't replace it — we cover a different shape of problem.
+| Concern               | IntelliJ MCP                            | mcp-jdwp-inspector             |
+|-----------------------|-----------------------------------------|--------------------------------|
+| **Disambiguation**    | Routes through the *active* IDE window  | Scoped to a JVM **port**       |
+| **No IDE / Docker / CI** | Needs IntelliJ running               | Needs only JDWP                |
+| **Run configurations**| Agent has to create / pick one          | `mvn test` + JDWP is enough    |
+| **Log firehose**      | App logs spam the chat → tokens         | We don't surface app logs      |
+| **Power profile**     | Broad write surface (refactor, exec)    | Debug-only, R-mostly, small blast radius |
+| **Token economy**     | —                                       | Pairs with **rtk** + whitelisted `mvn` |
 
----
-
-### Independence
-
-- Multiple Claude Code sessions × multiple open IDEs → **whose IDE is which agent talking to?**
-- The JetBrains MCP routes through the *active* project window. Ambiguous.
-- This server attaches to a **JVM port** — unambiguous, scoped, killable.
-
-Note:
-This bites in real life. You have two repos open, two CC sessions, and the wrong one ends up driving the wrong project.
-
----
-
-### Works without an IDE
-
-- Docker container
-- CI/CD pipeline (debug a failing test on the runner)
-- Headless server
-- A colleague's machine over SSH
-
-If the JVM has JDWP open, we attach. No GUI, no JetBrains license, no plugin install.
-
----
-
-### Practical wins
-
-- **No run-configuration ritual** — agent doesn't need to create / pick an IDE run config; `mvn test` + JDWP is enough.
-- **No log-stream firehose** — IDE MCPs surface app logs as token-eating chat output. We don't.
-- **Token economy** — paired with **rtk** (Rust Token Killer) and `mvn` whitelisted, the agent runs builds without burning context.
-
----
-
-### Different power profile
-
-- The JetBrains MCP can refactor, run tools, execute terminal commands — **broad write surface**.
-- This server only debugs. Variable mutation is scoped to a paused thread; nothing else.
-- Smaller blast radius → safer to leave running in the background.
+<small>Complementary, not competitive. Use the IJ MCP for refactors; use this when you want to *watch the JVM run*.</small>
 
 Note:
-Frame this as complementary, not competitive. Use the IJ MCP for refactors and codebase edits; use this when you specifically want to *watch the JVM run*.
+The disambiguation problem is real: multiple Claude Code sessions × multiple open IntelliJ projects → which agent talks to which project? The JetBrains MCP routes through whichever window has focus. Ambiguous. We attach to a port — unambiguous, scoped, killable.
+
+Run configurations: the JetBrains MCP can't create one on the fly the way agents want to. Agents like to type `mvn test -Dtest=Foo -Dmaven.surefire.debug` and have it Just Work. We support exactly that.
+
+Log firehose: when an IDE MCP surfaces app logs as chat output, every WARN line eats tokens. We don't do that — the only output you see is what the agent explicitly asks for via `jdwp_get_events`.
+
+Token economy: rtk (Rust Token Killer) is a CLI proxy that compresses verbose output before the agent sees it. With `mvn` whitelisted in CLAUDE.md, the agent runs builds without burning context on stack traces it isn't going to read.
+
+Power profile: our worst-case blast is mutating a local variable inside a single suspended thread. The JetBrains MCP can refactor your whole repo. Different risk profile.
