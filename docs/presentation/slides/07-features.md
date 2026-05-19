@@ -26,7 +26,7 @@ Raw JDI gives you threads, frames, variables. Not enough for an agent.
 Note:
 This is the "why use this instead of raw JDI" slide. Every item exists because we hit a real agent ergonomics problem and built around it.
 
-The deck calls out four highlights on the verticals: (1) conditional + logpoints together; (2) field watchpoints + chained BPs — the big 2.0 additions; (3) expression evaluation + recursive guard — the crown jewel; (4) agent ergonomics — small things that compound.
+The deck calls out four highlights on the verticals: (1) conditional + logpoints together; (2) field watchpoints + chained BPs — the heavy hitters for non-trivial bugs; (3) expression evaluation + recursive guard — the crown jewel; (4) agent ergonomics — small things that compound.
 
 --
 

@@ -24,7 +24,7 @@
 Note:
 Walk through groups by scrolling Down. Each group is one screen with the tool table and a one-line "why this matters for an agent". Skip to "Features beyond JDWP" if running short on time.
 
-Big restructuring since 2.0: the per-type `list_*` and `clear_all_*` tools collapsed into `jdwp_overview` (read) and `jdwp_clear` (bulk delete) — agent learns one mental model for "show me everything" / "wipe the BPs of kind X". Old tools removed: `list_breakpoints`, `list_exception_breakpoints`, `list_all_watchers`, `clear_all_breakpoints`, `clear_all_watchers`, `clear_exception_breakpoint`, `clear_breakpoint_by_id` (now a single `clear_breakpoint(id)`).
+Big restructuring of the surface: the per-type `list_*` and `clear_all_*` tools collapsed into `jdwp_overview` (read) and `jdwp_clear` (bulk delete) — agent learns one mental model for "show me everything" / "wipe the BPs of kind X".
 
 The 46-tool headline = 44 `@McpTool` methods + 2 MCP resources (`jdwp://diagnose`, `jdwp://jvms`).
 
@@ -93,7 +93,7 @@ Object IDs are stable across calls — the server caches `ObjectReference`s. The
 Note:
 `resume_until_event` is the big agent ergonomics win in this group. Without it, the agent does `resume`, then loops calling `get_events` until something interesting fires — wasting tokens on every empty poll. With it, the JDI event listener (daemon thread) is the source of truth; the tool awaits the next event with a timeout.
 
-Step semantics match IntelliJ: F6 / F7 / Shift+F8. `threadId` is **optional** since 2.0 — omitted, the step targets the thread of the last breakpoint hit. Each step is one round trip; for predictable destinations, prefer a breakpoint + `resume_until_event`.
+Step semantics match IntelliJ: F6 / F7 / Shift+F8. `threadId` is **optional** — omitted, the step targets the thread of the last breakpoint hit. Each step is one round trip; for predictable destinations, prefer a breakpoint + `resume_until_event`.
 
 --
 
@@ -113,7 +113,7 @@ Step semantics match IntelliJ: F6 / F7 / Shift+F8. `threadId` is **optional** si
 | `jdwp_disarm_until_trigger`       | re-disable a dependent after its one-shot fired          |
 
 Note:
-This is the biggest growth area since 1.0. Field watchpoints and chained breakpoints are both brand-new.
+This is the biggest group in the surface. Field watchpoints and chained breakpoints are the two tools that have no IntelliJ-equivalent shortcut and earn their slot on the keychain.
 
 Conditional BPs are critical for agents — a BP in a hot loop generates thousands of useless stops. With a condition, the JVM evaluates the expression on every hit, but the thread only suspends when the result is `true`. False hits auto-resume transparently.
 
@@ -165,7 +165,7 @@ This is the crown jewel. At a suspended breakpoint the agent runs *arbitrary Jav
 Note:
 Watchers are MCP-side bookkeeping — attach one to a breakpoint with a label + expression; on every hit the agent calls `evaluate_watchers` to get all watcher values in one round. Dual-indexed by watcher UUID and breakpoint ID; auto-cleaned when the breakpoint dies.
 
-**Marks** are new in 2.0: name a cached object as `$label` and use that label in any expression (conditions, logpoints, watchers, evaluations). Pinned by default — the server calls `disableCollection` on the underlying mirror so GC can't yank it out from under you. `unmark_instance` releases the pin. Lets the agent track "the specific Order under test" across breakpoint hits even when the local variable holding it goes out of scope.
+**Marks**: name a cached object as `$label` and use that label in any expression (conditions, logpoints, watchers, evaluations). Pinned by default — the server calls `disableCollection` on the underlying mirror so GC can't yank it out from under you. `unmark_instance` releases the pin. Lets the agent track "the specific Order under test" across breakpoint hits even when the local variable holding it goes out of scope.
 
 The bulk listing for both lives in `jdwp_overview` (`types="watcher"` or `types="mark"`).
 
