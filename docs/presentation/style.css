@@ -113,15 +113,15 @@
 	max-height: 290px;
 }
 
-/* ---- install slide: bigger code, matching inline-code size ---- */
+/* ---- install slide: bigger code, smaller inline-code so it stays on one line ---- */
 .reveal section.install-slide pre code {
-	font-size: 0.85em;
+	font-size: 1.0em;
 	white-space: pre-wrap;
 	word-break: break-all;
 }
 .reveal section.install-slide li code,
 .reveal section.install-slide small code {
-	font-size: 1em;
+	font-size: 0.8em;
 }
 
 /* ---- dense-table: for overview slides with many rows ---- */

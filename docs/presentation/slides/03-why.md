@@ -1,11 +1,11 @@
 <!-- .slide: data-background-image="images/bg-content.png" data-background-size="cover" -->
 
-## Why bother?
+## Designed for two scenarios
 
 <div class="cols">
 <div>
 
-### <span class="accent">Goal #1</span> · failing tests
+### <span class="accent">Scenario 1</span> · failing tests
 
 <pre><code class="nohighlight">mvn test -Dmaven.surefire.debug</code></pre>
 
@@ -18,7 +18,7 @@
 </div>
 <div>
 
-### <span class="accent">Goal #2</span> · running apps
+### <span class="accent">Scenario 2</span> · running apps
 
 <pre><code class="nohighlight">-agentlib:jdwp=…,suspend=n,address=*:5005</code></pre>
 
