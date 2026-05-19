@@ -1,3 +1,5 @@
+<!-- .slide: data-background-image="images/bg-content.png" data-background-size="cover" -->
+
 ## Why bother?
 
 <div class="cols">
@@ -5,9 +7,11 @@
 
 ### <span class="accent">Goal #1</span> · failing tests
 
-- `mvn test -Dmaven.surefire.debug`<br/>→ JVM halts on port 5005
+<pre><code>mvn test -Dmaven.surefire.debug</code></pre>
+
+- JVM halts on port 5005
 - Agent attaches **before** any user code runs
-- Sets breakpoint at the failing assertion
+- Breakpoint at the failing assertion
 - Reads locals, evaluates Java, walks object graphs
 - **Sees runtime state, not stack traces.**
 
@@ -16,18 +20,19 @@
 
 ### <span class="accent">Goal #2</span> · running apps
 
-- `-agentlib:jdwp=…,suspend=n,address=*:5005`
+<pre><code>-agentlib:jdwp=…,suspend=n,address=*:5005</code></pre>
+
 - Attach **while it's running**
 - **Logpoints** + field watchpoints trace without stopping traffic
 - **Conditional breakpoints** fire only on the bad request
-- No restart, no extra logging, no print-statement-and-redeploy loop.
+- No restart, no extra logging, no print-and-redeploy loop
 
 </div>
 </div>
 
 Note:
-**Primary goal — failing tests** is the killer use case. Today most agents pattern-match on stack traces and hallucinate the cause. With JDWP they observe runtime state directly. The Maven-suspend integration matters because a slow agent process loses the attach race — by the time it connects, ordinary test runs are already over. `suspend=y` (which `-Dmaven.surefire.debug` sets by default) holds the JVM until we say go.
-
-**Secondary goal — running apps** is the time-saver for "why is this only broken in staging" investigations. Logpoints replace println-and-redeploy. Field watchpoints (new) let you trace *who* mutates a field without instrumenting code. Conditional breakpoints mean the agent isn't flooded with thousands of irrelevant hits in a hot loop.
-
-Why this is hard without us: raw JDWP/JDI gives you threads, stack frames, and variables — fine for a human staring at IntelliJ. An agent needs conditions, deferred breakpoints, expression evaluation, value mutation, recursive-evaluation guards — none of which JDI gives you out of the box.
+- Primary win: failing tests — agent stops hallucinating from stack traces, sees actual runtime state
+- `suspend=y` (set by `-Dmaven.surefire.debug`) holds the JVM until the agent attaches — no race
+- Secondary win: running apps — "broken only in staging" investigations without redeploy
+- Logpoints replace `println`; field watchpoints find rogue writers; conditions tame hot-loop floods
+- Raw JDI is fine for a human in IntelliJ — agents need more (conditions, eval, mutation, guards)

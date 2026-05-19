@@ -1,3 +1,5 @@
+<!-- .slide: data-background-image="images/bg-content.png" data-background-size="cover" -->
+
 ## Live demo — test flights
 
 The repo ships **6 deliberately broken Java classes** in `jdwp-sandbox/`.
@@ -15,12 +17,8 @@ Each compiles cleanly, looks reasonable, **fails its test with a confusing messa
 <small>Kicking off scenario #1 in the background — we'll come back to it.</small>
 
 Note:
-Pre-trigger flight #1 in a separate terminal so it runs while we walk the rest of the deck. Return at the end with live output.
-
-#6 is the headliner: `displayName` is written via `Field.setAccessible(true) + Field.set(...)`, so a line BP on the setter never fires. The field watchpoint catches every JVM-level store — reflection and `Unsafe` included.
-
-Launch a flight: in Claude Code, "Use JDWP to debug `OrderProcessorTest` in jdwp-sandbox — find the root cause."
-
-Backup if the live demo stalls: cite evita-db `OffsetIndexTest.generationalProofTest` — agent found an off-by-one in `countDifference()` (binarySearch insertion-point misused as the `>` loop bound) in minutes.
-
-Scorecard: 6 = bug terminator. 0–1 = JVM wins.
+- Pre-trigger flight #1 in a separate terminal; come back to it at the end
+- Launch: "Use JDWP to debug `OrderProcessorTest` in jdwp-sandbox — find the root cause"
+- #6 is the headliner: `displayName` written via `Field.setAccessible(true)` → line BP misses, field watchpoint catches every store
+- Backup story: evita-db `OffsetIndexTest.generationalProofTest` off-by-one in `countDifference()` — found in minutes
+- Scorecard: 6 = bug terminator. 0–1 = JVM wins.

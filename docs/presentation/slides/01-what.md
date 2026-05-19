@@ -1,3 +1,5 @@
+<!-- .slide: data-background-image="images/bg-content.png" data-background-size="cover" -->
+
 ## What is it?
 
 An **MCP server** that gives Claude Code a debugger.
@@ -9,10 +11,8 @@ An **MCP server** that gives Claude Code a debugger.
 - Pure STDIO → no daemon, no extra port, no GUI
 
 Note:
-JDWP = Java Debug Wire Protocol. Same wire IntelliJ / Eclipse / VS Code speak when you click "Attach". We translate it for the agent. JDI (the high-level Java API) is what we actually use server-side; JDWP is what travels over the socket.
-
-Why "agent-driven" matters: the agent sees what the *debugger* sees, not what the log printed. Stack traces lie; runtime state doesn't.
-
-Two MCP resources beyond the tools: `jdwp://diagnose` (state-of-the-world snapshot) and `jdwp://jvms` (local-JVM inventory) — attaching either via `@` in the prompt pulls the rendered text in without burning a model turn on a tool call.
-
-Key constraint: this is a Claude Code plugin. Users `git clone` it. That's why the presentation lives on a separate orphan `gh-pages` branch — to keep their clones slim.
+- JDWP = Java Debug Wire Protocol — what IntelliJ / Eclipse / VS Code speak when you click "Attach"
+- We translate JDWP ↔ MCP so the agent sees what a debugger sees
+- Stack traces lie; runtime state doesn't
+- 2 MCP resources too: `jdwp://diagnose`, `jdwp://jvms` — pull in via `@`, no tool turn
+- It's a Claude Code plugin → users `git clone` it (slides live on orphan `gh-pages` to keep clones slim)

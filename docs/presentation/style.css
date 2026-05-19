@@ -41,7 +41,7 @@
 }
 .reveal pre code {
 	max-height: 480px;
-	font-size: 0.55em;
+	font-size: 0.62em;
 	line-height: 1.35;
 	padding: 0.7em 1em;
 	border-radius: 4px;
@@ -79,9 +79,46 @@
 	word-break: break-all;
 	white-space: normal;
 }
+.reveal .cols pre {
+	margin: 0.3em 0 0.5em 0;
+	width: 100%;
+	box-shadow: none;
+}
+.reveal .cols pre code {
+	font-size: 0.85em;
+	padding: 0.4em 0.6em;
+	white-space: pre-wrap;
+	word-break: break-all;
+}
 
 /* ---- title slide flourish ---- */
-.reveal .title-slide h2 { color: #7ec6ff; }
+.reveal .title-slide h1 { font-size: 2.6em; line-height: 1.05; }
+.reveal .title-slide h2 { color: #7ec6ff; font-size: 1.2em; opacity: 0.9; }
+
+/* ---- diagrams: keep images tidy and centered ---- */
+.reveal img.diagram {
+	max-width: 80%;
+	max-height: 60vh;
+	margin: 0.4em auto;
+	display: block;
+	border-radius: 6px;
+	box-shadow: 0 4px 18px rgba(0, 0, 0, 0.45);
+}
+.reveal .cols img.diagram {
+	max-width: 100%;
+	max-height: 50vh;
+}
+
+/* ---- install slide: bigger code, matching inline-code size ---- */
+.reveal section.install-slide pre code {
+	font-size: 0.85em;
+	white-space: pre-wrap;
+	word-break: break-all;
+}
+.reveal section.install-slide li code,
+.reveal section.install-slide small code {
+	font-size: 1em;
+}
 
 /* ---- dense-table: for overview slides with many rows ---- */
 .reveal .dense-table h2 { font-size: 1.1em; margin-bottom: 0.2em; }
