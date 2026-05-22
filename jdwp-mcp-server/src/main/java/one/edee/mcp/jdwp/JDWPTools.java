@@ -401,10 +401,9 @@ public class JDWPTools {
     }
 
     /**
-     * Renders the GH issue #4 reconnect contract for the agent: what survived, what was lost, and
-     * the explicit "target VM is running" status (re-suspending threads after a reattach is not
-     * feasible in JDI). The structure mirrors the example in the issue body so the response is
-     * predictable across calls.
+     * Renders the reconnect contract for the agent: what survived, what was lost, and the
+     * explicit "target VM is running" status (re-suspending threads after a reattach is not
+     * feasible in JDI). The structure is stable so the agent can pattern-match on it across calls.
      */
     private static String formatReconnectReport(JDIConnectionService.ReconnectResult result) {
         final StringBuilder out = new StringBuilder();
@@ -1087,7 +1086,7 @@ public class JDWPTools {
     }
 
     /**
-     * Renders the GH issue #4 "still_waiting" envelope returned by every soft-waiting tool when
+     * Renders the "still_waiting" envelope returned by every soft-waiting tool when
      * its 30s ceiling elapses without the awaited event. The structure (Status / Elapsed / JDI
      * Health / Options) is part of the contract: the agent decides whether to wait_more,
      * reconnect, or abort based on the current health classification, never on a hardcoded

@@ -19,8 +19,7 @@ import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Passive JDI traffic observer plus active probe used to answer "is the JDI connection wedged?"
- * without parking on a user-facing tool. Existence and responsibilities mirror the design in
- * GH issue #4:
+ * without parking on a user-facing tool. Three concerns:
  * <ul>
  *   <li><b>Passive observation</b> — every JDWP packet that flows in or out of the target VM
  *       brushes against {@link #notifyTraffic()}, which advances the last-traffic timestamp.
@@ -54,9 +53,9 @@ public class JdiHealthMonitor {
     private static final Duration PROBE_TICK = Duration.ofSeconds(5);
 
     /**
-     * Silence threshold before the watchdog escalates to an active probe. The issue calls this
-     * out as a fixed 30s — keep this aligned with the soft-wait envelope so the agent sees
-     * "unresponsive_for_30s" right when its first soft-wait window also expires.
+     * Silence threshold before the watchdog escalates to an active probe. Aligned with the
+     * soft-wait envelope window so the agent sees {@code "unresponsive_for_30s"} right as its
+     * first soft-wait window also expires.
      */
     private static final Duration SILENCE_THRESHOLD = Duration.ofSeconds(30);
 
@@ -275,36 +274,45 @@ public class JdiHealthMonitor {
                 final int count = probe.get(PROBE_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
                 // Successful probe — the connection is alive after all. Update snapshot and
                 // refresh the last-traffic timestamp so the next tick does not immediately re-probe.
-                notifyTraffic();
-                snapshotRef.set(new JdiHealthSnapshot(
-                    Status.RESPONSIVE,
-                    lastTrafficAt.get(),
-                    Duration.ZERO,
-                    probeStartedAt,
-                    String.format("OK (%d threads)", count)
-                ));
+                // Skip the snapshot publish if stop() has run (or a different VM is now registered)
+                // between probe submit and probe return — overwriting DISCONNECTED with RESPONSIVE
+                // would silently revive a stopped monitor.
+                if (vmRef.get() == vm) {
+                    notifyTraffic();
+                    snapshotRef.set(new JdiHealthSnapshot(
+                        Status.RESPONSIVE,
+                        lastTrafficAt.get(),
+                        Duration.ZERO,
+                        probeStartedAt,
+                        String.format("OK (%d threads)", count)
+                    ));
+                }
                 log.debug("[Health] Active probe succeeded after {}s silence (threads={})",
                     silentFor.toSeconds(), count);
             } catch (TimeoutException timeout) {
                 probe.cancel(true);
-                snapshotRef.set(new JdiHealthSnapshot(
-                    Status.UNRESPONSIVE,
-                    lastSeen,
-                    silentFor,
-                    probeStartedAt,
-                    String.format("vm.allThreads() timed out after %ds", PROBE_TIMEOUT.toSeconds())
-                ));
+                if (vmRef.get() == vm) {
+                    snapshotRef.set(new JdiHealthSnapshot(
+                        Status.UNRESPONSIVE,
+                        lastSeen,
+                        silentFor,
+                        probeStartedAt,
+                        String.format("vm.allThreads() timed out after %ds", PROBE_TIMEOUT.toSeconds())
+                    ));
+                }
                 log.warn("[Health] JDI probe timed out — connection appears wedged (silent for {}s)",
                     silentFor.toSeconds());
             } catch (ExecutionException ee) {
                 final Throwable cause = ee.getCause() != null ? ee.getCause() : ee;
-                snapshotRef.set(new JdiHealthSnapshot(
-                    Status.UNRESPONSIVE,
-                    lastSeen,
-                    silentFor,
-                    probeStartedAt,
-                    String.format("vm.allThreads() failed: %s", cause.getClass().getSimpleName())
-                ));
+                if (vmRef.get() == vm) {
+                    snapshotRef.set(new JdiHealthSnapshot(
+                        Status.UNRESPONSIVE,
+                        lastSeen,
+                        silentFor,
+                        probeStartedAt,
+                        String.format("vm.allThreads() failed: %s", cause.getClass().getSimpleName())
+                    ));
+                }
                 log.warn("[Health] JDI probe failed with {}: {}",
                     cause.getClass().getSimpleName(), cause.getMessage());
             } catch (InterruptedException ie) {

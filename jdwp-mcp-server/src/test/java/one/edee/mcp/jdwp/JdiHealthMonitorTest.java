@@ -89,4 +89,43 @@ class JdiHealthMonitorTest {
 		assertThat(snapshot.lastTrafficAt()).isNull();
 		assertThat(snapshot.lastProbeAt()).isNull();
 	}
+
+	/**
+	 * Race regression: an active probe parked in {@code Future.get} can race with {@code stop()},
+	 * and an unguarded snapshot write would revive a stopped monitor by overwriting DISCONNECTED
+	 * with RESPONSIVE or UNRESPONSIVE. The fix is a {@code vmRef.get() == vm} guard inside
+	 * {@code runActiveProbe} that suppresses the publish when the monitor has been stopped (or
+	 * re-armed against a different VM) since the probe was submitted.
+	 *
+	 * <p>The test drives {@code runActiveProbe} via reflection so we can simulate the in-flight
+	 * scenario deterministically — wiping {@code vmRef} mid-probe via a separate thread the way
+	 * production would is timing-fragile in a unit test.
+	 */
+	@Test
+	@DisplayName("runActiveProbe does not revive snapshot after stop() has run")
+	void shouldNotReviveSnapshotAfterStopRaceWithProbe() throws Exception {
+		final com.sun.jdi.VirtualMachine vm = org.mockito.Mockito.mock(com.sun.jdi.VirtualMachine.class);
+		org.mockito.Mockito.when(vm.allThreads()).thenReturn(java.util.List.of());
+
+		// Plant the vm reference and traffic timestamp manually so runActiveProbe sees a "valid"
+		// state on entry; then NULL the vmRef before invoking the probe, simulating a concurrent
+		// stop().
+		final var vmRefField = JdiHealthMonitor.class.getDeclaredField("vmRef");
+		vmRefField.setAccessible(true);
+		@SuppressWarnings("unchecked")
+		final java.util.concurrent.atomic.AtomicReference<com.sun.jdi.VirtualMachine> vmRef =
+			(java.util.concurrent.atomic.AtomicReference<com.sun.jdi.VirtualMachine>) vmRefField.get(monitor);
+		vmRef.set(null);  // monitor already "stopped" — snapshot is DISCONNECTED
+
+		final var probeMethod = JdiHealthMonitor.class.getDeclaredMethod(
+			"runActiveProbe", com.sun.jdi.VirtualMachine.class, java.time.Instant.class, java.time.Duration.class);
+		probeMethod.setAccessible(true);
+		probeMethod.invoke(monitor,
+			vm, java.time.Instant.now().minusSeconds(60), java.time.Duration.ofSeconds(60));
+
+		final JdiHealthMonitor.JdiHealthSnapshot snapshot = monitor.snapshot();
+		// The probe succeeded against the captured vm reference, but the guard suppressed the
+		// snapshot publish because vmRef no longer matched. The DISCONNECTED state survives.
+		assertThat(snapshot.status()).isEqualTo(JdiHealthMonitor.Status.DISCONNECTED);
+	}
 }

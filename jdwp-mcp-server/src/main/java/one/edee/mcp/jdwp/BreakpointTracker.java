@@ -463,6 +463,10 @@ public class BreakpointTracker {
      * for the JDI side — registering {@link ClassPrepareRequest}s for the pending class names and
      * calling {@link #tryPromotePending} so classes already loaded by the fresh VM bind
      * immediately.
+     *
+     * @param snapshot  the immutable capture returned by {@link #snapshotForReconnect()}; the
+     *                  tracker mutates only its own internal state during replay — the snapshot
+     *                  itself is untouched
      */
     public synchronized void restoreFromSnapshotAsPending(ReconnectSnapshot snapshot) {
         clearAllInMemoryStateLocked();
@@ -1928,6 +1932,13 @@ public class BreakpointTracker {
      *
      * <p>Lists / maps / sets are deep-copied via {@code List.copyOf} / {@code Map.copyOf} /
      * {@code Set.copyOf} so callers cannot mutate the snapshot after capture.
+     *
+     * @param lineBreakpoints            every line BP (active and pending), in capture order
+     * @param exceptionBreakpoints       every exception BP (active and pending), in capture order
+     * @param fieldBreakpoints           every field watchpoint (active and pending), in capture order
+     * @param metadata                   per-BP condition / logpoint metadata, keyed by synthetic ID
+     * @param dependencies               chain edges — dependent ID → {@link TriggerLink}
+     * @param triggersFiredAtLeastOnce   set of trigger IDs that have already fired at least once
      */
     public record ReconnectSnapshot(
         List<LineBreakpointEntry> lineBreakpoints,
@@ -1942,20 +1953,41 @@ public class BreakpointTracker {
      * Captured line breakpoint spec. Used by {@link ReconnectSnapshot} so the reconnect path can
      * replay an active OR pending line BP under its original synthetic ID without losing the
      * suspend policy.
+     *
+     * @param id                  synthetic BP id from the previous session — restored verbatim
+     * @param className           fully qualified class name the BP is set in
+     * @param lineNumber          source line number where the BP is set
+     * @param suspendPolicy       JDI {@link EventRequest} {@code SUSPEND_*} constant
+     * @param suspendPolicyLabel  human-readable label ("all" / "thread" / "none") round-tripped
+     *                            by {@code suspendPolicyLabel(int)}
      */
     public record LineBreakpointEntry(
         int id, String className, int lineNumber, int suspendPolicy, String suspendPolicyLabel
     ) {}
 
-    /** Captured exception breakpoint spec — wraps the existing {@link ExceptionBreakpointSpec}. */
+    /**
+     * Captured exception breakpoint spec — wraps the existing {@link ExceptionBreakpointSpec}.
+     *
+     * @param id    synthetic BP id from the previous session — restored verbatim
+     * @param spec  the immutable exception BP spec, replayed against the fresh VM as-is
+     */
     public record ExceptionBreakpointEntry(int id, ExceptionBreakpointSpec spec) {}
 
-    /** Captured field watchpoint spec — wraps the existing {@link FieldBreakpointSpec}. */
+    /**
+     * Captured field watchpoint spec — wraps the existing {@link FieldBreakpointSpec}.
+     *
+     * @param id    synthetic BP id from the previous session — restored verbatim
+     * @param spec  the immutable field watchpoint spec, replayed against the fresh VM as-is
+     */
     public record FieldBreakpointEntry(int id, FieldBreakpointSpec spec) {}
 
     /**
      * Captured metadata row from {@link BreakpointMetadata}. Both fields nullable because each is
      * independently set: a BP can have a condition without a logpoint expression and vice versa.
+     *
+     * @param condition           user-supplied conditional expression, or {@code null} when none
+     * @param logpointExpression  user-supplied logpoint expression, or {@code null} when the BP is
+     *                            not a logpoint
      */
     public record MetadataSnapshot(@Nullable String condition, @Nullable String logpointExpression) {}
 

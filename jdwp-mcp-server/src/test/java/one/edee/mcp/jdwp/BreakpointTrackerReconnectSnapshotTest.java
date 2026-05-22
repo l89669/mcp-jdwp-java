@@ -14,7 +14,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 /**
- * Behavioural tests for the GH issue #4 reconnect snapshot / restore contract on
+ * Behavioural tests for the reconnect snapshot / restore contract on
  * {@link BreakpointTracker}. The contract: synthetic IDs survive verbatim across
  * {@code snapshotForReconnect()} → {@code restoreFromSnapshotAsPending()}; metadata and chain
  * edges are restored; everything comes back as <i>pending</i> regardless of whether the

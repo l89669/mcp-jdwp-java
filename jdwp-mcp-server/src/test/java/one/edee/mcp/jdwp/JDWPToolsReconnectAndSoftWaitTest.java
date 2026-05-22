@@ -18,12 +18,12 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 /**
- * GH issue #4 surface tests for {@link JDWPTools#jdwp_reconnect} and the soft-wait envelope
+ * Surface tests for {@link JDWPTools#jdwp_reconnect} and the soft-wait envelope
  * emitted by {@link JDWPTools#jdwp_resume_until_event} when its 30s ceiling elapses without an
  * event. The envelope is the load-bearing contract — agents pivot to {@code wait_more} /
  * {@code reconnect} / {@code abort} based on what it says, so the format is asserted on directly.
  */
-@DisplayName("issue #4 — reconnect tool + soft-wait envelope")
+@DisplayName("reconnect tool + soft-wait envelope")
 class JDWPToolsReconnectAndSoftWaitTest {
 
 	private JDIConnectionService jdiService;
