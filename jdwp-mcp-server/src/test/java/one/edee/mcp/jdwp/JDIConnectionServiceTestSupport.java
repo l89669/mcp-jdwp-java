@@ -51,7 +51,8 @@ final class JDIConnectionServiceTestSupport {
 			new EventHistory(),
 			new WatcherManager(),
 			new EvaluationGuard(),
-			new MarkedInstanceRegistry()
+			new MarkedInstanceRegistry(),
+			new JdiHealthMonitor()
 		);
 	}
 
@@ -63,7 +64,7 @@ final class JDIConnectionServiceTestSupport {
 	static JDIConnectionService newServiceWithCollaborators(JdiEventListener listener,
 			BreakpointTracker tracker, EventHistory history, WatcherManager watchers,
 			EvaluationGuard guard) {
-		return new JDIConnectionService(listener, tracker, history, watchers, guard, new MarkedInstanceRegistry());
+		return new JDIConnectionService(listener, tracker, history, watchers, guard, new MarkedInstanceRegistry(), new JdiHealthMonitor());
 	}
 
 	/**
@@ -74,7 +75,7 @@ final class JDIConnectionServiceTestSupport {
 	static JDIConnectionService newServiceWithCollaborators(JdiEventListener listener,
 			BreakpointTracker tracker, EventHistory history, WatcherManager watchers,
 			EvaluationGuard guard, MarkedInstanceRegistry marks) {
-		return new JDIConnectionService(listener, tracker, history, watchers, guard, marks);
+		return new JDIConnectionService(listener, tracker, history, watchers, guard, marks, new JdiHealthMonitor());
 	}
 
 	/**
@@ -91,7 +92,7 @@ final class JDIConnectionServiceTestSupport {
 		final EvaluationGuard guard = new EvaluationGuard();
 		final JdiExpressionEvaluator evaluator = mock(JdiExpressionEvaluator.class);
 		final JdiEventListener listener = new JdiEventListener(tracker, history, evaluator, guard, null, new MarkedInstanceRegistry());
-		return new JDIConnectionService(listener, tracker, history, watchers, guard, new MarkedInstanceRegistry());
+		return new JDIConnectionService(listener, tracker, history, watchers, guard, new MarkedInstanceRegistry(), new JdiHealthMonitor());
 	}
 
 	/**

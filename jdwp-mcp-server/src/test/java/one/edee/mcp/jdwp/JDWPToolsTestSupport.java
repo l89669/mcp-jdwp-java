@@ -44,7 +44,8 @@ final class JDWPToolsTestSupport {
 			mock(EventHistory.class),
 			new EvaluationGuard(),
 			mock(JvmDiscoveryService.class),
-			new MarkedInstanceRegistry()
+			new MarkedInstanceRegistry(),
+			new JdiHealthMonitor()
 		);
 	}
 
@@ -70,7 +71,8 @@ final class JDWPToolsTestSupport {
 			eventHistory,
 			evaluationGuard,
 			jvmDiscoveryService,
-			new MarkedInstanceRegistry()
+			new MarkedInstanceRegistry(),
+			new JdiHealthMonitor()
 		);
 	}
 
@@ -96,7 +98,36 @@ final class JDWPToolsTestSupport {
 			eventHistory,
 			evaluationGuard,
 			jvmDiscoveryService,
-			markedInstances
+			markedInstances,
+			new JdiHealthMonitor()
+		);
+	}
+
+	/**
+	 * Overload that accepts a caller-supplied {@link JdiHealthMonitor} — needed by reconnect /
+	 * health-state tests that need to inject a pre-stubbed monitor or assert on its lifecycle.
+	 */
+	static JDWPTools newTools(
+		JDIConnectionService jdiService,
+		BreakpointTracker breakpointTracker,
+		WatcherManager watcherManager,
+		JdiExpressionEvaluator expressionEvaluator,
+		EventHistory eventHistory,
+		EvaluationGuard evaluationGuard,
+		JvmDiscoveryService jvmDiscoveryService,
+		MarkedInstanceRegistry markedInstances,
+		JdiHealthMonitor healthMonitor
+	) {
+		return new JDWPTools(
+			jdiService,
+			breakpointTracker,
+			watcherManager,
+			expressionEvaluator,
+			eventHistory,
+			evaluationGuard,
+			jvmDiscoveryService,
+			markedInstances,
+			healthMonitor
 		);
 	}
 }

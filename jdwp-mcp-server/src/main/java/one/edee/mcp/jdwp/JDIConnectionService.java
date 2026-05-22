@@ -3,6 +3,9 @@ package one.edee.mcp.jdwp;
 import com.sun.jdi.*;
 import com.sun.jdi.connect.AttachingConnector;
 import com.sun.jdi.connect.Connector;
+import com.sun.jdi.request.ClassPrepareRequest;
+import com.sun.jdi.request.EventRequest;
+import com.sun.jdi.request.EventRequestManager;
 import one.edee.mcp.jdwp.evaluation.ClasspathDiscoverer;
 import one.edee.mcp.jdwp.evaluation.ClasspathDiscoverer.DiscoveryResult;
 import one.edee.mcp.jdwp.evaluation.InMemoryJavaCompiler;
@@ -66,6 +69,11 @@ public class JDIConnectionService {
     private final EventHistory eventHistory;
     private final WatcherManager watcherManager;
     private final EvaluationGuard evaluationGuard;
+    /**
+     * Passive JDI traffic observer + active wedge probe. Lifecycle is gated by this service:
+     * armed in {@link #connect}, torn down in {@link #cleanupSessionState} / {@link #notifyVmDied}.
+     */
+    private final JdiHealthMonitor healthMonitor;
     /**
      * Server-wide registry of agent-labelled JDI object references. Held here so its lifecycle is
      * gated by the connection: pinned object references must be released both on VM death (see
@@ -132,15 +140,20 @@ public class JDIConnectionService {
 
     public JDIConnectionService(JdiEventListener eventListener, BreakpointTracker breakpointTracker,
                                 EventHistory eventHistory, WatcherManager watcherManager,
-                                EvaluationGuard evaluationGuard, MarkedInstanceRegistry markedInstances) {
+                                EvaluationGuard evaluationGuard, MarkedInstanceRegistry markedInstances,
+                                JdiHealthMonitor healthMonitor) {
         this.eventListener = eventListener;
         this.breakpointTracker = breakpointTracker;
         this.eventHistory = eventHistory;
         this.watcherManager = watcherManager;
         this.evaluationGuard = evaluationGuard;
         this.markedInstances = markedInstances;
+        this.healthMonitor = healthMonitor;
         // Wire post-mortem cleanup so the listener can null the VM the moment the target dies.
         eventListener.setVmDeathHook(this::notifyVmDied);
+        // Wire traffic observation so every JDI event drained from the queue advances the
+        // health monitor's last-traffic timestamp without the listener knowing about the monitor.
+        eventListener.setTrafficObserver(healthMonitor::notifyTraffic);
     }
 
     /**
@@ -314,6 +327,10 @@ public class JDIConnectionService {
         lastConnectError = null;
 
         eventListener.start(vm);
+        // Arm the health watchdog. The attach round-trip itself counts as traffic, so the
+        // monitor seeds lastTrafficAt to now and only escalates to an active probe if the
+        // listener subsequently sees a full silence window.
+        healthMonitor.start(vm);
 
         return String.format("Connected to %s (version %s)", vm.name(), vm.version());
     }
@@ -413,6 +430,7 @@ public class JDIConnectionService {
         cachedClasspath = null;
         discoveredJdkPath = null;
         targetMajorVersion = 0;
+        healthMonitor.stop();
     }
 
     /**
@@ -458,7 +476,195 @@ public class JDIConnectionService {
 
         lastHost = null;
         lastPort = 0;
+        healthMonitor.stop();
     }
+
+    /**
+     * Reconnect path for GH issue #4. Snapshots every breakpoint spec, condition, logpoint
+     * expression, chain edge, and watcher; disposes the (possibly wedged) JDI connection;
+     * re-attaches to the last successful host:port; replays the snapshot so synthetic breakpoint
+     * IDs stay stable; then registers a {@link ClassPrepareRequest} per unique pending class and
+     * runs the opportunistic promoter so classes already loaded by the fresh VM bind immediately.
+     *
+     * <p><b>What survives the reconnect</b> (preserved here verbatim from issue #4's contract):
+     * synthetic breakpoint IDs, line/exception/field BP specs, conditions, logpoint expressions,
+     * chain edges, watchers, event history. <b>What is lost</b> (cannot survive {@code vm.dispose()}):
+     * marked instances, object cache, last suspended thread context, classpath discovery cache,
+     * any in-flight {@code invokeMethod}. The target VM resumes — re-suspending threads after a
+     * reattach is not possible in JDI.
+     *
+     * @return a structured {@link ReconnectResult} describing what was restored and what was lost;
+     *         callers (the {@code jdwp_reconnect} tool) format this for the agent
+     * @throws Exception when no prior successful attach exists (the issue calls this out — agents
+     *                   must use {@code jdwp_connect} to point at a different target) or when the
+     *                   fresh attach itself fails
+     */
+    public synchronized ReconnectResult reconnectPreservingSpecs() throws Exception {
+        if (lastHost == null || lastPort == 0) {
+            throw new IllegalStateException(
+                "No prior successful attach — call jdwp_connect or jdwp_wait_for_attach first.");
+        }
+        final String host = lastHost;
+        final int port = lastPort;
+
+        final BreakpointTracker.ReconnectSnapshot snapshot = breakpointTracker.snapshotForReconnect();
+        final int watcherCount = watcherManager.getAllWatchers().size();
+        final int markedCount = markedInstances.list().size();
+        final int objectCacheCount = objectCache.size();
+
+        // Tear down anything JDI-bound that cannot survive vm.dispose(). Done before the dispose
+        // itself so the listener does not drain spurious events on the dying queue.
+        eventListener.stop();
+        healthMonitor.stop();
+        if (vm != null) {
+            try {
+                vm.dispose();
+            } catch (Exception ignored) {
+                // VM may already be wedged or dead — the dispose is best-effort.
+            }
+            vm = null;
+        }
+        markedInstances.clearAll();
+        objectCache.clear();
+        cachedClasspath = null;
+        discoveredJdkPath = null;
+        targetMajorVersion = 0;
+
+        // Fresh attach to the last known target — no host/port input from the caller so a
+        // mid-incident operator cannot accidentally swap targets while assuming their BPs survive.
+        lastConnectAttempt = Instant.now();
+        lastConnectAttemptHost = host;
+        lastConnectAttemptPort = port;
+        final VirtualMachineManager vmm = Bootstrap.virtualMachineManager();
+        AttachingConnector connector = null;
+        for (AttachingConnector ac : vmm.attachingConnectors()) {
+            if ("com.sun.jdi.SocketAttach".equals(ac.name())) {
+                connector = ac;
+                break;
+            }
+        }
+        if (connector == null) {
+            lastConnectError = "SocketAttach connector not found";
+            throw new RuntimeException("SocketAttach connector not found");
+        }
+        final Map<String, Connector.Argument> args = connector.defaultArguments();
+        Objects.requireNonNull(args.get("hostname"), "SocketAttach connector missing 'hostname' argument").setValue(host);
+        Objects.requireNonNull(args.get("port"), "SocketAttach connector missing 'port' argument").setValue(String.valueOf(port));
+        try {
+            vm = connector.attach(args);
+        } catch (Exception e) {
+            lastConnectError = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
+            // Leave the tracker snapshot un-restored — without a live VM there is nothing to
+            // promote against. The next jdwp_connect / jdwp_reconnect can replay from the lost
+            // snapshot only if the caller re-issues; the contract is best-effort, not transactional.
+            throw e;
+        }
+        lastConnectError = null;
+        eventListener.start(vm);
+        healthMonitor.start(vm);
+
+        // Replay specs as pending entries (synthetic IDs preserved), then register a
+        // ClassPrepareRequest per unique pending class name so the listener picks up subsequent
+        // loads. Already-loaded classes are bound immediately by tryPromotePending below.
+        breakpointTracker.restoreFromSnapshotAsPending(snapshot);
+        final EventRequestManager erm = vm.eventRequestManager();
+        final Set<String> classesNeedingPrepare = new java.util.LinkedHashSet<>();
+        for (BreakpointTracker.LineBreakpointEntry e : snapshot.lineBreakpoints()) {
+            classesNeedingPrepare.add(e.className());
+        }
+        for (BreakpointTracker.ExceptionBreakpointEntry e : snapshot.exceptionBreakpoints()) {
+            classesNeedingPrepare.add(e.spec().exceptionClass());
+        }
+        for (BreakpointTracker.FieldBreakpointEntry e : snapshot.fieldBreakpoints()) {
+            classesNeedingPrepare.add(e.spec().className());
+        }
+        for (String className : classesNeedingPrepare) {
+            try {
+                final ClassPrepareRequest cpr = erm.createClassPrepareRequest();
+                cpr.addClassFilter(className);
+                cpr.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
+                cpr.enable();
+                breakpointTracker.registerClassPrepareRequest(className, cpr);
+            } catch (Exception cprError) {
+                // Best-effort: a CPR failure for one class must not prevent the rest of the
+                // reconnect from completing. The opportunistic promoter below will still bind
+                // already-loaded classes, and a subsequent class load will simply not auto-promote.
+                log.warn("[Reconnect] Failed to register ClassPrepareRequest for {}: {}",
+                    className, cprError.getMessage());
+            }
+        }
+
+        // Promote any pending entries whose class is already loaded in the fresh VM.
+        final int promoted;
+        try {
+            promoted = breakpointTracker.tryPromotePending(this);
+        } catch (Exception e) {
+            // Defensive — the tracker's safety-net promoter is best-effort even on the regular
+            // path; an exception here must not turn a successful re-attach into a failure.
+            log.warn("[Reconnect] Opportunistic promotion threw: {}", e.getMessage());
+            eventHistory.record(new EventHistory.DebugEvent("RECONNECT",
+                String.format("Reconnected to %s:%d; promotion error", host, port),
+                Map.of("host", host, "port", String.valueOf(port))));
+            return new ReconnectResult(
+                host, port,
+                snapshot.lineBreakpoints().size(),
+                0,
+                snapshot.lineBreakpoints().size(),
+                snapshot.exceptionBreakpoints().size(),
+                snapshot.fieldBreakpoints().size(),
+                watcherCount,
+                markedCount,
+                objectCacheCount
+            );
+        }
+
+        eventHistory.record(new EventHistory.DebugEvent("RECONNECT",
+            String.format("Reconnected to %s:%d, promoted %d/%d line BPs", host, port,
+                promoted, snapshot.lineBreakpoints().size()),
+            Map.of("host", host, "port", String.valueOf(port),
+                "promoted", String.valueOf(promoted))));
+
+        // promoted counts every kind (line + exception + field) but the report distinguishes line
+        // active vs deferred — we approximate "active line BPs" by counting how many line entries
+        // now exist in the active map after promotion, since tryPromotePending returns a flat
+        // total across the three kinds.
+        final int activeLines = breakpointTracker.getAllBreakpoints().size();
+        final int deferredLines = snapshot.lineBreakpoints().size() - activeLines;
+
+        return new ReconnectResult(
+            host, port,
+            activeLines, Math.max(0, deferredLines),
+            snapshot.lineBreakpoints().size(),
+            snapshot.exceptionBreakpoints().size(),
+            snapshot.fieldBreakpoints().size(),
+            watcherCount, markedCount, objectCacheCount
+        );
+    }
+
+    /**
+     * Structured outcome of {@link #reconnectPreservingSpecs} for the {@code jdwp_reconnect} MCP
+     * tool to render. Counts capture the "what survived / what was lost" contract from issue #4:
+     * BPs and watchers survive ({@code restoredLineActive} + {@code restoredLineDeferred} sum to
+     * {@code restoredLineTotal}), while marked instances and the object cache are wiped (the
+     * pre-reconnect counts are echoed so the agent knows what they need to re-establish).
+     *
+     * @param host                    target host the fresh attach succeeded against
+     * @param port                    target port the fresh attach succeeded against
+     * @param restoredLineActive      line BPs immediately bound (class already loaded)
+     * @param restoredLineDeferred    line BPs still pending (class not yet loaded)
+     * @param restoredLineTotal       total line BPs replayed (active + deferred)
+     * @param restoredExceptionTotal  exception BPs replayed
+     * @param restoredFieldTotal      field watchpoints replayed
+     * @param watchersPreserved       watchers carried over from the previous session
+     * @param markedInstancesLost     marked instances dropped (cannot survive vm.dispose)
+     * @param objectCacheLost         object cache entries dropped (likewise)
+     */
+    public record ReconnectResult(
+        String host, int port,
+        int restoredLineActive, int restoredLineDeferred, int restoredLineTotal,
+        int restoredExceptionTotal, int restoredFieldTotal,
+        int watchersPreserved, int markedInstancesLost, int objectCacheLost
+    ) {}
 
     /**
      * Returns the connected VirtualMachine, auto-reconnecting if the connection has dropped.
