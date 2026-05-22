@@ -949,7 +949,8 @@ public class BreakpointTracker {
 
                 synchronized (this) {
                     // Recheck: the listener path (JdiEventListener.handleClassPrepareEvent) may
-                    // have promoted or removed this entry while we were parked in the JDI invoke.
+                    // have promoted or removed this entry between the unsynchronized passive
+                    // lookup above and our re-acquire of the tracker monitor here.
                     if (pendingBreakpointsById.get(id) != pending
                         || pending.getFailureReason() != null
                         || breakpointsById.containsKey(id)) {
