@@ -54,7 +54,7 @@ class JDWPToolsSetExceptionLogpointTest {
 	@DisplayName("rejects a null expression with a hard error and never touches the VM")
 	void shouldRejectNullExpression() throws Exception {
 		final String result = tools.jdwp_set_exception_logpoint(
-			"java.lang.RuntimeException", null, null, null, null, null, null);
+			"java.lang.RuntimeException", null, null, null, null, null, null, null);
 
 		assertThat(result).startsWith("Error:").contains("expression is required");
 		verify(jdiService, never()).getVM();
@@ -64,7 +64,7 @@ class JDWPToolsSetExceptionLogpointTest {
 	@DisplayName("rejects a blank expression with a hard error and never touches the VM")
 	void shouldRejectBlankExpression() throws Exception {
 		final String result = tools.jdwp_set_exception_logpoint(
-			"java.lang.RuntimeException", "   ", null, null, null, null, null);
+			"java.lang.RuntimeException", "   ", null, null, null, null, null, null);
 
 		assertThat(result).startsWith("Error:").contains("expression is required");
 		verify(jdiService, never()).getVM();
@@ -75,11 +75,11 @@ class JDWPToolsSetExceptionLogpointTest {
 	void shouldRenderLogOnlyModeAndExpression() throws Exception {
 		final ReferenceType refType = mock(ReferenceType.class);
 		final ExceptionRequest req = mock(ExceptionRequest.class);
-		when(jdiService.findOrForceLoadClass("java.lang.RuntimeException")).thenReturn(refType);
+		when(jdiService.findLoadedClass("java.lang.RuntimeException")).thenReturn(refType);
 		when(erm.createExceptionRequest(refType, true, true)).thenReturn(req);
 
 		final String result = tools.jdwp_set_exception_logpoint(
-			"java.lang.RuntimeException", "$exception.getMessage()", null, null, null, null, null);
+			"java.lang.RuntimeException", "$exception.getMessage()", null, null, null, null, null, null);
 
 		assertThat(result).contains("Mode: log-only");
 		assertThat(result).contains("Expression: $exception.getMessage()");
@@ -90,12 +90,12 @@ class JDWPToolsSetExceptionLogpointTest {
 	void shouldPersistCondition() throws Exception {
 		final ReferenceType refType = mock(ReferenceType.class);
 		final ExceptionRequest req = mock(ExceptionRequest.class);
-		when(jdiService.findOrForceLoadClass("java.lang.RuntimeException")).thenReturn(refType);
+		when(jdiService.findLoadedClass("java.lang.RuntimeException")).thenReturn(refType);
 		when(erm.createExceptionRequest(refType, true, true)).thenReturn(req);
 
 		final String result = tools.jdwp_set_exception_logpoint(
 			"java.lang.RuntimeException", "$exception.getMessage()",
-			"$exception.getMessage() != null", null, null, null, null);
+			"$exception.getMessage() != null", null, null, null, null, null);
 
 		assertThat(result).contains("Condition: $exception.getMessage() != null");
 		// And the metadata is queryable by the listener path via the synthetic ID.
@@ -108,11 +108,11 @@ class JDWPToolsSetExceptionLogpointTest {
 	void shouldTreatBlankConditionAsNoCondition() throws Exception {
 		final ReferenceType refType = mock(ReferenceType.class);
 		final ExceptionRequest req = mock(ExceptionRequest.class);
-		when(jdiService.findOrForceLoadClass("java.lang.RuntimeException")).thenReturn(refType);
+		when(jdiService.findLoadedClass("java.lang.RuntimeException")).thenReturn(refType);
 		when(erm.createExceptionRequest(refType, true, true)).thenReturn(req);
 
 		final String result = tools.jdwp_set_exception_logpoint(
-			"java.lang.RuntimeException", "$exception", "   ", null, null, null, null);
+			"java.lang.RuntimeException", "$exception", "   ", null, null, null, null, null);
 
 		assertThat(result).doesNotContain("Condition:");
 		final Integer id = tracker.getAllExceptionBreakpoints().keySet().stream().findFirst().orElseThrow();
@@ -124,11 +124,11 @@ class JDWPToolsSetExceptionLogpointTest {
 	void shouldDefaultCaughtAndUncaughtToTrue() throws Exception {
 		final ReferenceType refType = mock(ReferenceType.class);
 		final ExceptionRequest req = mock(ExceptionRequest.class);
-		when(jdiService.findOrForceLoadClass("java.lang.RuntimeException")).thenReturn(refType);
+		when(jdiService.findLoadedClass("java.lang.RuntimeException")).thenReturn(refType);
 		when(erm.createExceptionRequest(refType, true, true)).thenReturn(req);
 
 		final String result = tools.jdwp_set_exception_logpoint(
-			"java.lang.RuntimeException", "$exception", null, null, null, null, null);
+			"java.lang.RuntimeException", "$exception", null, null, null, null, null, null);
 
 		assertThat(result).contains("Caught: true").contains("Uncaught: true");
 		verify(erm).createExceptionRequest(refType, true, true);
@@ -138,11 +138,11 @@ class JDWPToolsSetExceptionLogpointTest {
 	@DisplayName("deferred path — registers a ClassPrepareRequest when the exception class is unloaded")
 	void shouldDeferWhenExceptionClassIsUnloaded() throws Exception {
 		final ClassPrepareRequest cpr = mock(ClassPrepareRequest.class);
-		when(jdiService.findOrForceLoadClass("com.example.MyException")).thenReturn(null);
+		when(jdiService.findLoadedClass("com.example.MyException")).thenReturn(null);
 		when(erm.createClassPrepareRequest()).thenReturn(cpr);
 
 		final String result = tools.jdwp_set_exception_logpoint(
-			"com.example.MyException", "$exception", "$exception != null", null, null, null, null);
+			"com.example.MyException", "$exception", "$exception != null", null, null, null, null, null);
 
 		assertThat(result).startsWith("Exception breakpoint deferred");
 		assertThat(result).contains("Mode: log-only");
@@ -159,7 +159,7 @@ class JDWPToolsSetExceptionLogpointTest {
 	@DisplayName("rejects an unknown triggerBreakpointId without touching the VM")
 	void shouldRejectUnknownTrigger() throws Exception {
 		final String result = tools.jdwp_set_exception_logpoint(
-			"java.lang.RuntimeException", "$exception", null, null, null, 999, null);
+			"java.lang.RuntimeException", "$exception", null, null, null, 999, null, null);
 
 		assertThat(result).startsWith("Error:").contains("Trigger breakpoint #999");
 		verify(jdiService, never()).getVM();
@@ -170,13 +170,13 @@ class JDWPToolsSetExceptionLogpointTest {
 	void shouldAcceptKnownTriggerAndEmbedChainSuffix() throws Exception {
 		final ReferenceType refType = mock(ReferenceType.class);
 		final ExceptionRequest req = mock(ExceptionRequest.class);
-		when(jdiService.findOrForceLoadClass("java.lang.RuntimeException")).thenReturn(refType);
+		when(jdiService.findLoadedClass("java.lang.RuntimeException")).thenReturn(refType);
 		when(erm.createExceptionRequest(refType, true, true)).thenReturn(req);
 
 		final int triggerId = tracker.registerBreakpoint(mock(BreakpointRequest.class));
 
 		final String result = tools.jdwp_set_exception_logpoint(
-			"java.lang.RuntimeException", "$exception", null, null, null, triggerId, true);
+			"java.lang.RuntimeException", "$exception", null, null, null, triggerId, true, null);
 
 		assertThat(result).contains("Chain: trigger=#" + triggerId).contains("one-shot");
 	}

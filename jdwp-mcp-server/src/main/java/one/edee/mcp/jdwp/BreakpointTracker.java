@@ -45,15 +45,13 @@ import java.util.concurrent.atomic.AtomicInteger;
  *       removal that spans both maps, {@code clearAll}, and the pending-side registrations whose
  *       atomicity matters for {@link #tryPromotePending}'s recheck-and-mutate critical section.</li>
  *   <li>{@link #tryPromotePending} is the documented exception to the "single critical section"
- *       pattern: it cannot hold the tracker monitor across
- *       {@link JDIConnectionService#findOrForceLoadClass}, because that call parks the worker
- *       inside a target-VM {@code invokeMethod} until the JDI event listener drains the resulting
- *       events — and the listener itself takes this monitor in
- *       {@link #promotePendingFieldsForClass}. So {@code tryPromotePending} snapshots the pending
- *       maps under the monitor, releases it across each per-entry force-load round-trip, then
- *       re-acquires it for a recheck-and-mutate critical section. The {@code promote*} methods
- *       are the authoritative already-promoted guard; losers in that race tear down their orphan
- *       JDI request.</li>
+ *       pattern: it snapshots the pending maps under the monitor, releases it across each
+ *       per-entry passive lookup (via {@link JDIConnectionService#findLoadedClass}), then
+ *       re-acquires it for a recheck-and-mutate critical section. The lookup is intentionally
+ *       passive — driving force-loads from this safety net was the root cause of the
+ *       deferred-class-load deadlock (GH issue #2) and the breakpoint-induced behaviour change
+ *       (GH issue #3). The {@code promote*} methods are the authoritative already-promoted guard;
+ *       losers in the race tear down their orphan JDI request.</li>
  *   <li>The {@code lastBreakpoint*} fields are {@code volatile} for cross-thread visibility from
  *       the JDI listener thread to MCP worker threads.</li>
  * </ul>
@@ -873,38 +871,38 @@ public class BreakpointTracker {
 
     /**
      * Re-attempts to promote every pending entry — line BPs, exception BPs, and field watchpoints —
-     * by re-querying `vm.classesByName(...)`. This is the safety net for cases where
-     * {@link ClassPrepareRequest} does not fire — most notably bootstrap classes loaded by the JVM
-     * before any debugger event is delivered.
+     * by re-querying {@link JDIConnectionService#findLoadedClass} (passive,
+     * side-effect free). This is the safety net for cases where {@link ClassPrepareRequest} does
+     * not fire — most notably bootstrap classes loaded by the JVM before any debugger event is
+     * delivered.
      * <p>
      * Called from {@link JDIConnectionService#getVM()} (every MCP tool call) and
      * from {@link JdiEventListener} (after every JDI event), so any user interaction
      * gives pending items another chance to bind. Best-effort; transient failures are logged at
      * debug and the item stays pending for the next retry.
      * <p>
+     * The lookup is intentionally <i>passive</i>: it never invokes {@code Class.forName} in the
+     * target VM. The safety net's job is to catch classes that loaded while we weren't looking,
+     * not to drive new loads. Driving loads here was the root cause of the deferred-class-load
+     * deadlock pattern (GH issue #2) and changed target-application behaviour (GH issue #3); both
+     * are eliminated by making this strictly observational.
+     * <p>
      * Field BPs additionally roll back any partially-created JDI requests if promotion fails
      * mid-flight (a {@code BOTH}-mode entry creates two requests, either of which can throw) and
      * mark the pending entry failed so subsequent cycles do not retry the same orphan-prone path.
      * <p>
-     * <b>Concurrency:</b> the method is intentionally not {@code synchronized}. Two monitors are
-     * relevant — the tracker monitor (this object) and the {@link JDIConnectionService} monitor.
-     * The pending maps are snapshotted under the tracker monitor here, then each pending entry is
-     * resolved by calling {@link JDIConnectionService#findOrForceLoadClass} <i>without</i> the
-     * tracker monitor held: that call can park inside a target-VM {@code invokeMethod} that only
-     * returns once our event listener drains the resulting events, and the listener takes this
-     * same tracker monitor in {@link #promotePendingFieldsForClass}. The per-entry mutation step
-     * re-acquires the tracker monitor with a recheck that the entry is still pending and that no
-     * other path (listener or a sibling {@link #tryPromotePending} caller) has already promoted
-     * it — the recheck is defense in depth on top of the already-promoted guard inside the
-     * promote* methods themselves. Orphan JDI requests that lose the race are deleted from the
+     * <b>Concurrency:</b> the method is intentionally not {@code synchronized}. The pending maps
+     * are snapshotted under the tracker monitor here, then each entry's per-class lookup runs
+     * without the monitor (cheap and side-effect free), and the per-entry mutation step re-acquires
+     * the tracker monitor with a recheck that the entry is still pending and that no other path
+     * (listener or a sibling {@link #tryPromotePending} caller) has already promoted it. The
+     * recheck is defense in depth on top of the already-promoted guard inside the promote* methods
+     * themselves. Orphan JDI requests that lose the race are deleted from the
      * {@link EventRequestManager}.
      *
      * @return number of items promoted in this call
      */
-    public int tryPromotePending(
-        @Nullable JDIConnectionService jdiService,
-        @Nullable ThreadReference preferredThread
-    ) {
+    public int tryPromotePending(@Nullable JDIConnectionService jdiService) {
         if (jdiService == null) {
             return 0;
         }
@@ -940,7 +938,11 @@ public class BreakpointTracker {
             }
 
             try {
-                final ReferenceType refType = jdiService.findOrForceLoadClass(pending.getClassName(), preferredThread);
+                // Passive lookup only — the listener path is the authoritative promoter for the
+                // natural-load case, and force-loading from the safety net would re-introduce the
+                // very side effects this codebase moved away from in GH issue #3 (early <clinit>,
+                // masked lazy-load diagnostics, the deferred-class-load deadlock pattern).
+                final ReferenceType refType = jdiService.findLoadedClass(pending.getClassName());
                 if (refType == null) {
                     continue;
                 }
@@ -990,7 +992,7 @@ public class BreakpointTracker {
             }
 
             try {
-                final ReferenceType refType = jdiService.findOrForceLoadClass(pending.getExceptionClass(), preferredThread);
+                final ReferenceType refType = jdiService.findLoadedClass(pending.getExceptionClass());
                 if (refType == null) {
                     continue;
                 }
@@ -1031,8 +1033,7 @@ public class BreakpointTracker {
                 continue;
             }
             try {
-                final ReferenceType refType = jdiService.findOrForceLoadClass(
-                    pending.getSpec().className(), preferredThread);
+                final ReferenceType refType = jdiService.findLoadedClass(pending.getSpec().className());
                 if (refType == null) {
                     continue;
                 }

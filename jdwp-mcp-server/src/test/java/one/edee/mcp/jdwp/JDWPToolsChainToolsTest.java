@@ -305,7 +305,7 @@ class JDWPToolsChainToolsTest {
 		@Test
 		@DisplayName("rejects an unknown trigger")
 		void shouldRejectSetBreakpointWithUnknownTrigger() throws Exception {
-			String result = tools.jdwp_set_breakpoint("com.example.Foo", 10, "all", null, 999, false);
+			String result = tools.jdwp_set_breakpoint("com.example.Foo", 10, "all", null, 999, false, null);
 
 			assertThat(result).startsWith("Error:").contains("Trigger breakpoint #999");
 		}
@@ -314,11 +314,11 @@ class JDWPToolsChainToolsTest {
 		@DisplayName("accepts a pending trigger when setting a new breakpoint")
 		void shouldAcceptPendingTriggerWhenSettingBreakpoint() throws Exception {
 			int pendingTriggerId = tracker.registerPendingBreakpoint("com.example.Trigger", 10, 2, "ALL");
-			when(jdiService.findOrForceLoadClass("com.example.Foo")).thenReturn(null);
+			when(jdiService.findLoadedClass("com.example.Foo")).thenReturn(null);
 			when(vm.classesByName("com.example.Foo")).thenReturn(List.of());
 			when(erm.createClassPrepareRequest()).thenReturn(mock(com.sun.jdi.request.ClassPrepareRequest.class));
 
-			String result = tools.jdwp_set_breakpoint("com.example.Foo", 99, "all", null, pendingTriggerId, false);
+			String result = tools.jdwp_set_breakpoint("com.example.Foo", 99, "all", null, pendingTriggerId, false, null);
 
 			assertThat(result).doesNotStartWith("Error");
 			assertThat(result).contains("chain: trigger=#" + pendingTriggerId);
@@ -330,13 +330,13 @@ class JDWPToolsChainToolsTest {
 			BreakpointRequest createdBp = mock(BreakpointRequest.class);
 			ReferenceType refType = mock(ReferenceType.class);
 			Location loc = mock(Location.class);
-			when(jdiService.findOrForceLoadClass("com.example.Foo")).thenReturn(refType);
+			when(jdiService.findLoadedClass("com.example.Foo")).thenReturn(refType);
 			when(refType.locationsOfLine(10)).thenReturn(List.of(loc));
 			when(erm.createBreakpointRequest(loc)).thenReturn(createdBp);
 
 			int triggerId = tracker.registerBreakpoint(mock(BreakpointRequest.class));
 
-			String result = tools.jdwp_set_breakpoint("com.example.Foo", 10, "all", null, triggerId, true);
+			String result = tools.jdwp_set_breakpoint("com.example.Foo", 10, "all", null, triggerId, true, null);
 
 			assertThat(result).contains("chain: trigger=#" + triggerId)
 				.contains("one-shot");
@@ -345,13 +345,13 @@ class JDWPToolsChainToolsTest {
 		@Test
 		@DisplayName("embeds chain info in the pending breakpoint response")
 		void shouldEmbedChainInfoInPendingBreakpointResponse() throws Exception {
-			when(jdiService.findOrForceLoadClass("com.example.Foo")).thenReturn(null);
+			when(jdiService.findLoadedClass("com.example.Foo")).thenReturn(null);
 			when(vm.classesByName("com.example.Foo")).thenReturn(List.of());
 			when(erm.createClassPrepareRequest()).thenReturn(mock(com.sun.jdi.request.ClassPrepareRequest.class));
 
 			int triggerId = tracker.registerBreakpoint(mock(BreakpointRequest.class));
 
-			String result = tools.jdwp_set_breakpoint("com.example.Foo", 10, "all", null, triggerId, false);
+			String result = tools.jdwp_set_breakpoint("com.example.Foo", 10, "all", null, triggerId, false, null);
 
 			assertThat(result).contains("deferred")
 				.contains("chain: trigger=#" + triggerId)
@@ -364,13 +364,13 @@ class JDWPToolsChainToolsTest {
 			BreakpointRequest createdBp = mock(BreakpointRequest.class);
 			ReferenceType refType = mock(ReferenceType.class);
 			Location loc = mock(Location.class);
-			when(jdiService.findOrForceLoadClass("com.example.Foo")).thenReturn(refType);
+			when(jdiService.findLoadedClass("com.example.Foo")).thenReturn(refType);
 			when(refType.locationsOfLine(10)).thenReturn(List.of(loc));
 			when(erm.createBreakpointRequest(loc)).thenReturn(createdBp);
 
 			int triggerId = tracker.registerBreakpoint(mock(BreakpointRequest.class));
 
-			tools.jdwp_set_breakpoint("com.example.Foo", 10, "all", null, triggerId, false);
+			tools.jdwp_set_breakpoint("com.example.Foo", 10, "all", null, triggerId, false, null);
 
 			// The request must NEVER be enabled while chained — neither setEnabled(true) nor the
 			// convenience enable() may be called. JDI delivers events the instant a request is
@@ -399,11 +399,11 @@ class JDWPToolsChainToolsTest {
 			BreakpointRequest createdBp = mock(BreakpointRequest.class);
 			ReferenceType refType = mock(ReferenceType.class);
 			Location loc = mock(Location.class);
-			when(jdiService.findOrForceLoadClass("com.example.Foo")).thenReturn(refType);
+			when(jdiService.findLoadedClass("com.example.Foo")).thenReturn(refType);
 			when(refType.locationsOfLine(10)).thenReturn(List.of(loc));
 			when(erm.createBreakpointRequest(loc)).thenReturn(createdBp);
 
-			tools.jdwp_set_breakpoint("com.example.Foo", 10, "all", null, null, false);
+			tools.jdwp_set_breakpoint("com.example.Foo", 10, "all", null, null, false, null);
 
 			org.mockito.InOrder inOrder = org.mockito.Mockito.inOrder(createdBp);
 			inOrder.verify(createdBp).setSuspendPolicy(EventRequest.SUSPEND_ALL);
@@ -419,7 +419,7 @@ class JDWPToolsChainToolsTest {
 		@DisplayName("rejects an unknown trigger")
 		void shouldRejectExceptionBpWithUnknownTrigger() throws Exception {
 			String result = tools.jdwp_set_exception_breakpoint(
-				"java.lang.RuntimeException", null, null, 999, false);
+				"java.lang.RuntimeException", null, null, 999, false, null);
 
 			assertThat(result).startsWith("Error:").contains("Trigger breakpoint #999");
 		}
@@ -429,13 +429,13 @@ class JDWPToolsChainToolsTest {
 		void shouldEmbedChainInfoInExceptionBreakpointResponse() throws Exception {
 			ReferenceType refType = mock(ReferenceType.class);
 			ExceptionRequest exReq = mock(ExceptionRequest.class);
-			when(jdiService.findOrForceLoadClass("java.lang.RuntimeException")).thenReturn(refType);
+			when(jdiService.findLoadedClass("java.lang.RuntimeException")).thenReturn(refType);
 			when(erm.createExceptionRequest(refType, true, true)).thenReturn(exReq);
 
 			int triggerId = tracker.registerBreakpoint(mock(BreakpointRequest.class));
 
 			String result = tools.jdwp_set_exception_breakpoint(
-				"java.lang.RuntimeException", null, null, triggerId, false);
+				"java.lang.RuntimeException", null, null, triggerId, false, null);
 
 			assertThat(result).contains("Chain: trigger=#" + triggerId)
 				.contains("sticky");
@@ -446,13 +446,13 @@ class JDWPToolsChainToolsTest {
 		void shouldDisableActiveExceptionRequestWhenChained() throws Exception {
 			ReferenceType refType = mock(ReferenceType.class);
 			ExceptionRequest exReq = mock(ExceptionRequest.class);
-			when(jdiService.findOrForceLoadClass("java.lang.RuntimeException")).thenReturn(refType);
+			when(jdiService.findLoadedClass("java.lang.RuntimeException")).thenReturn(refType);
 			when(erm.createExceptionRequest(refType, true, true)).thenReturn(exReq);
 
 			int triggerId = tracker.registerBreakpoint(mock(BreakpointRequest.class));
 
 			tools.jdwp_set_exception_breakpoint(
-				"java.lang.RuntimeException", null, null, triggerId, false);
+				"java.lang.RuntimeException", null, null, triggerId, false, null);
 
 			// The exception request must never be enabled while a chain is wired up — same race
 			// window as the line-BP variant above.

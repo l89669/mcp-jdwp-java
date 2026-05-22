@@ -484,7 +484,7 @@ public class JDIConnectionService {
         // is never delivered. Best-effort; failures are swallowed. Runs outside the service monitor
         // (see class-level Javadoc for the rationale).
         try {
-            breakpointTracker.tryPromotePending(this, null);
+            breakpointTracker.tryPromotePending(this);
         } catch (Exception e) {
             log.debug("[JDI] Pending promotion failed: {}", e.getMessage());
         }
@@ -493,10 +493,10 @@ public class JDIConnectionService {
 
     /**
      * Returns the raw VM reference without triggering opportunistic promotion. Used by
-     * {@link BreakpointTracker#tryPromotePending(JDIConnectionService, ThreadReference)} to avoid
-     * recursion. Reads the {@code vm} field directly without taking the service monitor — the
-     * field is written under the monitor and read here as a plain reference; a stale read returns
-     * a recently-disposed {@link VirtualMachine} whose JDI calls throw {@link com.sun.jdi.VMDisconnectedException},
+     * {@link BreakpointTracker#tryPromotePending(JDIConnectionService)} to avoid recursion. Reads
+     * the {@code vm} field directly without taking the service monitor — the field is written under
+     * the monitor and read here as a plain reference; a stale read returns a recently-disposed
+     * {@link VirtualMachine} whose JDI calls throw {@link com.sun.jdi.VMDisconnectedException},
      * which the caller already handles.
      */
     @Nullable
@@ -1019,11 +1019,59 @@ public class JDIConnectionService {
     }
 
     /**
+     * Passive class lookup — checks whether {@code className} is already loaded in the target VM
+     * via two side-effect-free probes ({@link VirtualMachine#classesByName} and a full
+     * {@code allClasses()} scan) and returns the matching {@link ReferenceType} or {@code null}
+     * if the class is not yet loaded.
+     *
+     * <p>Unlike {@link #findOrForceLoadClass}, this method <i>never</i> invokes
+     * {@code Class.forName} in the target VM, so it cannot trigger {@code <clinit>}, cannot
+     * cascade-load dependencies, and cannot park the calling thread inside a target-VM
+     * {@code invokeMethod}. This is the default lookup used by every set-breakpoint code path —
+     * a debugger should observe class loads, not cause them. Callers that genuinely need to make
+     * a class appear (typically the bootstrap-class case for exception BPs, or expression /
+     * watcher evaluation that needs a specific helper class) must opt in via
+     * {@link #findOrForceLoadClass}.
+     */
+    @Nullable
+    public ReferenceType findLoadedClass(String className) {
+        final VirtualMachine vmRef;
+        synchronized (this) {
+            if (vm == null) {
+                return null;
+            }
+            vmRef = vm;
+        }
+        try {
+            final List<ReferenceType> existing = vmRef.classesByName(className);
+            if (!existing.isEmpty()) {
+                return existing.get(0);
+            }
+            // Fallback: full scan — sometimes catches bootstrap classes the indexed lookup misses.
+            return vmRef.allClasses().stream()
+                .filter(rt -> rt.name().equals(className))
+                .findFirst()
+                .orElse(null);
+        } catch (Exception e) {
+            log.debug("[JDI] Passive lookup for '{}' failed: {}", className, e.getMessage());
+            return null;
+        }
+    }
+
+    /**
      * Locates a class in the target VM, force-loading it via {@code Class.forName(name)} if not yet
      * visible. Solves the bootstrap-class problem: classes like {@code java.lang.IllegalStateException}
      * are not visible to {@link VirtualMachine#classesByName} until first referenced, and their
      * {@link com.sun.jdi.event.ClassPrepareEvent} is not delivered to JDI clients. Returns
      * {@code null} if the class cannot be found or force-loaded.
+     *
+     * <p><b>This method has observable side effects on the target application</b> — running
+     * {@code <clinit>} triggers static-field init, cascade-loads dependencies, may register
+     * listeners and open connections, and can mask the very lazy-load diagnostics users attach a
+     * debugger to investigate. It is therefore <i>opt-in</i>: every set-breakpoint / set-logpoint
+     * MCP tool defaults to the passive {@link #findLoadedClass} path; callers must explicitly pass
+     * {@code forceLoad=true} (or call this method directly from a non-breakpoint code path such as
+     * expression evaluation) to accept the trade-off.
      *
      * <p>{@code preferredThread}, if non-null, must be suspended at a JDI method-invocation event
      * (breakpoint, step, exception, class prepare) — JDI cannot invoke methods on threads

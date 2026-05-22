@@ -3,7 +3,6 @@ package one.edee.mcp.jdwp;
 import com.sun.jdi.Field;
 import com.sun.jdi.Location;
 import com.sun.jdi.ReferenceType;
-import com.sun.jdi.ThreadReference;
 import com.sun.jdi.VirtualMachine;
 import com.sun.jdi.request.AccessWatchpointRequest;
 import com.sun.jdi.request.BreakpointRequest;
@@ -27,19 +26,22 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 /**
- * Regression guard for the deferred-class-load monitor cycle: while a worker thread is parked
- * inside {@link JDIConnectionService#findOrForceLoadClass} (a synchronous JDI invoke that cannot
- * complete until the event listener drains the event queue), the JDI listener thread must still
- * be able to acquire the {@link BreakpointTracker} monitor and finish
- * {@link BreakpointTracker#promotePendingFieldsForClass}. Pre-fix the listener blocks on the
- * monitor held by the worker and the target VM permanently wedges; post-fix the promotion path
- * does its JDI roundtrip with no tracker monitor held, so the listener proceeds immediately.
+ * Regression guard for the monitor-release contract in {@link BreakpointTracker#tryPromotePending}:
+ * the tracker monitor must NOT be held across the per-entry
+ * {@link JDIConnectionService#findLoadedClass} lookup, so a concurrent listener-side
+ * {@link BreakpointTracker#promotePendingFieldsForClass} (which acquires the same monitor) can
+ * proceed in parallel. Pre-fix, the worker held the monitor across the lookup and the listener
+ * blocked on it; post-fix, the listener runs to completion immediately while the worker is mid-
+ * lookup. The simulated lookup uses a latch to keep the worker suspended past the listener's
+ * observation window, mimicking a slow {@code vm.allClasses()} scan or — historically — a parked
+ * {@code Class.forName} invoke. Both scenarios are covered by the same shape: the property under
+ * test is "monitor released across the lookup", not the specific reason the lookup is slow.
  *
- * <p>Three variants cover the three monitor-held-across-invoke call sites in
- * {@code tryPromotePending} — line BP, exception BP, and field BP — so a partial fix that only
- * addresses one path is caught by the other two. Each variant also asserts the post-release
- * behaviour: once the simulated JDI invoke returns, the worker must finish promotion (active
- * entry visible under the same synthetic id) instead of silently no-oping.
+ * <p>Three variants cover the three call sites in {@code tryPromotePending} — line BP, exception
+ * BP, and field BP — so a partial regression that only re-introduces the bug on one path is
+ * caught by the other two. Each variant also asserts the post-release behaviour: once the
+ * simulated lookup returns, the worker must finish promotion (active entry visible under the
+ * same synthetic id) instead of silently no-oping.
  */
 class BreakpointTrackerPromotionDeadlockTest {
 
@@ -132,8 +134,8 @@ class BreakpointTrackerPromotionDeadlockTest {
 	}
 
 	/**
-	 * Recheck-race coverage for the field BP arm: while the worker is parked inside
-	 * {@link JDIConnectionService#findOrForceLoadClass}, the JDI listener calls
+	 * Recheck-race coverage for the field BP arm: while the worker is mid-lookup in
+	 * {@link JDIConnectionService#findLoadedClass}, the JDI listener calls
 	 * {@link BreakpointTracker#promotePendingFieldsForClass} on the same {@code ReferenceType} and
 	 * wins the race. When the worker eventually re-acquires the tracker monitor, its recheck must
 	 * observe that the pending entry has been removed and return 0 promotions instead of double-
@@ -169,7 +171,7 @@ class BreakpointTrackerPromotionDeadlockTest {
 
 		CountDownLatch workerInsideInvoke = new CountDownLatch(1);
 		CountDownLatch releaseWorker = new CountDownLatch(1);
-		when(service.findOrForceLoadClass(eq("com.x.Foo"), any()))
+		when(service.findLoadedClass(eq("com.x.Foo")))
 			.thenAnswer(inv -> {
 				workerInsideInvoke.countDown();
 				if (!releaseWorker.await(WORKER_RELEASE_TIMEOUT_S, TimeUnit.SECONDS)) {
@@ -180,7 +182,7 @@ class BreakpointTrackerPromotionDeadlockTest {
 
 		AtomicBoolean workerSawPromotion = new AtomicBoolean(false);
 		Thread worker = new Thread(() -> {
-			int promoted = tracker.tryPromotePending(service, null);
+			int promoted = tracker.tryPromotePending(service);
 			workerSawPromotion.set(promoted > 0);
 		}, "field-recheck-race-worker");
 		worker.setDaemon(true);
@@ -211,10 +213,11 @@ class BreakpointTrackerPromotionDeadlockTest {
 	/**
 	 * Guards the outer-monitor decoupling between {@link JDIConnectionService} and
 	 * {@link BreakpointTracker#tryPromotePending}: {@code JDIConnectionService.getVM()} must NOT
-	 * hold the service monitor across the call to {@code tryPromotePending}, because that path can
-	 * park inside a JDI {@code invokeMethod} (force-loading a deferred class) for the duration of
-	 * the target-VM round-trip. Holding the monitor across that window would block every other
-	 * {@code getVM()} caller — and thus every other MCP tool call — until the invoke returns.
+	 * hold the service monitor across the call to {@code tryPromotePending}, because the promotion
+	 * path can stall for a while (the per-entry passive class lookup walks
+	 * {@code vm.allClasses()} which is O(loaded-classes) on the target VM). Holding the monitor
+	 * across that window would block every other {@code getVM()} caller — and thus every other
+	 * MCP tool call — until the slow lookup returns.
 	 *
 	 * <p>The connect / auto-reconnect work still runs under the monitor; only the opportunistic
 	 * promotion call is moved outside. A second {@code getVM()} caller must therefore make progress
@@ -233,8 +236,7 @@ class BreakpointTrackerPromotionDeadlockTest {
 
 		BreakpointTracker blockingTracker = new BreakpointTracker() {
 			@Override
-			public int tryPromotePending(@Nullable JDIConnectionService jdiService,
-			                             @Nullable ThreadReference preferredThread) {
+			public int tryPromotePending(@Nullable JDIConnectionService jdiService) {
 				workerInsideInvoke.countDown();
 				try {
 					if (!releaseWorker.await(WORKER_RELEASE_TIMEOUT_S, TimeUnit.SECONDS)) {
@@ -302,11 +304,11 @@ class BreakpointTrackerPromotionDeadlockTest {
 	}
 
 	/**
-	 * Drives the worker into a simulated parked-JDI-invoke and observes whether the listener-side
-	 * monitor acquire can make progress. Pre-fix the listener blocks on the tracker monitor held
-	 * by the worker and stays alive past {@link #LISTENER_OBSERVATION_WINDOW_MS}; post-fix the
-	 * listener completes immediately and the assertion below passes. Also asserts both threads
-	 * terminate cleanly after the release latch.
+	 * Drives the worker into a simulated slow per-entry lookup and observes whether the listener-
+	 * side monitor acquire can make progress. Pre-fix the listener blocks on the tracker monitor
+	 * held by the worker and stays alive past {@link #LISTENER_OBSERVATION_WINDOW_MS}; post-fix
+	 * the listener completes immediately and the assertion below passes. Also asserts both
+	 * threads terminate cleanly after the release latch.
 	 */
 	private static void runDeadlockProbe(BreakpointTracker tracker, JDIConnectionService service,
 	                                     VirtualMachine vm, EventRequestManager erm,
@@ -314,10 +316,11 @@ class BreakpointTrackerPromotionDeadlockTest {
 		CountDownLatch workerInsideInvoke = new CountDownLatch(1);
 		CountDownLatch releaseWorker = new CountDownLatch(1);
 
-		// Simulate the parked JDI invoke: signal that the worker is "inside JDI", then block
-		// until the listener side has had its chance to run. The fix moves this call outside the
-		// BreakpointTracker monitor, so the listener can acquire the monitor while we wait here.
-		when(service.findOrForceLoadClass(eq("com.x.Foo"), any()))
+		// Simulate a slow per-entry lookup: signal that the worker is "inside the lookup", then
+		// block until the listener side has had its chance to run. The contract under test is that
+		// the call happens OUTSIDE the BreakpointTracker monitor, so the listener can acquire the
+		// monitor while we wait here.
+		when(service.findLoadedClass(eq("com.x.Foo")))
 			.thenAnswer(inv -> {
 				workerInsideInvoke.countDown();
 				if (!releaseWorker.await(WORKER_RELEASE_TIMEOUT_S, TimeUnit.SECONDS)) {
@@ -326,7 +329,7 @@ class BreakpointTrackerPromotionDeadlockTest {
 				return refType;
 			});
 
-		Thread worker = new Thread(() -> tracker.tryPromotePending(service, null), "deadlock-probe-worker");
+		Thread worker = new Thread(() -> tracker.tryPromotePending(service), "deadlock-probe-worker");
 		worker.setDaemon(true);
 		worker.start();
 
@@ -355,7 +358,7 @@ class BreakpointTrackerPromotionDeadlockTest {
 
 		assertThat(listenerBlockedOnMonitor)
 			.as("promotePendingFieldsForClass must not be BLOCKED on the BreakpointTracker monitor "
-				+ "while a worker is parked inside findOrForceLoadClass — listener state observed: %s",
+				+ "while a worker is mid-lookup inside findLoadedClass — listener state observed: %s",
 				listenerState)
 			.isFalse();
 		assertThat(worker.isAlive())

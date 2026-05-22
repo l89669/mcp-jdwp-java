@@ -117,7 +117,7 @@ class JDWPToolsBugCaptureTest {
 		when(vm.eventRequestManager()).thenReturn(erm);
 		when(erm.createClassPrepareRequest()).thenReturn(cpr);
 		// First lookup returns nothing → enter the pending branch
-		when(jdiService.findOrForceLoadClass("com.example.MyClass")).thenReturn(null);
+		when(jdiService.findLoadedClass("com.example.MyClass")).thenReturn(null);
 		// The recheck inside the pending branch finds the class — race window
 		when(vm.classesByName("com.example.MyClass")).thenReturn(List.of(refType));
 		// locationsOfLine throws AbsentInformationException
@@ -126,7 +126,7 @@ class JDWPToolsBugCaptureTest {
 		when(breakpointTracker.registerPendingBreakpoint(anyString(), anyInt(), anyInt(), anyString()))
 			.thenReturn(99);
 
-		String result = tools.jdwp_set_breakpoint("com.example.MyClass", 42, "all", null, null, null);
+		String result = tools.jdwp_set_breakpoint("com.example.MyClass", 42, "all", null, null, null, null);
 
 		// User-facing error message preserved
 		assertThat(result).startsWith("Error:");
@@ -149,13 +149,13 @@ class JDWPToolsBugCaptureTest {
 		when(jdiService.getVM()).thenReturn(vm);
 		when(vm.eventRequestManager()).thenReturn(erm);
 		when(erm.createClassPrepareRequest()).thenReturn(cpr);
-		when(jdiService.findOrForceLoadClass("com.example.MyClass")).thenReturn(null);
+		when(jdiService.findLoadedClass("com.example.MyClass")).thenReturn(null);
 		when(vm.classesByName("com.example.MyClass")).thenReturn(List.of(refType));
 		when(refType.locationsOfLine(42)).thenThrow(new AbsentInformationException());
 		when(breakpointTracker.registerPendingBreakpoint(anyString(), anyInt(), anyInt(), anyString()))
 			.thenReturn(77);
 
-		String result = tools.jdwp_set_logpoint("com.example.MyClass", 42, "\"x=\" + x", null);
+		String result = tools.jdwp_set_logpoint("com.example.MyClass", 42, "\"x=\" + x", null, null);
 
 		assertThat(result).startsWith("Error:");
 		assertThat(result).contains("debug info");

@@ -327,7 +327,7 @@ class BreakpointTrackerFieldBreakpointTest {
 		AccessWatchpointRequest accessReq = mock(AccessWatchpointRequest.class);
 		when(service.getRawVM()).thenReturn(vm);
 		when(vm.eventRequestManager()).thenReturn(erm);
-		when(service.findOrForceLoadClass(eq("com.x.Foo"), any())).thenReturn(refType);
+		when(service.findLoadedClass(eq("com.x.Foo"))).thenReturn(refType);
 		when(refType.allFields()).thenReturn(List.of(field));
 		when(field.name()).thenReturn("bar");
 		when(field.isStatic()).thenReturn(false);
@@ -338,7 +338,7 @@ class BreakpointTrackerFieldBreakpointTest {
 			"com.x.Foo", "bar", BreakpointTracker.FieldWatchMode.BOTH, null, null, null);
 		int id = tracker.registerPendingFieldBreakpoint(spec);
 
-		int promoted = tracker.tryPromotePending(service, null);
+		int promoted = tracker.tryPromotePending(service);
 
 		assertThat(promoted).isZero();
 		// Pending entry stays in the map so it surfaces in jdwp_overview(types="field_breakpoint"), but its
@@ -379,13 +379,13 @@ class BreakpointTrackerFieldBreakpointTest {
 
 		// While the worker is parked, simulate the listener-side promotion: remove the pending
 		// entry and insert the listener's access request under the same synthetic id.
-		when(service.findOrForceLoadClass(eq("com.x.Foo"), any()))
+		when(service.findLoadedClass(eq("com.x.Foo")))
 			.thenAnswer(inv -> {
 				tracker.promotePendingFieldToActive(pendingId, listenerAccessReq, null);
 				return refType;
 			});
 
-		int promoted = tracker.tryPromotePending(service, null);
+		int promoted = tracker.tryPromotePending(service);
 
 		assertThat(promoted)
 			.as("worker must observe that the pending entry is gone and skip its own creation path")
@@ -399,7 +399,7 @@ class BreakpointTrackerFieldBreakpointTest {
 	/**
 	 * Recheck-race coverage for the field BP arm when the pending entry has been marked failed
 	 * (e.g. by a concurrent classifier that detected an ambiguous field) while the worker is
-	 * parked in {@code findOrForceLoadClass}. The worker's recheck observes the non-null
+	 * parked in {@code findLoadedClass}. The worker's recheck observes the non-null
 	 * failure reason and skips creation — both to avoid duplicating the classifier's work and to
 	 * preserve the failure reason for {@code jdwp_overview} rendering.
 	 */
@@ -417,13 +417,13 @@ class BreakpointTrackerFieldBreakpointTest {
 			"com.x.Foo", "bar", BreakpointTracker.FieldWatchMode.ACCESS, null, null, null);
 		int pendingId = tracker.registerPendingFieldBreakpoint(spec);
 
-		when(service.findOrForceLoadClass(eq("com.x.Foo"), any()))
+		when(service.findLoadedClass(eq("com.x.Foo")))
 			.thenAnswer(inv -> {
 				tracker.markPendingFieldFailed(pendingId, "ambiguous field — classifier marked failed");
 				return refType;
 			});
 
-		int promoted = tracker.tryPromotePending(service, null);
+		int promoted = tracker.tryPromotePending(service);
 
 		assertThat(promoted).isZero();
 		assertThat(tracker.getAllPendingFieldBreakpoints().get(pendingId).getFailureReason())

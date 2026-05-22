@@ -60,11 +60,11 @@ class JDWPToolsSetExceptionBreakpointTest {
 	void shouldDefaultCaughtAndUncaughtToTrue() throws Exception {
 		final ReferenceType refType = mock(ReferenceType.class);
 		final ExceptionRequest req = mock(ExceptionRequest.class);
-		when(jdiService.findOrForceLoadClass("java.lang.RuntimeException")).thenReturn(refType);
+		when(jdiService.findLoadedClass("java.lang.RuntimeException")).thenReturn(refType);
 		when(erm.createExceptionRequest(refType, true, true)).thenReturn(req);
 
 		final String result = tools.jdwp_set_exception_breakpoint(
-			"java.lang.RuntimeException", null, null, null, null);
+			"java.lang.RuntimeException", null, null, null, null, null);
 
 		assertThat(result).contains("Caught: true").contains("Uncaught: true").contains("Mode: suspend");
 		verify(erm).createExceptionRequest(refType, true, true);
@@ -74,11 +74,11 @@ class JDWPToolsSetExceptionBreakpointTest {
 	@DisplayName("deferred path — registers a ClassPrepareRequest when the exception class is unloaded")
 	void shouldDeferWhenExceptionClassIsUnloaded() throws Exception {
 		final ClassPrepareRequest cpr = mock(ClassPrepareRequest.class);
-		when(jdiService.findOrForceLoadClass("com.example.MyException")).thenReturn(null);
+		when(jdiService.findLoadedClass("com.example.MyException")).thenReturn(null);
 		when(erm.createClassPrepareRequest()).thenReturn(cpr);
 
 		final String result = tools.jdwp_set_exception_breakpoint(
-			"com.example.MyException", null, null, null, null);
+			"com.example.MyException", null, null, null, null, null);
 
 		assertThat(result).startsWith("Exception breakpoint deferred");
 		assertThat(result).contains("com.example.MyException");
@@ -90,7 +90,7 @@ class JDWPToolsSetExceptionBreakpointTest {
 	@DisplayName("rejects an unknown triggerBreakpointId without touching the VM")
 	void shouldRejectUnknownTrigger() throws Exception {
 		final String result = tools.jdwp_set_exception_breakpoint(
-			"java.lang.RuntimeException", null, null, 999, null);
+			"java.lang.RuntimeException", null, null, 999, null, null);
 
 		assertThat(result).startsWith("Error:").contains("Trigger breakpoint #999");
 	}
@@ -100,13 +100,13 @@ class JDWPToolsSetExceptionBreakpointTest {
 	void shouldAcceptKnownTriggerAndEmbedChainSuffix() throws Exception {
 		final ReferenceType refType = mock(ReferenceType.class);
 		final ExceptionRequest req = mock(ExceptionRequest.class);
-		when(jdiService.findOrForceLoadClass("java.lang.RuntimeException")).thenReturn(refType);
+		when(jdiService.findLoadedClass("java.lang.RuntimeException")).thenReturn(refType);
 		when(erm.createExceptionRequest(refType, true, true)).thenReturn(req);
 
 		final int triggerId = tracker.registerBreakpoint(mock(BreakpointRequest.class));
 
 		final String result = tools.jdwp_set_exception_breakpoint(
-			"java.lang.RuntimeException", null, null, triggerId, true);
+			"java.lang.RuntimeException", null, null, triggerId, true, null);
 
 		assertThat(result).contains("Chain: trigger=#" + triggerId).contains("one-shot");
 	}
