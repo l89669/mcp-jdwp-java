@@ -59,4 +59,46 @@ class JDIConnectionServiceReconnectWatcherPreservationTest {
 			.as("watcher count after failed reconnect")
 			.hasSize(1);
 	}
+
+	/**
+	 * Pins the recoverable-failure contract: when the fresh attach fails inside
+	 * {@code reconnectPreservingSpecs}, the tracker must be left in a clean pure-pending state
+	 * (no JDI request handles tied to the disposed VM) so the agent's retry can safely
+	 * re-snapshot. Otherwise the tracker's active maps would still hold dead
+	 * {@link com.sun.jdi.request.BreakpointRequest} handles whose {@code location()} call
+	 * throws {@link com.sun.jdi.VMDisconnectedException}.
+	 */
+	@Test
+	@DisplayName("tracker is recoverable (pure-pending) after a failed reconnect attach")
+	void shouldLeaveTrackerInRecoverablePendingStateOnAttachFailure() throws Exception {
+		final BreakpointTracker tracker = new BreakpointTracker();
+		final EventHistory history = new EventHistory();
+		final WatcherManager watchers = new WatcherManager();
+		final EvaluationGuard guard = new EvaluationGuard();
+		final MarkedInstanceRegistry marks = new MarkedInstanceRegistry();
+		final JdiExpressionEvaluator evaluator = mock(JdiExpressionEvaluator.class);
+		final JdiEventListener listener = new JdiEventListener(tracker, history, evaluator, guard, null, marks);
+		final JDIConnectionService service = new JDIConnectionService(
+			listener, tracker, history, watchers, guard, marks, new JdiHealthMonitor());
+
+		// Seed one PENDING line BP into the tracker so the snapshot has something to round-trip.
+		// Using a pending entry avoids needing a mock BreakpointRequest with a live JDI handle.
+		final int bpId = tracker.registerPendingBreakpoint(
+			"com.example.Foo", 42, com.sun.jdi.request.EventRequest.SUSPEND_ALL, "all");
+
+		JDIConnectionServiceTestSupport.setLastSuccessfulAttach(service, "127.0.0.1", 1);
+
+		assertThatThrownBy(service::reconnectPreservingSpecs)
+			.isInstanceOf(Exception.class);
+
+		// After the failure: the tracker has the original synthetic ID in its PENDING map. No
+		// stale active entry remains (the active map would have held the JDI handle from before
+		// the dispose; that handle is dead now).
+		assertThat(tracker.getPendingBreakpoint(bpId))
+			.as("pending BP must survive a failed reconnect for the agent to retry")
+			.isNotNull();
+		assertThat(tracker.getAllBreakpoints())
+			.as("active map must be empty after a failed reconnect — no dangling JDI handles")
+			.isEmpty();
+	}
 }

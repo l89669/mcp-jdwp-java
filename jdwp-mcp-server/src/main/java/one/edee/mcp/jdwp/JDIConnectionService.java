@@ -538,6 +538,14 @@ public class JDIConnectionService {
             discoveredJdkPath = null;
             targetMajorVersion = 0;
 
+            // Restore the tracker into pure-pending state BEFORE the fresh attach. After dispose
+            // the active maps are holding JDI request handles tied to the dead VM — any later
+            // snapshot/inspection on those would throw VMDisconnectedException. Putting the
+            // tracker into "everything pending, no JDI handles" state up front means that if the
+            // reattach itself fails, the agent can safely re-call jdwp_reconnect (or fall back
+            // to jdwp_connect, which calls cleanupSessionState anyway).
+            breakpointTracker.restoreFromSnapshotAsPending(snapshot);
+
             // Fresh attach to the last known target — no host/port input from the caller so a
             // mid-incident operator cannot accidentally swap targets while assuming their BPs survive.
             lastConnectAttempt = Instant.now();
@@ -562,19 +570,18 @@ public class JDIConnectionService {
                 vm = connector.attach(args);
             } catch (Exception e) {
                 lastConnectError = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
-                // Leave the tracker snapshot un-restored — without a live VM there is nothing to
-                // promote against. The next jdwp_connect / jdwp_reconnect can replay from the lost
-                // snapshot only if the caller re-issues; the contract is best-effort, not transactional.
+                // Tracker is already in pending state from the restore above — the agent's BPs
+                // are recoverable via a retry. No further bookkeeping needed here beyond
+                // surfacing the original error.
                 throw e;
             }
             lastConnectError = null;
             eventListener.start(vm);
             healthMonitor.start(vm);
 
-            // Replay specs as pending entries (synthetic IDs preserved), then register a
-            // ClassPrepareRequest per unique pending class name so the listener picks up subsequent
-            // loads. Already-loaded classes are bound immediately by tryPromotePending below.
-            breakpointTracker.restoreFromSnapshotAsPending(snapshot);
+            // Register a ClassPrepareRequest per unique pending class name so the listener picks
+            // up subsequent loads. The pending entries themselves were already restored above;
+            // already-loaded classes will bind immediately via tryPromotePending below.
             final EventRequestManager erm = vm.eventRequestManager();
             final Set<String> classesNeedingPrepare = new java.util.LinkedHashSet<>();
             for (BreakpointTracker.LineBreakpointEntry e : snapshot.lineBreakpoints()) {
