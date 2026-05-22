@@ -907,6 +907,37 @@ class BreakpointTrackerExceptionAndMetadataTest {
 				.isNull();
 		}
 
+		/**
+		 * The pending entry can disappear between the listener's class-prepare snapshot and the call
+		 * to {@code promotePendingToActive} — most commonly because the user cleared the breakpoint
+		 * via {@code clearBreakpoint}. Without this guard, late class-prepare promotion would resurrect
+		 * a breakpoint the user has already removed: no active entry exists, the {@code containsKey}
+		 * check passes, and the orphan {@link BreakpointRequest} gets installed under the recycled id.
+		 */
+		@Test
+		void promotePendingToActive_returnsFalseWhenPendingEntryWasClearedConcurrently() {
+			int id = tracker.registerPendingBreakpoint("com.example.Foo", 42, 2, "ALL");
+			// Simulate the user clearing the pending entry between the listener's snapshot of
+			// pendingList and the call to promotePendingToActive.
+			assertThat(tracker.removePendingBreakpoint(id))
+				.as("precondition: the pending entry exists before the simulated clear")
+				.isTrue();
+
+			BreakpointRequest bp = mock(BreakpointRequest.class);
+			boolean result = tracker.promotePendingToActive(id, bp);
+
+			assertThat(result)
+				.as("late class-prepare promotion must observe the cleared pending entry and refuse "
+					+ "to install — caller will delete the orphan request")
+				.isFalse();
+			assertThat(tracker.getBreakpoint(id))
+				.as("no active breakpoint may be created from a cleared pending entry")
+				.isNull();
+			assertThat(tracker.findIdByRequest(bp))
+				.as("the orphan request must NOT appear in the reverse index — would be a ghost entry")
+				.isNull();
+		}
+
 		@Test
 		void promotePendingExceptionToActive_rejectsSecondPromotionForSameId() {
 			int id = tracker.registerPendingExceptionBreakpoint(

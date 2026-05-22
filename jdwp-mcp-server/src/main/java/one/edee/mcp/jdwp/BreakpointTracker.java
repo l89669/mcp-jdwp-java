@@ -431,16 +431,21 @@ public class BreakpointTracker {
     /**
      * Promote a pending breakpoint to active: remove from pending, add to active with the same ID.
      * Returns {@code true} if the promotion happened. Returns {@code false} when the synthetic id
-     * already has an active entry — the listener path and the {@link #tryPromotePending} safety net
-     * race for the same pending entries, and the second arrival must not overwrite the winner.
-     * Callers that receive {@code false} are responsible for tearing down the now-orphan
-     * {@link BreakpointRequest} they just created (via {@code erm.deleteEventRequest(bp)}).
+     * already has an active entry (the listener path and the {@link #tryPromotePending} safety net
+     * race for the same pending entries, and the second arrival must not overwrite the winner) or
+     * when the pending entry has already been consumed — e.g. the user cleared it between the
+     * class-prepare snapshot and this call. Callers that receive {@code false} are responsible for
+     * tearing down the now-orphan {@link BreakpointRequest} they just created
+     * (via {@code erm.deleteEventRequest(bp)}).
      */
     public synchronized boolean promotePendingToActive(int id, BreakpointRequest bp) {
         if (breakpointsById.containsKey(id)) {
             return false;
         }
-        pendingBreakpointsById.remove(id);
+        final PendingBreakpoint pending = pendingBreakpointsById.remove(id);
+        if (pending == null) {
+            return false;
+        }
         breakpointsById.put(id, bp);
         breakpointIdsByRequest.put(bp, id);
         return true;
