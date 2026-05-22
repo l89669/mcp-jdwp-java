@@ -341,16 +341,20 @@ class BreakpointTrackerPromotionDeadlockTest {
 		listener.start();
 
 		listener.join(LISTENER_OBSERVATION_WINDOW_MS);
-		boolean listenerBlocked = listener.isAlive();
+		// Distinguish "blocked on the tracker monitor" (the pre-fix deadlock — Thread.State.BLOCKED)
+		// from "still running but slow under a loaded CI host" (Thread.State.RUNNABLE / WAITING /
+		// TIMED_WAITING — not a deadlock, must not fail the test). Same pattern as
+		// getVm_secondCallerProceedsWhileFirstIsParkedInDeferredClassLoadPhase2 below.
 		Thread.State listenerState = listener.getState();
+		boolean listenerBlockedOnMonitor = listenerState == Thread.State.BLOCKED;
 
 		// Always release the worker so the test does not leak threads regardless of the assertion outcome.
 		releaseWorker.countDown();
 		worker.join(WORKER_RELEASE_TIMEOUT_S * 1_000);
 		listener.join(WORKER_RELEASE_TIMEOUT_S * 1_000);
 
-		assertThat(listenerBlocked)
-			.as("promotePendingFieldsForClass must not block on the BreakpointTracker monitor "
+		assertThat(listenerBlockedOnMonitor)
+			.as("promotePendingFieldsForClass must not be BLOCKED on the BreakpointTracker monitor "
 				+ "while a worker is parked inside findOrForceLoadClass — listener state observed: %s",
 				listenerState)
 			.isFalse();

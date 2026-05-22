@@ -31,19 +31,34 @@ import java.util.concurrent.atomic.AtomicInteger;
  * normal path) or by the {@link #tryPromotePending} safety net (called from {@link JDIConnectionService#getVM()}
  * before every tool call) for classes loaded before any debugger event was delivered.
  * <p>
- * <b>Thread-safety:</b> public mutators that touch state in a single critical section are
- * {@code synchronized} on this tracker. {@link #tryPromotePending} is the exception: it cannot
- * hold the tracker monitor across {@link JDIConnectionService#findOrForceLoadClass}, because that
- * call parks the worker inside a target-VM {@code invokeMethod} until the JDI event listener drains
- * the resulting events — and the listener itself takes this monitor in
- * {@link #promotePendingFieldsForClass}. So {@code tryPromotePending} snapshots the pending maps
- * under the monitor, releases it across each per-entry force-load round-trip, then re-acquires it
- * for a recheck-and-mutate critical section. The promote* methods are the authoritative
- * already-promoted guard; losers in that race tear down their orphan JDI request.
- * <p>
- * The read-mostly state maps are {@code ConcurrentHashMap} so listeners can iterate without
- * contending with mutators. The {@code lastBreakpoint*} fields are {@code volatile} for cross-thread
- * visibility from the JDI listener thread to MCP worker threads.
+ * <b>Thread-safety:</b> the contract is layered, not uniform — readers should not assume "every
+ * public mutator is {@code synchronized}". The actual rules:
+ * <ul>
+ *   <li>The state maps are {@link ConcurrentHashMap}, so single-map mutations
+ *       ({@code registerBreakpoint}, {@code unregisterByRequest}, {@code markPendingFailed},
+ *       {@code registerClassPrepareRequest}, {@code setCondition}, {@code setLogpointExpression},
+ *       {@code registerExceptionBreakpoint}, {@code registerFieldBreakpoint},
+ *       {@code promotePendingFieldToActive}, …) rely on the map's own atomicity and are
+ *       intentionally not {@code synchronized}.</li>
+ *   <li>{@code synchronized} on this tracker guards operations that must mutate <i>multiple maps
+ *       atomically</i> — promotion (remove from pending + insert into active + index the request),
+ *       removal that spans both maps, {@code clearAll}, and the pending-side registrations whose
+ *       atomicity matters for {@link #tryPromotePending}'s recheck-and-mutate critical section.</li>
+ *   <li>{@link #tryPromotePending} is the documented exception to the "single critical section"
+ *       pattern: it cannot hold the tracker monitor across
+ *       {@link JDIConnectionService#findOrForceLoadClass}, because that call parks the worker
+ *       inside a target-VM {@code invokeMethod} until the JDI event listener drains the resulting
+ *       events — and the listener itself takes this monitor in
+ *       {@link #promotePendingFieldsForClass}. So {@code tryPromotePending} snapshots the pending
+ *       maps under the monitor, releases it across each per-entry force-load round-trip, then
+ *       re-acquires it for a recheck-and-mutate critical section. The {@code promote*} methods
+ *       are the authoritative already-promoted guard; losers in that race tear down their orphan
+ *       JDI request.</li>
+ *   <li>The {@code lastBreakpoint*} fields are {@code volatile} for cross-thread visibility from
+ *       the JDI listener thread to MCP worker threads.</li>
+ * </ul>
+ * When adding new public mutators, decide consciously which bucket they fall into — a method that
+ * touches more than one map atomically must take the monitor; a single-map mutation should not.
  */
 @Service
 public class BreakpointTracker {
