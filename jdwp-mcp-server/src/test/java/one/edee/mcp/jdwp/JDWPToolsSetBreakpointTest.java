@@ -57,7 +57,7 @@ class JDWPToolsSetBreakpointTest {
 		final ReferenceType refType = mock(ReferenceType.class);
 		final Location loc = mock(Location.class);
 		final BreakpointRequest req = mock(BreakpointRequest.class);
-		when(jdiService.findOrForceLoadClass(className)).thenReturn(refType);
+		when(jdiService.findLoadedClass(className)).thenReturn(refType);
 		when(refType.locationsOfLine(line)).thenReturn(List.of(loc));
 		when(erm.createBreakpointRequest(loc)).thenReturn(req);
 		return req;
@@ -72,7 +72,7 @@ class JDWPToolsSetBreakpointTest {
 		void shouldUseSuspendAllForExplicitAll() throws Exception {
 			final BreakpointRequest req = wireEagerSet("com.example.Foo", 10);
 
-			final String result = tools.jdwp_set_breakpoint("com.example.Foo", 10, "all", null, null, null);
+			final String result = tools.jdwp_set_breakpoint("com.example.Foo", 10, "all", null, null, null, null);
 
 			assertThat(result).contains("suspend: all");
 			verify(req).setSuspendPolicy(EventRequest.SUSPEND_ALL);
@@ -83,7 +83,7 @@ class JDWPToolsSetBreakpointTest {
 		void shouldDefaultToSuspendAllWhenNull() throws Exception {
 			final BreakpointRequest req = wireEagerSet("com.example.Foo", 10);
 
-			final String result = tools.jdwp_set_breakpoint("com.example.Foo", 10, null, null, null, null);
+			final String result = tools.jdwp_set_breakpoint("com.example.Foo", 10, null, null, null, null, null);
 
 			assertThat(result).contains("suspend: all");
 			verify(req).setSuspendPolicy(EventRequest.SUSPEND_ALL);
@@ -94,7 +94,7 @@ class JDWPToolsSetBreakpointTest {
 		void shouldUseSuspendEventThreadForThread() throws Exception {
 			final BreakpointRequest req = wireEagerSet("com.example.Foo", 10);
 
-			final String result = tools.jdwp_set_breakpoint("com.example.Foo", 10, "thread", null, null, null);
+			final String result = tools.jdwp_set_breakpoint("com.example.Foo", 10, "thread", null, null, null, null);
 
 			assertThat(result).contains("suspend: thread");
 			verify(req).setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
@@ -105,7 +105,7 @@ class JDWPToolsSetBreakpointTest {
 		void shouldUseSuspendNoneForNone() throws Exception {
 			final BreakpointRequest req = wireEagerSet("com.example.Foo", 10);
 
-			final String result = tools.jdwp_set_breakpoint("com.example.Foo", 10, "none", null, null, null);
+			final String result = tools.jdwp_set_breakpoint("com.example.Foo", 10, "none", null, null, null, null);
 
 			assertThat(result).contains("suspend: none");
 			verify(req).setSuspendPolicy(EventRequest.SUSPEND_NONE);
@@ -116,7 +116,7 @@ class JDWPToolsSetBreakpointTest {
 		void shouldAcceptUppercasePolicy() throws Exception {
 			final BreakpointRequest req = wireEagerSet("com.example.Foo", 10);
 
-			final String result = tools.jdwp_set_breakpoint("com.example.Foo", 10, "ALL", null, null, null);
+			final String result = tools.jdwp_set_breakpoint("com.example.Foo", 10, "ALL", null, null, null, null);
 
 			assertThat(result).contains("suspend: all");
 			verify(req).setSuspendPolicy(EventRequest.SUSPEND_ALL);
@@ -125,7 +125,7 @@ class JDWPToolsSetBreakpointTest {
 		@Test
 		@DisplayName("unknown policy returns an actionable error")
 		void shouldRejectInvalidSuspendPolicy() throws Exception {
-			final String result = tools.jdwp_set_breakpoint("com.example.Foo", 10, "bogus", null, null, null);
+			final String result = tools.jdwp_set_breakpoint("com.example.Foo", 10, "bogus", null, null, null, null);
 
 			assertThat(result).startsWith("Error:").contains("Invalid suspend policy 'bogus'");
 		}
@@ -140,7 +140,7 @@ class JDWPToolsSetBreakpointTest {
 		void shouldSetBreakpointEagerlyWhenClassIsLoaded() throws Exception {
 			final BreakpointRequest req = wireEagerSet("com.example.Foo", 10);
 
-			final String result = tools.jdwp_set_breakpoint("com.example.Foo", 10, "all", null, null, null);
+			final String result = tools.jdwp_set_breakpoint("com.example.Foo", 10, "all", null, null, null, null);
 
 			assertThat(result).startsWith("Breakpoint set at com.example.Foo:10");
 			// Unchained BP must be enabled as the last step.
@@ -152,15 +152,57 @@ class JDWPToolsSetBreakpointTest {
 		@DisplayName("deferred path — registers a ClassPrepareRequest when class not yet loaded")
 		void shouldDeferWhenClassNotLoaded() throws Exception {
 			final ClassPrepareRequest cpr = mock(ClassPrepareRequest.class);
-			when(jdiService.findOrForceLoadClass("com.example.Foo")).thenReturn(null);
+			when(jdiService.findLoadedClass("com.example.Foo")).thenReturn(null);
 			when(vm.classesByName("com.example.Foo")).thenReturn(List.of());
 			when(erm.createClassPrepareRequest()).thenReturn(cpr);
 
-			final String result = tools.jdwp_set_breakpoint("com.example.Foo", 10, "all", null, null, null);
+			final String result = tools.jdwp_set_breakpoint("com.example.Foo", 10, "all", null, null, null, null);
 
 			assertThat(result).startsWith("Breakpoint deferred for com.example.Foo:10");
 			verify(cpr).addClassFilter("com.example.Foo");
 			verify(cpr).enable();
+		}
+
+		/**
+		 * Default registration must not trigger {@code Class.forName} in the target VM — the whole
+		 * point of GH issue #3 is that the debugger observes class loads rather than causing them.
+		 * Asserts via Mockito {@code never()} so a regression that re-introduces an eager force-load
+		 * call on the default path fails this test deterministically.
+		 */
+		@Test
+		@DisplayName("default registration never calls findOrForceLoadClass")
+		void shouldNeverForceLoadOnDefaultRegistration() throws Exception {
+			when(jdiService.findLoadedClass("com.example.Foo")).thenReturn(null);
+			when(vm.classesByName("com.example.Foo")).thenReturn(List.of());
+			when(erm.createClassPrepareRequest()).thenReturn(mock(ClassPrepareRequest.class));
+
+			tools.jdwp_set_breakpoint("com.example.Foo", 10, "all", null, null, null, null);
+
+			verify(jdiService, org.mockito.Mockito.never()).findOrForceLoadClass(org.mockito.ArgumentMatchers.anyString());
+			verify(jdiService, org.mockito.Mockito.never()).findOrForceLoadClass(
+				org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.any());
+		}
+
+		/**
+		 * Opt-in path: with {@code forceLoad=true} the tool routes to
+		 * {@link JDIConnectionService#findOrForceLoadClass} so the caller can accept the side
+		 * effects of running {@code <clinit>} in the target VM in exchange for an immediate bind.
+		 */
+		@Test
+		@DisplayName("forceLoad=true routes to findOrForceLoadClass")
+		void shouldRouteToForceLoadWhenForceLoadTrue() throws Exception {
+			final ReferenceType refType = mock(ReferenceType.class);
+			final Location loc = mock(Location.class);
+			final BreakpointRequest req = mock(BreakpointRequest.class);
+			when(jdiService.findOrForceLoadClass("com.example.Foo")).thenReturn(refType);
+			when(refType.locationsOfLine(10)).thenReturn(List.of(loc));
+			when(erm.createBreakpointRequest(loc)).thenReturn(req);
+
+			final String result = tools.jdwp_set_breakpoint("com.example.Foo", 10, "all", null, null, null, true);
+
+			assertThat(result).startsWith("Breakpoint set at com.example.Foo:10");
+			verify(jdiService).findOrForceLoadClass("com.example.Foo");
+			verify(jdiService, org.mockito.Mockito.never()).findLoadedClass(org.mockito.ArgumentMatchers.anyString());
 		}
 	}
 
@@ -173,7 +215,7 @@ class JDWPToolsSetBreakpointTest {
 		void shouldTreatBlankConditionAsNoCondition() throws Exception {
 			wireEagerSet("com.example.Foo", 10);
 
-			final String result = tools.jdwp_set_breakpoint("com.example.Foo", 10, "all", "   ", null, null);
+			final String result = tools.jdwp_set_breakpoint("com.example.Foo", 10, "all", "   ", null, null, null);
 
 			assertThat(result).doesNotContain("condition:");
 		}
@@ -183,7 +225,7 @@ class JDWPToolsSetBreakpointTest {
 		void shouldIncludeConditionInResponseWhenProvided() throws Exception {
 			wireEagerSet("com.example.Foo", 10);
 
-			final String result = tools.jdwp_set_breakpoint("com.example.Foo", 10, "all", "i > 0", null, null);
+			final String result = tools.jdwp_set_breakpoint("com.example.Foo", 10, "all", "i > 0", null, null, null);
 
 			assertThat(result).contains("condition: i > 0");
 		}

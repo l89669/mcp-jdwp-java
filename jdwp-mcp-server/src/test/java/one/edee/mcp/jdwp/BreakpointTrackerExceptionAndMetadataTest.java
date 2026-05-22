@@ -466,7 +466,7 @@ class BreakpointTrackerExceptionAndMetadataTest {
 
 		@Test
 		void shouldReturnZeroWhenServiceNull() {
-			assertThat(tracker.tryPromotePending(null, null)).isZero();
+			assertThat(tracker.tryPromotePending(null)).isZero();
 		}
 
 		@Test
@@ -474,7 +474,7 @@ class BreakpointTrackerExceptionAndMetadataTest {
 			JDIConnectionService service = mock(JDIConnectionService.class);
 			when(service.getRawVM()).thenReturn(null);
 
-			assertThat(tracker.tryPromotePending(service, null)).isZero();
+			assertThat(tracker.tryPromotePending(service)).isZero();
 		}
 
 		@Test
@@ -485,7 +485,7 @@ class BreakpointTrackerExceptionAndMetadataTest {
 			when(service.getRawVM()).thenReturn(vm);
 			when(vm.eventRequestManager()).thenReturn(erm);
 
-			assertThat(tracker.tryPromotePending(service, null)).isZero();
+			assertThat(tracker.tryPromotePending(service)).isZero();
 		}
 
 		@Test
@@ -499,10 +499,40 @@ class BreakpointTrackerExceptionAndMetadataTest {
 			int id = tracker.registerPendingBreakpoint("com.example.Foo", 42, 2, "ALL");
 			tracker.markPendingFailed(id, "no executable code");
 
-			int promoted = tracker.tryPromotePending(service, null);
+			int promoted = tracker.tryPromotePending(service);
 
 			assertThat(promoted).isZero();
 			assertThat(tracker.getPendingBreakpoint(id)).isNotNull();
+		}
+
+		/**
+		 * Regression guard for GH issue #3: the safety-net promoter is strictly passive — it must
+		 * NEVER invoke {@code findOrForceLoadClass}, because that path triggers {@code Class.forName}
+		 * in the target VM and changes application behaviour the debugger should only observe. The
+		 * promotion path uses {@link JDIConnectionService#findLoadedClass} exclusively; this test
+		 * fails if a regression re-routes any of the three call sites (line, exception, field) back
+		 * to the force-load overloads.
+		 */
+		@Test
+		void shouldNeverCallFindOrForceLoadClassFromSafetyNet() throws Exception {
+			JDIConnectionService service = mock(JDIConnectionService.class);
+			VirtualMachine vm = mock(VirtualMachine.class);
+			EventRequestManager erm = mock(EventRequestManager.class);
+			when(service.getRawVM()).thenReturn(vm);
+			when(vm.eventRequestManager()).thenReturn(erm);
+
+			tracker.registerPendingBreakpoint("com.example.Foo", 42, 2, "ALL");
+			tracker.registerPendingExceptionBreakpoint(
+				ExceptionBreakpointSpec.suspending("com.example.MyException", true, true));
+			tracker.registerPendingFieldBreakpoint(BreakpointTracker.FieldBreakpointSpec.suspending(
+				"com.example.Owner", "field", BreakpointTracker.FieldWatchMode.ACCESS, null, null, null));
+
+			tracker.tryPromotePending(service);
+
+			verify(service, org.mockito.Mockito.never()).findOrForceLoadClass(
+				org.mockito.ArgumentMatchers.anyString());
+			verify(service, org.mockito.Mockito.never()).findOrForceLoadClass(
+				org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.any());
 		}
 
 		/**
@@ -520,7 +550,7 @@ class BreakpointTrackerExceptionAndMetadataTest {
 			BreakpointRequest bp = mock(BreakpointRequest.class);
 			when(service.getRawVM()).thenReturn(vm);
 			when(vm.eventRequestManager()).thenReturn(erm);
-			when(service.findOrForceLoadClass(eq("com.example.Foo"), any())).thenReturn(refType);
+			when(service.findLoadedClass(eq("com.example.Foo"))).thenReturn(refType);
 			when(refType.locationsOfLine(42)).thenReturn(java.util.List.of(loc));
 			when(erm.createBreakpointRequest(loc)).thenReturn(bp);
 
@@ -528,7 +558,7 @@ class BreakpointTrackerExceptionAndMetadataTest {
 			int pendingId = tracker.registerPendingBreakpoint("com.example.Foo", 42, 2, "ALL");
 			tracker.registerDependency(pendingId, triggerId, false);
 
-			int promoted = tracker.tryPromotePending(service, null);
+			int promoted = tracker.tryPromotePending(service);
 
 			assertThat(promoted).isEqualTo(1);
 			verify(bp).setEnabled(false);
@@ -548,7 +578,7 @@ class BreakpointTrackerExceptionAndMetadataTest {
 			ExceptionRequest exReq = mock(ExceptionRequest.class);
 			when(service.getRawVM()).thenReturn(vm);
 			when(vm.eventRequestManager()).thenReturn(erm);
-			when(service.findOrForceLoadClass(eq("com.example.MyException"), any())).thenReturn(refType);
+			when(service.findLoadedClass(eq("com.example.MyException"))).thenReturn(refType);
 			when(erm.createExceptionRequest(refType, true, true)).thenReturn(exReq);
 
 			int triggerId = tracker.registerBreakpoint(mock(BreakpointRequest.class));
@@ -556,7 +586,7 @@ class BreakpointTrackerExceptionAndMetadataTest {
 				ExceptionBreakpointSpec.suspending("com.example.MyException", true, true));
 			tracker.registerDependency(pendingId, triggerId, false);
 
-			int promoted = tracker.tryPromotePending(service, null);
+			int promoted = tracker.tryPromotePending(service);
 
 			assertThat(promoted).isEqualTo(1);
 			verify(exReq).setEnabled(false);
@@ -577,13 +607,13 @@ class BreakpointTrackerExceptionAndMetadataTest {
 			BreakpointRequest bp = mock(BreakpointRequest.class);
 			when(service.getRawVM()).thenReturn(vm);
 			when(vm.eventRequestManager()).thenReturn(erm);
-			when(service.findOrForceLoadClass(eq("com.example.Foo"), any())).thenReturn(refType);
+			when(service.findLoadedClass(eq("com.example.Foo"))).thenReturn(refType);
 			when(refType.locationsOfLine(42)).thenReturn(java.util.List.of(loc));
 			when(erm.createBreakpointRequest(loc)).thenReturn(bp);
 
 			tracker.registerPendingBreakpoint("com.example.Foo", 42, 2, "ALL");
 
-			int promoted = tracker.tryPromotePending(service, null);
+			int promoted = tracker.tryPromotePending(service);
 
 			assertThat(promoted).isEqualTo(1);
 			// enable() is called (from the production code itself), but setEnabled(false) must NOT.
@@ -594,8 +624,8 @@ class BreakpointTrackerExceptionAndMetadataTest {
 	/**
 	 * Recheck-race coverage for the {@code tryPromotePending} per-entry recheck branches. The
 	 * worker thread snapshots pending entries under the tracker monitor, releases the monitor for
-	 * the (potentially slow) {@code findOrForceLoadClass} JDI hop, then re-acquires the monitor to
-	 * recheck-then-promote each entry. Three things can have changed during the JDI hop:
+	 * the per-entry {@code findLoadedClass} lookup, then re-acquires the monitor to recheck-then-
+	 * promote each entry. Three things can have changed during the lookup window:
 	 * <ul>
 	 *   <li>another thread removed the pending entry (e.g. user issued {@code jdwp_clear})</li>
 	 *   <li>another thread marked the pending entry failed (e.g. listener path classifier)</li>
@@ -619,16 +649,16 @@ class BreakpointTrackerExceptionAndMetadataTest {
 
 			int pendingId = tracker.registerPendingBreakpoint("com.example.Foo", 42, 2, "ALL");
 
-			// While the worker is parked inside findOrForceLoadClass, another caller removes the
+			// While the worker is mid-lookup inside findLoadedClass, another caller removes the
 			// pending entry. The recheck must observe pendingBreakpointsById.get(id) != pending and
 			// continue without ever calling locationsOfLine / createBreakpointRequest.
-			when(service.findOrForceLoadClass(eq("com.example.Foo"), any()))
+			when(service.findLoadedClass(eq("com.example.Foo")))
 				.thenAnswer(inv -> {
 					tracker.removePendingBreakpoint(pendingId);
 					return refType;
 				});
 
-			int promoted = tracker.tryPromotePending(service, null);
+			int promoted = tracker.tryPromotePending(service);
 
 			assertThat(promoted).isZero();
 			assertThat(tracker.getPendingBreakpoint(pendingId)).isNull();
@@ -647,13 +677,13 @@ class BreakpointTrackerExceptionAndMetadataTest {
 
 			int pendingId = tracker.registerPendingBreakpoint("com.example.Foo", 42, 2, "ALL");
 
-			when(service.findOrForceLoadClass(eq("com.example.Foo"), any()))
+			when(service.findLoadedClass(eq("com.example.Foo")))
 				.thenAnswer(inv -> {
 					tracker.markPendingFailed(pendingId, "concurrent classifier marked failed");
 					return refType;
 				});
 
-			int promoted = tracker.tryPromotePending(service, null);
+			int promoted = tracker.tryPromotePending(service);
 
 			assertThat(promoted).isZero();
 			// Entry stays in the pending map so the failure reason is visible to overview tools.
@@ -679,13 +709,13 @@ class BreakpointTrackerExceptionAndMetadataTest {
 			// own BreakpointRequest. The worker's recheck must observe breakpointsById.containsKey(id)
 			// and skip the entry — otherwise it would overwrite breakpointsById with its own BP and
 			// leave listenerBp armed on the target VM as a ghost without tracker entry.
-			when(service.findOrForceLoadClass(eq("com.example.Foo"), any()))
+			when(service.findLoadedClass(eq("com.example.Foo")))
 				.thenAnswer(inv -> {
 					tracker.promotePendingToActive(pendingId, listenerBp);
 					return refType;
 				});
 
-			int promoted = tracker.tryPromotePending(service, null);
+			int promoted = tracker.tryPromotePending(service);
 
 			assertThat(promoted).isZero();
 			assertThat(tracker.getBreakpoint(pendingId))
@@ -706,13 +736,13 @@ class BreakpointTrackerExceptionAndMetadataTest {
 			int pendingId = tracker.registerPendingExceptionBreakpoint(
 				ExceptionBreakpointSpec.suspending("com.example.MyException", true, true));
 
-			when(service.findOrForceLoadClass(eq("com.example.MyException"), any()))
+			when(service.findLoadedClass(eq("com.example.MyException")))
 				.thenAnswer(inv -> {
 					tracker.removeExceptionBreakpoint(pendingId);
 					return refType;
 				});
 
-			int promoted = tracker.tryPromotePending(service, null);
+			int promoted = tracker.tryPromotePending(service);
 
 			assertThat(promoted).isZero();
 			assertThat(tracker.getAllPendingExceptionBreakpoints()).doesNotContainKey(pendingId);
@@ -733,13 +763,13 @@ class BreakpointTrackerExceptionAndMetadataTest {
 			int pendingId = tracker.registerPendingExceptionBreakpoint(
 				ExceptionBreakpointSpec.suspending("com.example.MyException", true, true));
 
-			when(service.findOrForceLoadClass(eq("com.example.MyException"), any()))
+			when(service.findLoadedClass(eq("com.example.MyException")))
 				.thenAnswer(inv -> {
 					tracker.markPendingExceptionFailed(pendingId, "concurrent classifier marked failed");
 					return refType;
 				});
 
-			int promoted = tracker.tryPromotePending(service, null);
+			int promoted = tracker.tryPromotePending(service);
 
 			assertThat(promoted).isZero();
 			assertThat(tracker.getAllPendingExceptionBreakpoints().get(pendingId).getFailureReason())
@@ -761,13 +791,13 @@ class BreakpointTrackerExceptionAndMetadataTest {
 			int pendingId = tracker.registerPendingExceptionBreakpoint(
 				ExceptionBreakpointSpec.suspending("com.example.MyException", true, true));
 
-			when(service.findOrForceLoadClass(eq("com.example.MyException"), any()))
+			when(service.findLoadedClass(eq("com.example.MyException")))
 				.thenAnswer(inv -> {
 					tracker.promotePendingExceptionToActive(pendingId, listenerExReq);
 					return refType;
 				});
 
-			int promoted = tracker.tryPromotePending(service, null);
+			int promoted = tracker.tryPromotePending(service);
 
 			assertThat(promoted).isZero();
 			assertThat(tracker.getAllExceptionBreakpoints().get(pendingId).getRequest())
@@ -794,12 +824,12 @@ class BreakpointTrackerExceptionAndMetadataTest {
 			ReferenceType refType = mock(ReferenceType.class);
 			when(service.getRawVM()).thenReturn(vm);
 			when(vm.eventRequestManager()).thenReturn(erm);
-			when(service.findOrForceLoadClass(eq("com.example.Foo"), any())).thenReturn(refType);
+			when(service.findLoadedClass(eq("com.example.Foo"))).thenReturn(refType);
 			when(refType.locationsOfLine(42)).thenThrow(new AbsentInformationException("no debug info"));
 
 			int pendingId = tracker.registerPendingBreakpoint("com.example.Foo", 42, 2, "ALL");
 
-			int promoted = tracker.tryPromotePending(service, null);
+			int promoted = tracker.tryPromotePending(service);
 
 			assertThat(promoted).isZero();
 			assertThat(tracker.getPendingBreakpoint(pendingId))
@@ -841,23 +871,23 @@ class BreakpointTrackerExceptionAndMetadataTest {
 			int idC = tracker.registerPendingBreakpoint("com.example.C", 30, 2, "ALL");
 
 			// A: removed under the worker's feet during its JDI invoke.
-			when(service.findOrForceLoadClass(eq("com.example.A"), any()))
+			when(service.findLoadedClass(eq("com.example.A")))
 				.thenAnswer(inv -> {
 					tracker.removePendingBreakpoint(idA);
 					return refTypeA;
 				});
 			// B: promoted by another caller while the worker is parked.
-			when(service.findOrForceLoadClass(eq("com.example.B"), any()))
+			when(service.findLoadedClass(eq("com.example.B")))
 				.thenAnswer(inv -> {
 					tracker.promotePendingToActive(idB, listenerBpB);
 					return refTypeB;
 				});
 			// C: a clean promotion path — survives the race.
-			when(service.findOrForceLoadClass(eq("com.example.C"), any())).thenReturn(refTypeC);
+			when(service.findLoadedClass(eq("com.example.C"))).thenReturn(refTypeC);
 			when(refTypeC.locationsOfLine(30)).thenReturn(List.of(locC));
 			when(erm.createBreakpointRequest(locC)).thenReturn(bpC);
 
-			int promoted = tracker.tryPromotePending(service, null);
+			int promoted = tracker.tryPromotePending(service);
 
 			assertThat(promoted)
 				.as("only entry C was actually promoted by this caller — A and B lost their recheck race")

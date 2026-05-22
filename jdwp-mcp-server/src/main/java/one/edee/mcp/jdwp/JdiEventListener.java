@@ -41,12 +41,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * death event.
  * <p>
  * Promotion contract: the main listener loop does not call
- * {@link BreakpointTracker#tryPromotePending(JDIConnectionService, ThreadReference)} directly —
- * promotion happens lazily via {@link JDIConnectionService#getVM()} on the next MCP tool call.
- * Logpoint and conditional-BP handlers DO end up calling it indirectly the first time after
- * connect (via {@code configureCompilerClasspath} → {@code discoverClasspath} → {@code getVM}),
- * which is safe because the BP thread is already suspended at a method-invocation event —
- * JDI permits {@code invokeMethod} on threads in that state.
+ * {@link BreakpointTracker#tryPromotePending(JDIConnectionService)} directly — promotion happens
+ * lazily via {@link JDIConnectionService#getVM()} on the next MCP tool call. Logpoint and
+ * conditional-BP handlers DO end up calling it indirectly the first time after connect (via
+ * {@code configureCompilerClasspath} → {@code discoverClasspath} → {@code getVM}); the safety-net
+ * promoter is strictly passive (it never calls {@code invokeMethod} on the target VM), so it is
+ * safe to invoke from any event-thread context.
  * <p>
  * Chain handling: after every BP, exception, or auto-resumed logpoint hit,
  * {@link #applyChainEffectsAfterHit} arms any dependent BPs waiting on the firing BP and

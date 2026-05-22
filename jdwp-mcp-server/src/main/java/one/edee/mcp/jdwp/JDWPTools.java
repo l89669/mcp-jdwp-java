@@ -1807,14 +1807,15 @@ public class JDWPTools {
         }
     }
 
-    @McpTool(description = "Set a breakpoint at a specific line in a class. Supports conditional breakpoints. If the class is not yet loaded, the breakpoint is deferred.")
+    @McpTool(description = "Set a breakpoint at a specific line in a class. Supports conditional breakpoints. By default the breakpoint is registered passively: if the class is not yet loaded, the BP is deferred via a ClassPrepareRequest and activates when the JVM loads the class on its own — same behaviour as IntelliJ / Eclipse / jdb. Pass forceLoad=true only when you need the breakpoint to bind immediately and accept that loading the class will run its `<clinit>` (early static init, eager dependency loads, masked lazy-load diagnostics).")
     public String jdwp_set_breakpoint(
         @McpToolParam(description = "Fully qualified class name (e.g. 'com.example.MyClass')") String className,
         @McpToolParam(description = "Line number") int lineNumber,
         @McpToolParam(required = false, description = "Suspend policy: 'all' (default), 'thread', 'none'") @Nullable String suspendPolicy,
         @McpToolParam(required = false, description = "Optional condition — only suspend when this evaluates to true (e.g., 'i > 100')") @Nullable String condition,
         @McpToolParam(required = false, description = "Optional ID of a trigger breakpoint — this BP stays disarmed until the trigger fires. Sticky by default: once armed it stays so unless re-disarmed via jdwp_disarm_until_trigger or oneShot=true.") @Nullable Integer triggerBreakpointId,
-        @McpToolParam(required = false, description = "If true, re-disarm this BP after each hit so the next trigger fire re-arms it (IntelliJ-style). Default: false (sticky).") @Nullable Boolean oneShot) {
+        @McpToolParam(required = false, description = "If true, re-disarm this BP after each hit so the next trigger fire re-arms it (IntelliJ-style). Default: false (sticky).") @Nullable Boolean oneShot,
+        @McpToolParam(required = false, description = "If true, force-load the class via Class.forName in the target VM when it isn't already loaded. Default: false (passive — defer via ClassPrepareRequest). Force-load triggers `<clinit>`, cascades dependent loads, and can mask lazy-init / classloader-leak diagnostics — use sparingly.") @Nullable Boolean forceLoad) {
         // Track the pending ID outside the try so the catch can clean it up if locationsOfLine
         // (or any later step) throws after the pending entry has already been registered.
         Integer pendingIdForCleanup = null;
@@ -1846,7 +1847,13 @@ public class JDWPTools {
             final String conditionInfo = condition != null && !condition.isBlank()
                 ? String.format(", condition: %s", condition) : "";
 
-            final ReferenceType eagerType = jdiService.findOrForceLoadClass(className);
+            final boolean effectiveForceLoad = forceLoad != null && forceLoad;
+            // Passive by default: a debugger should observe class loads, not cause them. Force-load
+            // is opt-in for the rare cases that genuinely need eager binding (bootstrap classes,
+            // tight integration tests). See GH issue #3.
+            final ReferenceType eagerType = effectiveForceLoad
+                ? jdiService.findOrForceLoadClass(className)
+                : jdiService.findLoadedClass(className);
             final List<ReferenceType> classes = eagerType != null ? List.of(eagerType) : List.of();
 
             final String chainInfo = triggerBreakpointId != null
@@ -1941,12 +1948,13 @@ public class JDWPTools {
         }
     }
 
-    @McpTool(description = "Set a logpoint (non-stopping breakpoint) that evaluates an expression and logs the result without pausing execution. Supports an optional condition — the expression is only logged when the condition evaluates to true.")
+    @McpTool(description = "Set a logpoint (non-stopping breakpoint) that evaluates an expression and logs the result without pausing execution. Supports an optional condition — the expression is only logged when the condition evaluates to true. By default the logpoint is registered passively: if the class is not yet loaded, it is deferred via a ClassPrepareRequest and activates on natural load. Pass forceLoad=true to force the class load (runs `<clinit>`, may mask lazy-init diagnostics).")
     public String jdwp_set_logpoint(
         @McpToolParam(description = "Fully qualified class name") String className,
         @McpToolParam(description = "Line number") int lineNumber,
         @McpToolParam(description = "Java expression to evaluate and log (e.g., '\"x=\" + x', 'order.getTotal()')") String expression,
-        @McpToolParam(required = false, description = "Optional condition — only log when this evaluates to true (e.g., 'i > 100')") @Nullable String condition) {
+        @McpToolParam(required = false, description = "Optional condition — only log when this evaluates to true (e.g., 'i > 100')") @Nullable String condition,
+        @McpToolParam(required = false, description = "If true, force-load the class via Class.forName in the target VM when it isn't already loaded. Default: false (passive — defer via ClassPrepareRequest). Force-load triggers `<clinit>` and can mask lazy-init / classloader-leak diagnostics — use sparingly.") @Nullable Boolean forceLoad) {
         // Track the pending ID outside the try so the catch can clean it up if locationsOfLine
         // (or any later step) throws after the pending entry has already been registered.
         Integer pendingIdForCleanup = null;
@@ -1959,7 +1967,10 @@ public class JDWPTools {
             final String conditionInfo = condition != null && !condition.isBlank()
                 ? String.format(", condition: %s", condition) : "";
 
-            final ReferenceType eagerType = jdiService.findOrForceLoadClass(className);
+            final boolean effectiveForceLoad = forceLoad != null && forceLoad;
+            final ReferenceType eagerType = effectiveForceLoad
+                ? jdiService.findOrForceLoadClass(className)
+                : jdiService.findLoadedClass(className);
             final List<ReferenceType> classes = eagerType != null ? List.of(eagerType) : List.of();
 
             if (classes.isEmpty()) {
@@ -2282,18 +2293,22 @@ public class JDWPTools {
 
     @McpTool(description = "Set a breakpoint that suspends the throwing thread when a specific exception " +
         "is thrown — caught at the throw site, before the stack unwinds. For non-stopping tracing, use " +
-        "jdwp_set_exception_logpoint instead. If the exception class is not yet loaded, the breakpoint is " +
-        "deferred and will activate automatically when the JVM loads it.")
+        "jdwp_set_exception_logpoint instead. By default the BP is registered passively: if the exception " +
+        "class is not yet loaded the BP is deferred via a ClassPrepareRequest and activates on natural load. " +
+        "Pass forceLoad=true when targeting an exception class the application hasn't referenced yet " +
+        "(typically a JDK exception type such as java.sql.SQLException) — accepts the side effects of " +
+        "running `<clinit>` in the target VM.")
     public String jdwp_set_exception_breakpoint(
         @McpToolParam(description = "Exception class name (e.g., 'java.lang.NullPointerException', 'java.lang.Exception' for all)") String exceptionClass,
         @McpToolParam(required = false, description = "Break on caught exceptions (default: true)") @Nullable Boolean caught,
         @McpToolParam(required = false, description = "Break on uncaught exceptions (default: true)") @Nullable Boolean uncaught,
         @McpToolParam(required = false, description = "Optional ID of a trigger breakpoint — this exception BP stays disarmed until the trigger fires. Sticky by default.") @Nullable Integer triggerBreakpointId,
-        @McpToolParam(required = false, description = "If true, re-disarm this BP after each hit so the next trigger fire re-arms it. Default: false (sticky).") @Nullable Boolean oneShot) {
+        @McpToolParam(required = false, description = "If true, re-disarm this BP after each hit so the next trigger fire re-arms it. Default: false (sticky).") @Nullable Boolean oneShot,
+        @McpToolParam(required = false, description = "If true, force-load the exception class via Class.forName when it isn't already loaded. Default: false (passive — defer via ClassPrepareRequest). Useful for JDK exception classes the application has never referenced (ClassPrepareEvent is not delivered for bootstrap classes, so the deferred path will never activate).") @Nullable Boolean forceLoad) {
         return registerExceptionBreakpointInternal(
             exceptionClass, caught, uncaught,
             /* expression */ null, /* condition */ null,
-            triggerBreakpointId, oneShot);
+            triggerBreakpointId, oneShot, forceLoad);
     }
 
     @McpTool(description = "Set a non-stopping breakpoint that records an EXCEPTION_LOG event for each " +
@@ -2301,8 +2316,11 @@ public class JDWPTools {
         "$exception bound to the thrown object (e.g., \"$exception.getMessage()\"); its result is attached " +
         "to the event. The optional condition is evaluated with the same $exception binding — the log is " +
         "recorded only when the condition is true. Use this for tracing exception flows in long-running " +
-        "services without halting traffic. If the exception class is not yet loaded, the logpoint is " +
-        "deferred and will activate automatically when the JVM loads it.")
+        "services without halting traffic. By default the logpoint is registered passively: if the exception " +
+        "class is not yet loaded the logpoint is deferred via a ClassPrepareRequest and activates on natural " +
+        "load. Pass forceLoad=true when targeting an exception class the application hasn't referenced yet " +
+        "(typically a JDK exception type such as java.sql.SQLException) — accepts the side effects of " +
+        "running `<clinit>` in the target VM.")
     public String jdwp_set_exception_logpoint(
         @McpToolParam(description = "Exception class name (e.g., 'java.sql.SQLException')") String exceptionClass,
         @McpToolParam(description = "Java expression evaluated on each hit; $exception is bound to the thrown object") String expression,
@@ -2310,7 +2328,8 @@ public class JDWPTools {
         @McpToolParam(required = false, description = "Log caught exceptions (default: true)") @Nullable Boolean caught,
         @McpToolParam(required = false, description = "Log uncaught exceptions (default: true)") @Nullable Boolean uncaught,
         @McpToolParam(required = false, description = "Optional ID of a trigger breakpoint — this logpoint stays disarmed until the trigger fires. Sticky by default.") @Nullable Integer triggerBreakpointId,
-        @McpToolParam(required = false, description = "If true, re-disarm after each hit so the next trigger fire re-arms it. Default: false (sticky).") @Nullable Boolean oneShot) {
+        @McpToolParam(required = false, description = "If true, re-disarm after each hit so the next trigger fire re-arms it. Default: false (sticky).") @Nullable Boolean oneShot,
+        @McpToolParam(required = false, description = "If true, force-load the exception class via Class.forName when it isn't already loaded. Default: false (passive — defer via ClassPrepareRequest). Useful for JDK exception classes the application has never referenced.") @Nullable Boolean forceLoad) {
         if (expression == null || expression.isBlank()) {
             return "Error: expression is required for jdwp_set_exception_logpoint. "
                 + "Use jdwp_set_exception_breakpoint for a suspending exception BP without expression evaluation.";
@@ -2318,7 +2337,7 @@ public class JDWPTools {
         return registerExceptionBreakpointInternal(
             exceptionClass, caught, uncaught,
             expression, condition,
-            triggerBreakpointId, oneShot);
+            triggerBreakpointId, oneShot, forceLoad);
     }
 
     /**
@@ -2335,7 +2354,8 @@ public class JDWPTools {
         String exceptionClass,
         @Nullable Boolean caught, @Nullable Boolean uncaught,
         @Nullable String expression, @Nullable String condition,
-        @Nullable Integer triggerBreakpointId, @Nullable Boolean oneShot) {
+        @Nullable Integer triggerBreakpointId, @Nullable Boolean oneShot,
+        @Nullable Boolean forceLoad) {
         try {
             final boolean effectiveCaught = caught == null || caught;
             final boolean effectiveUncaught = uncaught == null || uncaught;
@@ -2357,8 +2377,13 @@ public class JDWPTools {
             final VirtualMachine vm = jdiService.getVM();
             final EventRequestManager erm = vm.eventRequestManager();
 
-            // Try eager: check classesByName, and if empty, force-load via Class.forName
-            final ReferenceType eagerType = jdiService.findOrForceLoadClass(exceptionClass);
+            // Passive lookup by default; only force-load when the caller opts in. The bootstrap-
+            // class problem (ClassPrepareEvent not delivered for java.*/jdk.* exceptions never
+            // referenced by user code) is the primary forceLoad=true use case.
+            final boolean effectiveForceLoad = forceLoad != null && forceLoad;
+            final ReferenceType eagerType = effectiveForceLoad
+                ? jdiService.findOrForceLoadClass(exceptionClass)
+                : jdiService.findLoadedClass(exceptionClass);
 
             if (eagerType == null) {
                 // Class not loadable yet — defer
@@ -2426,8 +2451,10 @@ public class JDWPTools {
     @McpTool(description = "Set a field watchpoint that suspends the firing thread when the field is read " +
         "(mode='access'), written (mode='modification'), or both. Conditions are evaluated against the firing " +
         "frame with $oldValue, $newValue (modification only), $object (null for static), $fieldName, and $mode " +
-        "bound. If the class is not yet loaded, the watchpoint is deferred and activates automatically. " +
-        "ERROR if the field is ambiguous on the class, missing, or static when objectFilterId is supplied.")
+        "bound. By default the BP is registered passively: if the class is not yet loaded it is deferred via " +
+        "a ClassPrepareRequest and activates on natural load. Pass forceLoad=true to bind immediately and " +
+        "accept the side effects of running `<clinit>` in the target VM. ERROR if the field is ambiguous on the " +
+        "class, missing, or static when objectFilterId is supplied.")
     public String jdwp_set_field_breakpoint(
         @McpToolParam(description = "Fully-qualified class declaring the field (e.g., 'com.example.Order')") String className,
         @McpToolParam(description = "Field name (must be unambiguous on the class)") String fieldName,
@@ -2436,19 +2463,23 @@ public class JDWPTools {
         @McpToolParam(required = false, description = "Optional thread filter — only fire when this thread (uniqueID) hits the field") @Nullable Long threadFilterId,
         @McpToolParam(required = false, description = "Optional object filter — only fire on the given instance (object ID from jdwp_get_locals/jdwp_get_fields). Must be omitted for static fields.") @Nullable Long objectFilterId,
         @McpToolParam(required = false, description = "Optional ID of a trigger breakpoint — this field BP stays disarmed until the trigger fires. Sticky by default.") @Nullable Integer triggerBreakpointId,
-        @McpToolParam(required = false, description = "If true, re-disarm this BP after each hit so the next trigger fire re-arms it. Default: false (sticky).") @Nullable Boolean oneShot) {
+        @McpToolParam(required = false, description = "If true, re-disarm this BP after each hit so the next trigger fire re-arms it. Default: false (sticky).") @Nullable Boolean oneShot,
+        @McpToolParam(required = false, description = "If true, force-load the declaring class via Class.forName when it isn't already loaded. Default: false (passive — defer via ClassPrepareRequest). Force-load triggers `<clinit>` and may mask lazy-init / classloader-leak diagnostics — use sparingly.") @Nullable Boolean forceLoad) {
         return registerFieldBreakpointInternal(
             className, fieldName, mode,
             /* expression */ null, condition,
             threadFilterId, objectFilterId,
-            triggerBreakpointId, oneShot);
+            triggerBreakpointId, oneShot, forceLoad);
     }
 
     @McpTool(description = "Set a non-stopping field watchpoint that records a FIELD_LOGPOINT event for each " +
         "access or modification of the field. The expression is evaluated against the firing frame with " +
         "$oldValue, $newValue (modification only), $object (null for static), $fieldName, and $mode bound; " +
         "its result is attached to the event. Optional condition gates whether the log is recorded. " +
-        "Use this to trace state transitions in long-running services without halting traffic.")
+        "Use this to trace state transitions in long-running services without halting traffic. By default the " +
+        "logpoint is registered passively: if the class is not yet loaded it is deferred via a " +
+        "ClassPrepareRequest and activates on natural load. Pass forceLoad=true to bind immediately and " +
+        "accept the side effects of running `<clinit>` in the target VM.")
     public String jdwp_set_field_logpoint(
         @McpToolParam(description = "Fully-qualified class declaring the field") String className,
         @McpToolParam(description = "Field name (must be unambiguous on the class)") String fieldName,
@@ -2458,7 +2489,8 @@ public class JDWPTools {
         @McpToolParam(required = false, description = "Optional thread filter — only fire when this thread (uniqueID) hits the field") @Nullable Long threadFilterId,
         @McpToolParam(required = false, description = "Optional object filter — only fire on the given instance. Must be omitted for static fields.") @Nullable Long objectFilterId,
         @McpToolParam(required = false, description = "Optional ID of a trigger breakpoint — this logpoint stays disarmed until the trigger fires. Sticky by default.") @Nullable Integer triggerBreakpointId,
-        @McpToolParam(required = false, description = "If true, re-disarm after each hit so the next trigger fire re-arms it. Default: false (sticky).") @Nullable Boolean oneShot) {
+        @McpToolParam(required = false, description = "If true, re-disarm after each hit so the next trigger fire re-arms it. Default: false (sticky).") @Nullable Boolean oneShot,
+        @McpToolParam(required = false, description = "If true, force-load the declaring class via Class.forName when it isn't already loaded. Default: false (passive — defer via ClassPrepareRequest). Force-load triggers `<clinit>` and may mask lazy-init diagnostics — use sparingly.") @Nullable Boolean forceLoad) {
         if (expression == null || expression.isBlank()) {
             return "Error: expression is required for jdwp_set_field_logpoint. "
                 + "Use jdwp_set_field_breakpoint for a suspending field BP without expression evaluation.";
@@ -2467,7 +2499,7 @@ public class JDWPTools {
             className, fieldName, mode,
             expression, condition,
             threadFilterId, objectFilterId,
-            triggerBreakpointId, oneShot);
+            triggerBreakpointId, oneShot, forceLoad);
     }
 
     /**
@@ -2484,7 +2516,8 @@ public class JDWPTools {
         String className, String fieldName, String mode,
         @Nullable String expression, @Nullable String condition,
         @Nullable Long threadFilterId, @Nullable Long objectFilterId,
-        @Nullable Integer triggerBreakpointId, @Nullable Boolean oneShot) {
+        @Nullable Integer triggerBreakpointId, @Nullable Boolean oneShot,
+        @Nullable Boolean forceLoad) {
         try {
             if (className == null || className.isBlank()) {
                 return "Error: className is required";
@@ -2523,7 +2556,10 @@ public class JDWPTools {
 
             final VirtualMachine vm = jdiService.getVM();
             final EventRequestManager erm = vm.eventRequestManager();
-            final ReferenceType eagerType = jdiService.findOrForceLoadClass(className);
+            final boolean effectiveForceLoad = forceLoad != null && forceLoad;
+            final ReferenceType eagerType = effectiveForceLoad
+                ? jdiService.findOrForceLoadClass(className)
+                : jdiService.findLoadedClass(className);
 
             final String chainInfo = triggerBreakpointId != null
                 ? String.format("\n  Chain: trigger=#%d%s",
