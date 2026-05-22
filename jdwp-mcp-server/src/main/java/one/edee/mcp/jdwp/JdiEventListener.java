@@ -1018,7 +1018,19 @@ public class JdiEventListener {
                     // otherwise the very first event could fire before the trigger ever has.
                     breakpointTracker.disarmIfChained(id, bpRequest);
 
-                    breakpointTracker.promotePendingToActive(id, bpRequest);
+                    if (!breakpointTracker.promotePendingToActive(id, bpRequest)) {
+                        // The opportunistic safety net in BreakpointTracker.tryPromotePending won
+                        // the race and bound a different BreakpointRequest under this synthetic id.
+                        // Tear down the loser before it can fire — otherwise a duplicate event
+                        // would arrive on the target VM with no tracker entry pointing at it.
+                        try {
+                            erm.deleteEventRequest(bpRequest);
+                        } catch (Exception ignored) {
+                            // VM may already be disconnected — best-effort cleanup.
+                        }
+                        log.debug("[JDI] Deferred breakpoint {} promotion lost the race to the opportunistic path; orphan request deleted", id);
+                        continue;
+                    }
                     log.info("[JDI] Deferred breakpoint {} activated at {}:{}", id, className, pending.getLineNumber());
 
                 } catch (AbsentInformationException e) {
@@ -1040,7 +1052,17 @@ public class JdiEventListener {
                     exReq.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
                     exReq.enable();
                     breakpointTracker.disarmIfChained(id, exReq);
-                    breakpointTracker.promotePendingExceptionToActive(id, exReq);
+                    if (!breakpointTracker.promotePendingExceptionToActive(id, exReq)) {
+                        // Lost the race against tryPromotePending — see the line BP arm above for
+                        // the full rationale. Tear down the orphan request so it cannot fire.
+                        try {
+                            erm.deleteEventRequest(exReq);
+                        } catch (Exception ignored) {
+                            // VM may already be disconnected — best-effort cleanup.
+                        }
+                        log.debug("[JDI] Deferred exception breakpoint {} promotion lost the race to the opportunistic path; orphan request deleted", id);
+                        continue;
+                    }
                     log.info("[JDI] Deferred exception breakpoint {} activated for {}", id, className);
                 } catch (Exception e) {
                     breakpointTracker.markPendingExceptionFailed(id, e.getMessage());

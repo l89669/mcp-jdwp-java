@@ -1883,8 +1883,15 @@ public class JDWPTools {
                         // registered could fire once unchained on a hot code path.
                         final BreakpointRequest bpRequest = erm.createBreakpointRequest(locations.get(0));
                         bpRequest.setSuspendPolicy(jdiPolicy);
-                        breakpointTracker.promotePendingToActive(pendingId, bpRequest);
-                        if (triggerBreakpointId == null) {
+                        if (!breakpointTracker.promotePendingToActive(pendingId, bpRequest)) {
+                            // Another path (listener or safety-net) won the promotion race; tear
+                            // down the loser request so no duplicate fires on the target VM.
+                            try {
+                                erm.deleteEventRequest(bpRequest);
+                            } catch (Exception ignored) {
+                                // VM may already be disconnected — best-effort cleanup.
+                            }
+                        } else if (triggerBreakpointId == null) {
                             bpRequest.setEnabled(true);
                         }
                         return String.format("Breakpoint set at %s:%d (ID: %d, suspend: %s%s%s)",
@@ -1980,7 +1987,15 @@ public class JDWPTools {
                         final BreakpointRequest bpRequest = erm.createBreakpointRequest(locations.get(0));
                         bpRequest.setSuspendPolicy(jdiPolicy);
                         bpRequest.enable();
-                        breakpointTracker.promotePendingToActive(pendingId, bpRequest);
+                        if (!breakpointTracker.promotePendingToActive(pendingId, bpRequest)) {
+                            // Another path (listener or safety-net) won the promotion race; tear
+                            // down the loser request so no duplicate fires on the target VM.
+                            try {
+                                erm.deleteEventRequest(bpRequest);
+                            } catch (Exception ignored) {
+                                // VM may already be disconnected — best-effort cleanup.
+                            }
+                        }
                         return String.format("Logpoint set at %s:%d (ID: %d, expression: %s%s)",
                             className, lineNumber, pendingId, expression, conditionInfo);
                     }

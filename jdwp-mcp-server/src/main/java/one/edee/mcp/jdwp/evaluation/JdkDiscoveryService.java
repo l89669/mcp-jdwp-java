@@ -15,22 +15,22 @@ import java.util.stream.Stream;
 
 /**
  * Discovers a local JDK installation matching the target JVM's Java version. The Eclipse JDT
- * compiler used by {@link InMemoryJavaCompiler} needs `--system <jdkPath>` to resolve `java.*`
- * system classes when compiling expression-evaluator wrapper classes; without this discovery the
- * compiler can't produce bytecode for the target.
+ * compiler used by {@link InMemoryJavaCompiler} needs {@code --system <jdkPath>} to resolve
+ * {@code java.*} system classes when compiling expression-evaluator wrapper classes; without this
+ * discovery the compiler can't produce bytecode for the target.
  * <p>
  * One-shot, stateful helper: holds {@link #targetMajorVersion} after a successful
  * {@link #discoverMatchingJdk} so callers can read it without re-running discovery. NOT a Spring
  * bean — instantiated manually by {@link ClasspathDiscoverer} per discovery call.
  * <p>
  * Search strategy (in order):
- * 1. The target JVM's own `java.home` if accessible from the MCP server's filesystem.
- * 2. The `JAVA_HOME` environment variable, but only when its `<jdkHome>/release` file confirms
- * a matching major version (a mismatched JAVA_HOME would later trigger cryptic JDT class-file
+ * 1. The target JVM's own {@code java.home} if accessible from the MCP server's filesystem.
+ * 2. The {@code JAVA_HOME} environment variable, but only when its {@code <jdkHome>/release} file
+ * confirms a matching major version (a mismatched JAVA_HOME would later trigger cryptic JDT class-file
  * errors).
- * 3. Common per-OS install paths (Adoptium, Oracle, OpenJDK, Zulu on Windows; `/usr/lib/jvm`,
- * `/opt`, SDKMAN under `~/.sdkman/candidates/java` on Linux/macOS).
- * 4. Directory scan of those parent paths for any subdirectory matching a `<name>-<version>`
+ * 3. Common per-OS install paths (Adoptium, Oracle, OpenJDK, Zulu on Windows; {@code /usr/lib/jvm},
+ * {@code /opt}, SDKMAN under {@code ~/.sdkman/candidates/java} on Linux/macOS).
+ * 4. Directory scan of those parent paths for any subdirectory matching a {@code <name>-<version>}
  * pattern containing the major version.
  */
 public class JdkDiscoveryService {
@@ -106,7 +106,7 @@ public class JdkDiscoveryService {
     }
 
     /**
-     * Reads {@code JAVA_VERSION="…"} from the `<jdkHome>/release` file (Java 9+ ships it
+     * Reads {@code JAVA_VERSION="…"} from the {@code <jdkHome>/release} file (Java 9+ ships it
      * unconditionally) and returns the parsed major version. Returns 0 if the file is missing
      * or malformed — callers should treat that as "version unknown, don't use".
      */

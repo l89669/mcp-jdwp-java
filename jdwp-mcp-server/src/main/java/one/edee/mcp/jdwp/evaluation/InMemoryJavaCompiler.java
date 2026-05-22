@@ -26,7 +26,7 @@ import java.util.stream.Collectors;
  * `javax.tools.JavaFileObject` backed by a path. The temp directory is unconditionally deleted in `finally`.
  * <p>
  * Requires {@link #configure(String, String, int)} to be called first with the path to a target-matching JDK
- * (used as `--system <jdkPath>` so JDT can resolve `java.*` system classes) and the target VM's classpath.
+ * (used as {@code --system <jdkPath>} so JDT can resolve {@code java.*} system classes) and the target VM's classpath.
  * Calling {@link #compile(String, String)} without configuration throws {@link JdiEvaluationException}.
  * <p>
  * Source/target version is derived from the major version: `1.8` for Java 8, the bare number for Java 9+.

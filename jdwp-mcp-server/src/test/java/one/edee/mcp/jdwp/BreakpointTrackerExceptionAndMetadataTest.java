@@ -1,5 +1,6 @@
 package one.edee.mcp.jdwp;
 
+import com.sun.jdi.AbsentInformationException;
 import com.sun.jdi.Location;
 import com.sun.jdi.ReferenceType;
 import com.sun.jdi.VirtualMachine;
@@ -15,6 +16,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 
+import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -586,6 +588,350 @@ class BreakpointTrackerExceptionAndMetadataTest {
 			assertThat(promoted).isEqualTo(1);
 			// enable() is called (from the production code itself), but setEnabled(false) must NOT.
 			verify(bp, org.mockito.Mockito.never()).setEnabled(false);
+		}
+	}
+
+	/**
+	 * Recheck-race coverage for the {@code tryPromotePending} per-entry recheck branches. The
+	 * worker thread snapshots pending entries under the tracker monitor, releases the monitor for
+	 * the (potentially slow) {@code findOrForceLoadClass} JDI hop, then re-acquires the monitor to
+	 * recheck-then-promote each entry. Three things can have changed during the JDI hop:
+	 * <ul>
+	 *   <li>another thread removed the pending entry (e.g. user issued {@code jdwp_clear})</li>
+	 *   <li>another thread marked the pending entry failed (e.g. listener path classifier)</li>
+	 *   <li>the listener path already promoted the entry from the {@code ClassPrepareEvent} side</li>
+	 * </ul>
+	 * In all three cases the worker's per-entry recheck must short-circuit so it neither double-
+	 * registers a JDI request nor counts the entry as freshly promoted.
+	 */
+	@Nested
+	@DisplayName("tryPromotePending per-entry recheck races")
+	class PromotePendingRecheckRaces {
+
+		@Test
+		void shouldReturnZeroAndSkipEntryWhenPendingLineBpIsRemovedWhileWorkerIsResolvingClass() throws Exception {
+			JDIConnectionService service = mock(JDIConnectionService.class);
+			VirtualMachine vm = mock(VirtualMachine.class);
+			EventRequestManager erm = mock(EventRequestManager.class);
+			ReferenceType refType = mock(ReferenceType.class);
+			when(service.getRawVM()).thenReturn(vm);
+			when(vm.eventRequestManager()).thenReturn(erm);
+
+			int pendingId = tracker.registerPendingBreakpoint("com.example.Foo", 42, 2, "ALL");
+
+			// While the worker is parked inside findOrForceLoadClass, another caller removes the
+			// pending entry. The recheck must observe pendingBreakpointsById.get(id) != pending and
+			// continue without ever calling locationsOfLine / createBreakpointRequest.
+			when(service.findOrForceLoadClass(eq("com.example.Foo"), any()))
+				.thenAnswer(inv -> {
+					tracker.removePendingBreakpoint(pendingId);
+					return refType;
+				});
+
+			int promoted = tracker.tryPromotePending(service, null);
+
+			assertThat(promoted).isZero();
+			assertThat(tracker.getPendingBreakpoint(pendingId)).isNull();
+			assertThat(tracker.getBreakpoint(pendingId)).isNull();
+			org.mockito.Mockito.verify(refType, org.mockito.Mockito.never()).locationsOfLine(org.mockito.ArgumentMatchers.anyInt());
+		}
+
+		@Test
+		void shouldReturnZeroAndSkipEntryWhenPendingLineBpIsMarkedFailedWhileWorkerIsResolvingClass() throws Exception {
+			JDIConnectionService service = mock(JDIConnectionService.class);
+			VirtualMachine vm = mock(VirtualMachine.class);
+			EventRequestManager erm = mock(EventRequestManager.class);
+			ReferenceType refType = mock(ReferenceType.class);
+			when(service.getRawVM()).thenReturn(vm);
+			when(vm.eventRequestManager()).thenReturn(erm);
+
+			int pendingId = tracker.registerPendingBreakpoint("com.example.Foo", 42, 2, "ALL");
+
+			when(service.findOrForceLoadClass(eq("com.example.Foo"), any()))
+				.thenAnswer(inv -> {
+					tracker.markPendingFailed(pendingId, "concurrent classifier marked failed");
+					return refType;
+				});
+
+			int promoted = tracker.tryPromotePending(service, null);
+
+			assertThat(promoted).isZero();
+			// Entry stays in the pending map so the failure reason is visible to overview tools.
+			assertThat(tracker.getPendingBreakpoint(pendingId)).isNotNull();
+			assertThat(tracker.getPendingBreakpoint(pendingId).getFailureReason())
+				.isEqualTo("concurrent classifier marked failed");
+			org.mockito.Mockito.verify(refType, org.mockito.Mockito.never()).locationsOfLine(org.mockito.ArgumentMatchers.anyInt());
+		}
+
+		@Test
+		void shouldReturnZeroForLineBpWhenAnotherCallerHasPromotedItToActiveWhileWorkerIsResolvingClass() throws Exception {
+			JDIConnectionService service = mock(JDIConnectionService.class);
+			VirtualMachine vm = mock(VirtualMachine.class);
+			EventRequestManager erm = mock(EventRequestManager.class);
+			ReferenceType refType = mock(ReferenceType.class);
+			BreakpointRequest listenerBp = mock(BreakpointRequest.class, "listenerBp");
+			when(service.getRawVM()).thenReturn(vm);
+			when(vm.eventRequestManager()).thenReturn(erm);
+
+			int pendingId = tracker.registerPendingBreakpoint("com.example.Foo", 42, 2, "ALL");
+
+			// While the worker is parked, the listener path promotes the same id to active using its
+			// own BreakpointRequest. The worker's recheck must observe breakpointsById.containsKey(id)
+			// and skip the entry — otherwise it would overwrite breakpointsById with its own BP and
+			// leave listenerBp armed on the target VM as a ghost without tracker entry.
+			when(service.findOrForceLoadClass(eq("com.example.Foo"), any()))
+				.thenAnswer(inv -> {
+					tracker.promotePendingToActive(pendingId, listenerBp);
+					return refType;
+				});
+
+			int promoted = tracker.tryPromotePending(service, null);
+
+			assertThat(promoted).isZero();
+			assertThat(tracker.getBreakpoint(pendingId))
+				.as("the listener-side BP must remain bound to the synthetic id")
+				.isSameAs(listenerBp);
+			org.mockito.Mockito.verify(refType, org.mockito.Mockito.never()).locationsOfLine(org.mockito.ArgumentMatchers.anyInt());
+		}
+
+		@Test
+		void shouldReturnZeroAndSkipEntryWhenPendingExceptionBpIsRemovedWhileWorkerIsResolvingClass() throws Exception {
+			JDIConnectionService service = mock(JDIConnectionService.class);
+			VirtualMachine vm = mock(VirtualMachine.class);
+			EventRequestManager erm = mock(EventRequestManager.class);
+			ReferenceType refType = mock(ReferenceType.class);
+			when(service.getRawVM()).thenReturn(vm);
+			when(vm.eventRequestManager()).thenReturn(erm);
+
+			int pendingId = tracker.registerPendingExceptionBreakpoint(
+				ExceptionBreakpointSpec.suspending("com.example.MyException", true, true));
+
+			when(service.findOrForceLoadClass(eq("com.example.MyException"), any()))
+				.thenAnswer(inv -> {
+					tracker.removeExceptionBreakpoint(pendingId);
+					return refType;
+				});
+
+			int promoted = tracker.tryPromotePending(service, null);
+
+			assertThat(promoted).isZero();
+			assertThat(tracker.getAllPendingExceptionBreakpoints()).doesNotContainKey(pendingId);
+			assertThat(tracker.getAllExceptionBreakpoints()).doesNotContainKey(pendingId);
+			org.mockito.Mockito.verify(erm, org.mockito.Mockito.never())
+				.createExceptionRequest(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.anyBoolean(), org.mockito.ArgumentMatchers.anyBoolean());
+		}
+
+		@Test
+		void shouldReturnZeroAndSkipEntryWhenPendingExceptionBpIsMarkedFailedWhileWorkerIsResolvingClass() throws Exception {
+			JDIConnectionService service = mock(JDIConnectionService.class);
+			VirtualMachine vm = mock(VirtualMachine.class);
+			EventRequestManager erm = mock(EventRequestManager.class);
+			ReferenceType refType = mock(ReferenceType.class);
+			when(service.getRawVM()).thenReturn(vm);
+			when(vm.eventRequestManager()).thenReturn(erm);
+
+			int pendingId = tracker.registerPendingExceptionBreakpoint(
+				ExceptionBreakpointSpec.suspending("com.example.MyException", true, true));
+
+			when(service.findOrForceLoadClass(eq("com.example.MyException"), any()))
+				.thenAnswer(inv -> {
+					tracker.markPendingExceptionFailed(pendingId, "concurrent classifier marked failed");
+					return refType;
+				});
+
+			int promoted = tracker.tryPromotePending(service, null);
+
+			assertThat(promoted).isZero();
+			assertThat(tracker.getAllPendingExceptionBreakpoints().get(pendingId).getFailureReason())
+				.isEqualTo("concurrent classifier marked failed");
+			org.mockito.Mockito.verify(erm, org.mockito.Mockito.never())
+				.createExceptionRequest(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.anyBoolean(), org.mockito.ArgumentMatchers.anyBoolean());
+		}
+
+		@Test
+		void shouldReturnZeroForExceptionBpWhenAnotherCallerHasPromotedItToActiveWhileWorkerIsResolvingClass() throws Exception {
+			JDIConnectionService service = mock(JDIConnectionService.class);
+			VirtualMachine vm = mock(VirtualMachine.class);
+			EventRequestManager erm = mock(EventRequestManager.class);
+			ReferenceType refType = mock(ReferenceType.class);
+			ExceptionRequest listenerExReq = mock(ExceptionRequest.class, "listenerExReq");
+			when(service.getRawVM()).thenReturn(vm);
+			when(vm.eventRequestManager()).thenReturn(erm);
+
+			int pendingId = tracker.registerPendingExceptionBreakpoint(
+				ExceptionBreakpointSpec.suspending("com.example.MyException", true, true));
+
+			when(service.findOrForceLoadClass(eq("com.example.MyException"), any()))
+				.thenAnswer(inv -> {
+					tracker.promotePendingExceptionToActive(pendingId, listenerExReq);
+					return refType;
+				});
+
+			int promoted = tracker.tryPromotePending(service, null);
+
+			assertThat(promoted).isZero();
+			assertThat(tracker.getAllExceptionBreakpoints().get(pendingId).getRequest())
+				.as("the listener-side ExceptionRequest must remain bound to the synthetic id")
+				.isSameAs(listenerExReq);
+			org.mockito.Mockito.verify(erm, org.mockito.Mockito.never())
+				.createExceptionRequest(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.anyBoolean(), org.mockito.ArgumentMatchers.anyBoolean());
+		}
+
+		/**
+		 * Coverage for the {@link AbsentInformationException} branch in the line-BP arm of
+		 * {@link BreakpointTracker#tryPromotePending}: when the class is loaded but carries no
+		 * debug info (or carries it for a different version of the source), {@code locationsOfLine}
+		 * throws {@code AbsentInformationException}. The arm must swallow the exception so a single
+		 * info-less class does not abort promotion of other pending entries, and must leave the
+		 * pending entry in place so a later retry — perhaps after a different version of the class
+		 * loads — gets another chance.
+		 */
+		@Test
+		void shouldSkipLineBpWhenLocationsOfLineThrowsAbsentInformationException() throws Exception {
+			JDIConnectionService service = mock(JDIConnectionService.class);
+			VirtualMachine vm = mock(VirtualMachine.class);
+			EventRequestManager erm = mock(EventRequestManager.class);
+			ReferenceType refType = mock(ReferenceType.class);
+			when(service.getRawVM()).thenReturn(vm);
+			when(vm.eventRequestManager()).thenReturn(erm);
+			when(service.findOrForceLoadClass(eq("com.example.Foo"), any())).thenReturn(refType);
+			when(refType.locationsOfLine(42)).thenThrow(new AbsentInformationException("no debug info"));
+
+			int pendingId = tracker.registerPendingBreakpoint("com.example.Foo", 42, 2, "ALL");
+
+			int promoted = tracker.tryPromotePending(service, null);
+
+			assertThat(promoted).isZero();
+			assertThat(tracker.getPendingBreakpoint(pendingId))
+				.as("pending entry must stay in place so a later retry can succeed")
+				.isNotNull();
+			// The pending entry's failure reason MUST stay null — AbsentInformationException is the
+			// "try again later" branch; only terminal failures should set a failure reason.
+			assertThat(tracker.getPendingBreakpoint(pendingId).getFailureReason()).isNull();
+		}
+
+		/**
+		 * The {@code promoted} counter returned by {@link BreakpointTracker#tryPromotePending}
+		 * counts only entries that were ACTUALLY promoted by this caller — entries that lost their
+		 * recheck race (because another caller already promoted them, removed them, or marked them
+		 * failed) must not contribute to the count. Otherwise the caller's "promoted N entries"
+		 * log line would attribute work that was performed by a different thread.
+		 *
+		 * <p>This test arranges three pending line BPs against three classes; the JDI-invoke
+		 * answer-stub performs concurrent state mutations against entry A (remove) and entry B
+		 * (already-promoted) before returning. Only entry C survives the race and is promoted by
+		 * the caller, so the returned counter must be 1.
+		 */
+		@Test
+		void shouldCountOnlyActuallyPromotedEntriesWhenSomeEntriesLoseRecheckRace() throws Exception {
+			JDIConnectionService service = mock(JDIConnectionService.class);
+			VirtualMachine vm = mock(VirtualMachine.class);
+			EventRequestManager erm = mock(EventRequestManager.class);
+			ReferenceType refTypeA = mock(ReferenceType.class, "refTypeA");
+			ReferenceType refTypeB = mock(ReferenceType.class, "refTypeB");
+			ReferenceType refTypeC = mock(ReferenceType.class, "refTypeC");
+			Location locC = mock(Location.class);
+			BreakpointRequest bpC = mock(BreakpointRequest.class, "bpC");
+			BreakpointRequest listenerBpB = mock(BreakpointRequest.class, "listenerBpB");
+			when(service.getRawVM()).thenReturn(vm);
+			when(vm.eventRequestManager()).thenReturn(erm);
+
+			int idA = tracker.registerPendingBreakpoint("com.example.A", 10, 2, "ALL");
+			int idB = tracker.registerPendingBreakpoint("com.example.B", 20, 2, "ALL");
+			int idC = tracker.registerPendingBreakpoint("com.example.C", 30, 2, "ALL");
+
+			// A: removed under the worker's feet during its JDI invoke.
+			when(service.findOrForceLoadClass(eq("com.example.A"), any()))
+				.thenAnswer(inv -> {
+					tracker.removePendingBreakpoint(idA);
+					return refTypeA;
+				});
+			// B: promoted by another caller while the worker is parked.
+			when(service.findOrForceLoadClass(eq("com.example.B"), any()))
+				.thenAnswer(inv -> {
+					tracker.promotePendingToActive(idB, listenerBpB);
+					return refTypeB;
+				});
+			// C: a clean promotion path — survives the race.
+			when(service.findOrForceLoadClass(eq("com.example.C"), any())).thenReturn(refTypeC);
+			when(refTypeC.locationsOfLine(30)).thenReturn(List.of(locC));
+			when(erm.createBreakpointRequest(locC)).thenReturn(bpC);
+
+			int promoted = tracker.tryPromotePending(service, null);
+
+			assertThat(promoted)
+				.as("only entry C was actually promoted by this caller — A and B lost their recheck race")
+				.isEqualTo(1);
+			assertThat(tracker.getBreakpoint(idB))
+				.as("entry B remains bound to the listener-side BP")
+				.isSameAs(listenerBpB);
+			assertThat(tracker.getBreakpoint(idC)).isSameAs(bpC);
+		}
+	}
+
+	/**
+	 * Guards the already-promoted contract on the {@link BreakpointTracker} promotion methods.
+	 * {@code promotePendingToActive} and {@code promotePendingExceptionToActive} are called from
+	 * two paths that race against each other for the same pending entry — the JDI listener thread
+	 * (on a {@code ClassPrepareEvent}) and the safety-net {@link BreakpointTracker#tryPromotePending}.
+	 * The first promotion must win; the second must observe the existing active entry, return
+	 * {@code false}, and leave callers to tear down the orphan JDI request they just created.
+	 */
+	@Nested
+	@DisplayName("Double-promotion guard")
+	class DoublePromotionGuard {
+
+		@Test
+		void promotePendingToActive_rejectsSecondPromotionForSameId() {
+			int id = tracker.registerPendingBreakpoint("com.example.Foo", 42, 2, "ALL");
+			BreakpointRequest bp1 = mock(BreakpointRequest.class, "bp1");
+			BreakpointRequest bp2 = mock(BreakpointRequest.class, "bp2");
+
+			boolean firstResult = tracker.promotePendingToActive(id, bp1);
+			boolean secondResult = tracker.promotePendingToActive(id, bp2);
+
+			assertThat(firstResult)
+				.as("first promotion succeeds")
+				.isTrue();
+			assertThat(secondResult)
+				.as("second promotion for the same synthetic id is rejected — caller must delete the orphan request")
+				.isFalse();
+			assertThat(tracker.getBreakpoint(id))
+				.as("first-arrived request wins — bp2 must NOT overwrite bp1 in the active map")
+				.isSameAs(bp1);
+			assertThat(tracker.findIdByRequest(bp1))
+				.as("reverse index for the winning request is preserved")
+				.isEqualTo(id);
+			assertThat(tracker.findIdByRequest(bp2))
+				.as("losing request must NOT appear in the reverse index — would be a ghost entry")
+				.isNull();
+		}
+
+		@Test
+		void promotePendingExceptionToActive_rejectsSecondPromotionForSameId() {
+			int id = tracker.registerPendingExceptionBreakpoint(
+				ExceptionBreakpointSpec.suspending("com.example.MyException", true, true));
+			ExceptionRequest exReq1 = mock(ExceptionRequest.class, "exReq1");
+			ExceptionRequest exReq2 = mock(ExceptionRequest.class, "exReq2");
+
+			boolean firstResult = tracker.promotePendingExceptionToActive(id, exReq1);
+			boolean secondResult = tracker.promotePendingExceptionToActive(id, exReq2);
+
+			assertThat(firstResult)
+				.as("first promotion succeeds")
+				.isTrue();
+			assertThat(secondResult)
+				.as("second promotion for the same synthetic id is rejected — caller must delete the orphan request")
+				.isFalse();
+			assertThat(tracker.getAllExceptionBreakpoints().get(id).getRequest())
+				.as("first-arrived request wins — exReq2 must NOT overwrite exReq1 in the active map")
+				.isSameAs(exReq1);
+			assertThat(tracker.findExceptionIdByRequest(exReq1))
+				.as("reverse index for the winning request is preserved")
+				.isEqualTo(id);
+			assertThat(tracker.findExceptionIdByRequest(exReq2))
+				.as("losing request must NOT appear in the reverse index — would be a ghost entry")
+				.isNull();
 		}
 	}
 
