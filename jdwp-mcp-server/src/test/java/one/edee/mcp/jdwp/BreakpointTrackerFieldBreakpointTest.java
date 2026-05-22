@@ -352,4 +352,85 @@ class BreakpointTrackerFieldBreakpointTest {
 		verify(erm).deleteEventRequest(accessReq);
 		assertThat(tracker.getAllFieldBreakpoints()).doesNotContainKey(id);
 	}
+
+	/**
+	 * Recheck-race coverage for the field BP arm: while the worker is parked in
+	 * {@code findOrForceLoadClass}, the listener path promotes the same pending entry via
+	 * {@link BreakpointTracker#promotePendingFieldsForClass}. When the worker re-acquires the
+	 * tracker monitor, its recheck observes that the pending entry is gone and short-circuits
+	 * without invoking {@code erm.createAccessWatchpointRequest} a second time — otherwise a
+	 * duplicate watchpoint would be armed on the target VM with the listener-side info already
+	 * bound under the synthetic id.
+	 */
+	@Test
+	@DisplayName("tryPromotePending returns 0 for field BP when another caller has promoted it during class load")
+	void shouldReturnZeroForFieldBpWhenAnotherCallerHasPromotedItWhileWorkerIsResolvingClass() throws Exception {
+		JDIConnectionService service = mock(JDIConnectionService.class);
+		VirtualMachine vm = mock(VirtualMachine.class);
+		EventRequestManager erm = mock(EventRequestManager.class);
+		ReferenceType refType = mock(ReferenceType.class);
+		AccessWatchpointRequest listenerAccessReq = mock(AccessWatchpointRequest.class, "listenerAccessReq");
+		when(service.getRawVM()).thenReturn(vm);
+		when(vm.eventRequestManager()).thenReturn(erm);
+
+		BreakpointTracker.FieldBreakpointSpec spec = BreakpointTracker.FieldBreakpointSpec.suspending(
+			"com.x.Foo", "bar", BreakpointTracker.FieldWatchMode.ACCESS, null, null, null);
+		int pendingId = tracker.registerPendingFieldBreakpoint(spec);
+
+		// While the worker is parked, simulate the listener-side promotion: remove the pending
+		// entry and insert the listener's access request under the same synthetic id.
+		when(service.findOrForceLoadClass(eq("com.x.Foo"), any()))
+			.thenAnswer(inv -> {
+				tracker.promotePendingFieldToActive(pendingId, listenerAccessReq, null);
+				return refType;
+			});
+
+		int promoted = tracker.tryPromotePending(service, null);
+
+		assertThat(promoted)
+			.as("worker must observe that the pending entry is gone and skip its own creation path")
+			.isZero();
+		assertThat(tracker.getAllFieldBreakpoints().get(pendingId).getAccessRequest())
+			.as("the listener-side request must remain bound to the synthetic id")
+			.isSameAs(listenerAccessReq);
+		verify(erm, org.mockito.Mockito.never()).createAccessWatchpointRequest(org.mockito.ArgumentMatchers.any());
+	}
+
+	/**
+	 * Recheck-race coverage for the field BP arm when the pending entry has been marked failed
+	 * (e.g. by a concurrent classifier that detected an ambiguous field) while the worker is
+	 * parked in {@code findOrForceLoadClass}. The worker's recheck observes the non-null
+	 * failure reason and skips creation — both to avoid duplicating the classifier's work and to
+	 * preserve the failure reason for {@code jdwp_overview} rendering.
+	 */
+	@Test
+	@DisplayName("tryPromotePending returns 0 for field BP when entry is marked failed during class load")
+	void shouldReturnZeroAndSkipEntryWhenPendingFieldBpIsMarkedFailedWhileWorkerIsResolvingClass() throws Exception {
+		JDIConnectionService service = mock(JDIConnectionService.class);
+		VirtualMachine vm = mock(VirtualMachine.class);
+		EventRequestManager erm = mock(EventRequestManager.class);
+		ReferenceType refType = mock(ReferenceType.class);
+		when(service.getRawVM()).thenReturn(vm);
+		when(vm.eventRequestManager()).thenReturn(erm);
+
+		BreakpointTracker.FieldBreakpointSpec spec = BreakpointTracker.FieldBreakpointSpec.suspending(
+			"com.x.Foo", "bar", BreakpointTracker.FieldWatchMode.ACCESS, null, null, null);
+		int pendingId = tracker.registerPendingFieldBreakpoint(spec);
+
+		when(service.findOrForceLoadClass(eq("com.x.Foo"), any()))
+			.thenAnswer(inv -> {
+				tracker.markPendingFieldFailed(pendingId, "ambiguous field — classifier marked failed");
+				return refType;
+			});
+
+		int promoted = tracker.tryPromotePending(service, null);
+
+		assertThat(promoted).isZero();
+		assertThat(tracker.getAllPendingFieldBreakpoints().get(pendingId).getFailureReason())
+			.isEqualTo("ambiguous field — classifier marked failed");
+		// Verify no JDI request creation was attempted — the worker observed the failure reason
+		// and short-circuited before touching the EventRequestManager.
+		verify(erm, org.mockito.Mockito.never()).createAccessWatchpointRequest(org.mockito.ArgumentMatchers.any());
+		verify(erm, org.mockito.Mockito.never()).createModificationWatchpointRequest(org.mockito.ArgumentMatchers.any());
+	}
 }

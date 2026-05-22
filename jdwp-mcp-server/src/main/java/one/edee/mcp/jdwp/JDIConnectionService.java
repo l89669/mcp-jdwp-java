@@ -463,25 +463,41 @@ public class JDIConnectionService {
     /**
      * Returns the connected VirtualMachine, auto-reconnecting if the connection has dropped.
      *
+     * <p><b>Concurrency:</b> the connect / auto-reconnect work runs under the service monitor (so
+     * a concurrent {@code disconnect()} cannot race with an in-flight reconnect), but the
+     * opportunistic pending-breakpoint retry runs <i>outside</i> the monitor. The retry path may
+     * park inside a JDI {@code invokeMethod} (force-loading a deferred class), which can only
+     * complete once our event listener drains the resulting events; holding this monitor across
+     * that round-trip would block every other {@code getVM()} caller — and thus every other MCP
+     * tool call — for the duration of the invoke.
+     *
      * @return the live {@link VirtualMachine} instance
      * @throws Exception if not connected and reconnection fails
      */
-    public synchronized VirtualMachine getVM() throws Exception {
-        ensureConnected();
+    public VirtualMachine getVM() throws Exception {
+        final VirtualMachine current;
+        synchronized (this) {
+            ensureConnected();
+            current = vm;
+        }
         // Opportunistic pending-breakpoint retry — handles bootstrap classes whose ClassPrepareEvent
-        // is never delivered. Best-effort; failures are swallowed.
+        // is never delivered. Best-effort; failures are swallowed. Runs outside the service monitor
+        // (see class-level Javadoc for the rationale).
         try {
             breakpointTracker.tryPromotePending(this, null);
         } catch (Exception e) {
             log.debug("[JDI] Pending promotion failed: {}", e.getMessage());
         }
-        return Objects.requireNonNull(vm);
+        return Objects.requireNonNull(current);
     }
 
     /**
      * Returns the raw VM reference without triggering opportunistic promotion. Used by
      * {@link BreakpointTracker#tryPromotePending(JDIConnectionService, ThreadReference)} to avoid
-     * recursion. Callers must already hold the connection service monitor.
+     * recursion. Reads the {@code vm} field directly without taking the service monitor — the
+     * field is written under the monitor and read here as a plain reference; a stale read returns
+     * a recently-disposed {@link VirtualMachine} whose JDI calls throw {@link com.sun.jdi.VMDisconnectedException},
+     * which the caller already handles.
      */
     @Nullable
     VirtualMachine getRawVM() {
@@ -991,76 +1007,101 @@ public class JDIConnectionService {
     }
 
     /**
-     * Locates a class in the target VM, force-loading it via {@code Class.forName(name)} if not
-     * yet visible. The force-load attempt requires a suspended thread (typically the main thread
-     * paused at VMStart, or any thread suspended at a breakpoint). Returns null if the class
-     * cannot be found or force-loaded.
+     * Convenience overload that lets the implementation pick the force-load thread. Prefer the
+     * two-arg form when a known-good thread is already in hand (e.g. the current breakpoint
+     * thread); it avoids a fallback scan of {@code allThreads()}.
      *
-     * <p>This solves the bootstrap-class problem: classes like {@code java.lang.IllegalStateException}
-     * are not visible to {@link VirtualMachine#classesByName(String)} until first referenced, and
-     * their {@link com.sun.jdi.event.ClassPrepareEvent} is not delivered to JDI clients. Forcing
-     * the load via {@code Class.forName} bypasses both issues.
+     * @see #findOrForceLoadClass(String, ThreadReference)
      */
     @Nullable
-    public synchronized ReferenceType findOrForceLoadClass(String className) {
+    public ReferenceType findOrForceLoadClass(String className) {
         return findOrForceLoadClass(className, null);
     }
 
     /**
-     * Same as {@link #findOrForceLoadClass(String)} but allows passing a preferred thread for the
-     * force-load step. This must be a thread that is suspended at a JDI method-invocation event
+     * Locates a class in the target VM, force-loading it via {@code Class.forName(name)} if not yet
+     * visible. Solves the bootstrap-class problem: classes like {@code java.lang.IllegalStateException}
+     * are not visible to {@link VirtualMachine#classesByName} until first referenced, and their
+     * {@link com.sun.jdi.event.ClassPrepareEvent} is not delivered to JDI clients. Returns
+     * {@code null} if the class cannot be found or force-loaded.
+     *
+     * <p>{@code preferredThread}, if non-null, must be suspended at a JDI method-invocation event
      * (breakpoint, step, exception, class prepare) — JDI cannot invoke methods on threads
-     * suspended via vm.suspend() (e.g., the VMStart-suspended state).
+     * suspended via {@code vm.suspend()} (e.g., the VMStart-suspended state). If unusable or
+     * {@code null}, the method falls back to {@link #findSuspendedThread}.
+     *
+     * <p><b>Concurrency:</b> the method is intentionally not {@code synchronized}. Phase 1 (cheap
+     * lookups via {@link VirtualMachine#classesByName} and the {@code allClasses()} fallback, plus
+     * pre-invoke preparation) runs under the {@code JDIConnectionService} monitor and captures a
+     * local {@code vmRef}. Phase 2 ({@code ClassType.invokeMethod} into the target VM) runs
+     * <i>outside</i> the monitor because it can only complete once our JDI event listener drains
+     * the events produced by running {@code <clinit>}. Holding this monitor across the invoke would
+     * re-introduce the deferred-class-load deadlock that {@link BreakpointTracker#tryPromotePending}
+     * also avoids — any listener path that touches the {@code JDIConnectionService} monitor would
+     * block on a worker parked here. Phase 3 (post-invoke {@code classesByName} lookup) reuses the
+     * captured {@code vmRef} rather than re-reading {@code this.vm}: a concurrent {@code disconnect}
+     * may have nulled the field, and a {@link com.sun.jdi.VMDisconnectedException} from the disposed
+     * reference is already handled here, whereas a {@code null} re-read would silently discard a
+     * successful force-load.
      */
     @Nullable
-    public synchronized ReferenceType findOrForceLoadClass(String className, @Nullable ThreadReference preferredThread) {
-        if (vm == null) {
-            return null;
-        }
+    public ReferenceType findOrForceLoadClass(String className, @Nullable ThreadReference preferredThread) {
+        // Phase 1: cheap lookups + force-load preflight, all under the monitor.
+        final VirtualMachine vmRef;
+        final ThreadReference thread;
+        final ClassType classClass;
+        final Method forName;
+        final StringReference nameRef;
+        synchronized (this) {
+            if (vm == null) {
+                return null;
+            }
+            vmRef = vm;
 
-        // Fast path: already visible via the indexed lookup
-        final List<ReferenceType> existing = vm.classesByName(className);
-        if (!existing.isEmpty()) {
-            return existing.get(0);
-        }
+            // Fast path: already visible via the indexed lookup
+            final List<ReferenceType> existing = vmRef.classesByName(className);
+            if (!existing.isEmpty()) {
+                return existing.get(0);
+            }
 
-        // Fallback 1: full scan of allClasses() — sometimes bootstrap classes appear here
-        // even when classesByName misses them.
-        final ReferenceType scanned = vm.allClasses().stream()
-            .filter(rt -> rt.name().equals(className))
-            .findFirst()
-            .orElse(null);
-        if (scanned != null) {
-            log.info("[JDI] Found '{}' via allClasses() scan (not in classesByName index)", className);
-            return scanned;
-        }
+            // Fallback 1: full scan of allClasses() — sometimes bootstrap classes appear here
+            // even when classesByName misses them.
+            final ReferenceType scanned = vmRef.allClasses().stream()
+                .filter(rt -> rt.name().equals(className))
+                .findFirst()
+                .orElse(null);
+            if (scanned != null) {
+                log.info("[JDI] Found '{}' via allClasses() scan (not in classesByName index)", className);
+                return scanned;
+            }
 
-        // Fallback 2: invoke Class.forName(name) in the target VM to force a load.
-        // JDI requires the thread to be suspended at a method-invocation event AND have frames.
-        final ThreadReference thread = preferredThread != null && isUsableForInvoke(preferredThread)
-            ? preferredThread : findSuspendedThread();
-        if (thread == null) {
-            log.debug("[JDI] Cannot force-load '{}' — no thread suspended at a method-invocation event", className);
-            return null;
-        }
+            // Fallback 2: invoke Class.forName(name) in the target VM to force a load.
+            // JDI requires the thread to be suspended at a method-invocation event AND have frames.
+            thread = preferredThread != null && isUsableForInvoke(preferredThread)
+                ? preferredThread : findSuspendedThread();
+            if (thread == null) {
+                log.debug("[JDI] Cannot force-load '{}' — no thread suspended at a method-invocation event", className);
+                return null;
+            }
 
-        try {
-            log.info("[JDI] Attempting to force-load '{}' via thread '{}' (suspended={}, frames={})",
-                className, thread.name(), thread.isSuspended(), tryFrameCount(thread));
-
-            final List<ReferenceType> classClassList = vm.classesByName("java.lang.Class");
+            final List<ReferenceType> classClassList = vmRef.classesByName("java.lang.Class");
             if (classClassList.isEmpty()) {
                 log.warn("[JDI] java.lang.Class not visible in target VM — cannot force-load");
                 return null;
             }
-            final ClassType classClass = (ClassType) classClassList.get(0);
-            final Method forName = classClass.concreteMethodByName("forName", "(Ljava/lang/String;)Ljava/lang/Class;");
+            classClass = (ClassType) classClassList.get(0);
+            forName = classClass.concreteMethodByName("forName", "(Ljava/lang/String;)Ljava/lang/Class;");
             if (forName == null) {
                 log.warn("[JDI] Class.forName(String) method not found");
                 return null;
             }
+            nameRef = vmRef.mirrorOf(className);
+        }
 
-            final StringReference nameRef = vm.mirrorOf(className);
+        // Phase 2: invokeMethod OUTSIDE the monitor.
+        try {
+            log.info("[JDI] Attempting to force-load '{}' via thread '{}' (suspended={}, frames={})",
+                className, thread.name(), thread.isSuspended(), tryFrameCount(thread));
             // Reentrancy guard: forcing Class.forName runs the target class's <clinit>, which
             // may hit a user breakpoint. Without the guard the listener would re-suspend the
             // thread we are driving and the outer invokeMethod would hang. Capture the id up
@@ -1073,12 +1114,22 @@ public class JDIConnectionService {
                 evaluationGuard.exit(guardedThreadId);
             }
             log.info("[JDI] Force-loaded class '{}' via Class.forName", className);
-
-            final List<ReferenceType> retry = vm.classesByName(className);
-            return retry.isEmpty() ? null : retry.get(0);
         } catch (Exception e) {
             log.warn("[JDI] Could not force-load class '{}': {} ({})",
                 className, e.getMessage(), e.getClass().getSimpleName());
+            return null;
+        }
+
+        // Phase 3: post-invoke lookup. Use the VM reference captured in Phase 1 rather than
+        // re-reading `this.vm`: a concurrent disconnect can null out the field even though our
+        // forceLoad just succeeded against the captured instance, and that disposed reference will
+        // throw VMDisconnectedException from any JDI call — already handled by the surrounding
+        // try/catch chain. Re-reading `this.vm` would silently discard a successful force-load.
+        try {
+            final List<ReferenceType> afterForceLoad = vmRef.classesByName(className);
+            return afterForceLoad.isEmpty() ? null : afterForceLoad.get(0);
+        } catch (Exception e) {
+            log.debug("[JDI] Phase 3 lookup for '{}' failed after force-load: {}", className, e.getMessage());
             return null;
         }
     }

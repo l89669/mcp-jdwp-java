@@ -31,9 +31,34 @@ import java.util.concurrent.atomic.AtomicInteger;
  * normal path) or by the {@link #tryPromotePending} safety net (called from {@link JDIConnectionService#getVM()}
  * before every tool call) for classes loaded before any debugger event was delivered.
  * <p>
- * Thread-safety: all public mutators are `synchronized`; the read-mostly state maps are
- * `ConcurrentHashMap` so listeners can iterate without contending with mutators. The `lastBreakpoint*`
- * fields are `volatile` for cross-thread visibility from the JDI listener thread to MCP worker threads.
+ * <b>Thread-safety:</b> the contract is layered, not uniform — readers should not assume "every
+ * public mutator is {@code synchronized}". The actual rules:
+ * <ul>
+ *   <li>The state maps are {@link ConcurrentHashMap}, so single-map mutations
+ *       ({@code registerBreakpoint}, {@code unregisterByRequest}, {@code markPendingFailed},
+ *       {@code registerClassPrepareRequest}, {@code setCondition}, {@code setLogpointExpression},
+ *       {@code registerExceptionBreakpoint}, {@code registerFieldBreakpoint},
+ *       {@code promotePendingFieldToActive}, …) rely on the map's own atomicity and are
+ *       intentionally not {@code synchronized}.</li>
+ *   <li>{@code synchronized} on this tracker guards operations that must mutate <i>multiple maps
+ *       atomically</i> — promotion (remove from pending + insert into active + index the request),
+ *       removal that spans both maps, {@code clearAll}, and the pending-side registrations whose
+ *       atomicity matters for {@link #tryPromotePending}'s recheck-and-mutate critical section.</li>
+ *   <li>{@link #tryPromotePending} is the documented exception to the "single critical section"
+ *       pattern: it cannot hold the tracker monitor across
+ *       {@link JDIConnectionService#findOrForceLoadClass}, because that call parks the worker
+ *       inside a target-VM {@code invokeMethod} until the JDI event listener drains the resulting
+ *       events — and the listener itself takes this monitor in
+ *       {@link #promotePendingFieldsForClass}. So {@code tryPromotePending} snapshots the pending
+ *       maps under the monitor, releases it across each per-entry force-load round-trip, then
+ *       re-acquires it for a recheck-and-mutate critical section. The {@code promote*} methods
+ *       are the authoritative already-promoted guard; losers in that race tear down their orphan
+ *       JDI request.</li>
+ *   <li>The {@code lastBreakpoint*} fields are {@code volatile} for cross-thread visibility from
+ *       the JDI listener thread to MCP worker threads.</li>
+ * </ul>
+ * When adding new public mutators, decide consciously which bucket they fall into — a method that
+ * touches more than one map atomically must take the monitor; a single-map mutation should not.
  */
 @Service
 public class BreakpointTracker {
@@ -420,11 +445,25 @@ public class BreakpointTracker {
 
     /**
      * Promote a pending breakpoint to active: remove from pending, add to active with the same ID.
+     * Returns {@code true} if the promotion happened. Returns {@code false} when the synthetic id
+     * already has an active entry (the listener path and the {@link #tryPromotePending} safety net
+     * race for the same pending entries, and the second arrival must not overwrite the winner) or
+     * when the pending entry has already been consumed — e.g. the user cleared it between the
+     * class-prepare snapshot and this call. Callers that receive {@code false} are responsible for
+     * tearing down the now-orphan {@link BreakpointRequest} they just created
+     * (via {@code erm.deleteEventRequest(bp)}).
      */
-    public void promotePendingToActive(int id, BreakpointRequest bp) {
-        pendingBreakpointsById.remove(id);
+    public synchronized boolean promotePendingToActive(int id, BreakpointRequest bp) {
+        if (breakpointsById.containsKey(id)) {
+            return false;
+        }
+        final PendingBreakpoint pending = pendingBreakpointsById.remove(id);
+        if (pending == null) {
+            return false;
+        }
         breakpointsById.put(id, bp);
         breakpointIdsByRequest.put(bp, id);
+        return true;
     }
 
     /**
@@ -650,17 +689,26 @@ public class BreakpointTracker {
 
     /**
      * Promotes a pending exception breakpoint to active by removing it from the pending map and
-     * inserting an {@link ExceptionBreakpointInfo} under the same synthetic ID. No-op if the ID is
-     * unknown (e.g., the user removed it between class-prepare and promotion).
+     * inserting an {@link ExceptionBreakpointInfo} under the same synthetic ID. Returns {@code true}
+     * if the promotion happened. Returns {@code false} when the synthetic id already has an active
+     * entry (the listener and the {@link #tryPromotePending} safety net raced for the same pending
+     * entry — the second arrival must not overwrite the winner) or when the pending entry has
+     * already been consumed. Callers that receive {@code false} are responsible for tearing down
+     * the now-orphan {@link ExceptionRequest} they just created.
      */
-    public void promotePendingExceptionToActive(int id, ExceptionRequest req) {
-        final PendingExceptionBreakpoint pending = pendingExceptionBreakpointsById.remove(id);
-        if (pending != null) {
-            final ExceptionBreakpointInfo info = new ExceptionBreakpointInfo(pending.getSpec(), req);
-            exceptionBreakpointsById.put(id, info);
-            exceptionInfoByRequest.put(req, info);
-            exceptionIdsByRequest.put(req, id);
+    public synchronized boolean promotePendingExceptionToActive(int id, ExceptionRequest req) {
+        if (exceptionBreakpointsById.containsKey(id)) {
+            return false;
         }
+        final PendingExceptionBreakpoint pending = pendingExceptionBreakpointsById.remove(id);
+        if (pending == null) {
+            return false;
+        }
+        final ExceptionBreakpointInfo info = new ExceptionBreakpointInfo(pending.getSpec(), req);
+        exceptionBreakpointsById.put(id, info);
+        exceptionInfoByRequest.put(req, info);
+        exceptionIdsByRequest.put(req, id);
+        return true;
     }
 
     /**
@@ -837,10 +885,23 @@ public class BreakpointTracker {
      * Field BPs additionally roll back any partially-created JDI requests if promotion fails
      * mid-flight (a {@code BOTH}-mode entry creates two requests, either of which can throw) and
      * mark the pending entry failed so subsequent cycles do not retry the same orphan-prone path.
+     * <p>
+     * <b>Concurrency:</b> the method is intentionally not {@code synchronized}. Two monitors are
+     * relevant — the tracker monitor (this object) and the {@link JDIConnectionService} monitor.
+     * The pending maps are snapshotted under the tracker monitor here, then each pending entry is
+     * resolved by calling {@link JDIConnectionService#findOrForceLoadClass} <i>without</i> the
+     * tracker monitor held: that call can park inside a target-VM {@code invokeMethod} that only
+     * returns once our event listener drains the resulting events, and the listener takes this
+     * same tracker monitor in {@link #promotePendingFieldsForClass}. The per-entry mutation step
+     * re-acquires the tracker monitor with a recheck that the entry is still pending and that no
+     * other path (listener or a sibling {@link #tryPromotePending} caller) has already promoted
+     * it — the recheck is defense in depth on top of the already-promoted guard inside the
+     * promote* methods themselves. Orphan JDI requests that lose the race are deleted from the
+     * {@link EventRequestManager}.
      *
      * @return number of items promoted in this call
      */
-    public synchronized int tryPromotePending(
+    public int tryPromotePending(
         @Nullable JDIConnectionService jdiService,
         @Nullable ThreadReference preferredThread
     ) {
@@ -860,11 +921,18 @@ public class BreakpointTracker {
             return 0;
         }
 
+        final List<Map.Entry<Integer, PendingBreakpoint>> lineSnapshot;
+        final List<Map.Entry<Integer, PendingExceptionBreakpoint>> exceptionSnapshot;
+        final List<Map.Entry<Integer, PendingFieldBreakpoint>> fieldSnapshot;
+        synchronized (this) {
+            lineSnapshot = new ArrayList<>(pendingBreakpointsById.entrySet());
+            exceptionSnapshot = new ArrayList<>(pendingExceptionBreakpointsById.entrySet());
+            fieldSnapshot = new ArrayList<>(pendingFieldBreakpointsById.entrySet());
+        }
+
         int promoted = 0;
 
-        // Promote pending line breakpoints
-        for (Map.Entry<Integer, PendingBreakpoint> entry :
-            new ArrayList<>(pendingBreakpointsById.entrySet())) {
+        for (Map.Entry<Integer, PendingBreakpoint> entry : lineSnapshot) {
             final int id = entry.getKey();
             final PendingBreakpoint pending = entry.getValue();
             if (pending.getFailureReason() != null) {
@@ -877,19 +945,36 @@ public class BreakpointTracker {
                     continue;
                 }
 
-                final List<Location> locations = refType.locationsOfLine(pending.getLineNumber());
-                if (locations.isEmpty()) {
-                    continue;
-                }
+                synchronized (this) {
+                    // Recheck: the listener path (JdiEventListener.handleClassPrepareEvent) may
+                    // have promoted or removed this entry while we were parked in the JDI invoke.
+                    if (pendingBreakpointsById.get(id) != pending
+                        || pending.getFailureReason() != null
+                        || breakpointsById.containsKey(id)) {
+                        continue;
+                    }
 
-                final BreakpointRequest bp = erm.createBreakpointRequest(locations.get(0));
-                bp.setSuspendPolicy(pending.getSuspendPolicy());
-                bp.enable();
-                disarmIfChained(id, bp);
-                promotePendingToActive(id, bp);
-                promoted++;
-                log.info("[Tracker] Opportunistically promoted pending breakpoint {} for {}:{}",
-                    id, pending.getClassName(), pending.getLineNumber());
+                    final List<Location> locations = refType.locationsOfLine(pending.getLineNumber());
+                    if (locations.isEmpty()) {
+                        continue;
+                    }
+
+                    final BreakpointRequest bp = erm.createBreakpointRequest(locations.get(0));
+                    bp.setSuspendPolicy(pending.getSuspendPolicy());
+                    bp.enable();
+                    disarmIfChained(id, bp);
+                    if (!promotePendingToActive(id, bp)) {
+                        // Defense in depth: the recheck above already short-circuits in the common
+                        // case, but promotePendingToActive is the authoritative guard. If the active
+                        // map gained an entry between the recheck and this call (impossible while we
+                        // hold the monitor, but cheap to assert), tear the orphan request down.
+                        deleteQuietly(erm, bp);
+                        continue;
+                    }
+                    promoted++;
+                    log.info("[Tracker] Opportunistically promoted pending breakpoint {} for {}:{}",
+                        id, pending.getClassName(), pending.getLineNumber());
+                }
             } catch (AbsentInformationException e) {
                 // Class loaded but no debug info — try again later in case a different version arrives
             } catch (Exception e) {
@@ -897,9 +982,7 @@ public class BreakpointTracker {
             }
         }
 
-        // Promote pending exception breakpoints
-        for (Map.Entry<Integer, PendingExceptionBreakpoint> entry :
-            new ArrayList<>(pendingExceptionBreakpointsById.entrySet())) {
+        for (Map.Entry<Integer, PendingExceptionBreakpoint> entry : exceptionSnapshot) {
             final int id = entry.getKey();
             final PendingExceptionBreakpoint pending = entry.getValue();
             if (pending.getFailureReason() != null) {
@@ -912,26 +995,36 @@ public class BreakpointTracker {
                     continue;
                 }
 
-                final ExceptionRequest exReq = erm.createExceptionRequest(
-                    refType, pending.isCaught(), pending.isUncaught());
-                // Always SUSPEND_EVENT_THREAD: even logOnly BPs need a brief suspend so the
-                // listener can read the exception object / evaluate the optional expression.
-                // Auto-resume happens in JdiEventListener.handleExceptionEvent.
-                exReq.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
-                exReq.enable();
-                disarmIfChained(id, exReq);
-                promotePendingExceptionToActive(id, exReq);
-                promoted++;
-                log.info("[Tracker] Opportunistically promoted pending exception breakpoint {} for {}",
-                    id, pending.getExceptionClass());
+                synchronized (this) {
+                    if (pendingExceptionBreakpointsById.get(id) != pending
+                        || pending.getFailureReason() != null
+                        || exceptionBreakpointsById.containsKey(id)) {
+                        continue;
+                    }
+
+                    final ExceptionRequest exReq = erm.createExceptionRequest(
+                        refType, pending.isCaught(), pending.isUncaught());
+                    // Always SUSPEND_EVENT_THREAD: even logOnly BPs need a brief suspend so the
+                    // listener can read the exception object / evaluate the optional expression.
+                    // Auto-resume happens in JdiEventListener.handleExceptionEvent.
+                    exReq.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
+                    exReq.enable();
+                    disarmIfChained(id, exReq);
+                    if (!promotePendingExceptionToActive(id, exReq)) {
+                        // Defense in depth — see the line BP arm above.
+                        deleteQuietly(erm, exReq);
+                        continue;
+                    }
+                    promoted++;
+                    log.info("[Tracker] Opportunistically promoted pending exception breakpoint {} for {}",
+                        id, pending.getExceptionClass());
+                }
             } catch (Exception e) {
                 log.debug("[Tracker] Failed to promote pending exception breakpoint {}: {}", id, e.getMessage());
             }
         }
 
-        // Promote pending field watchpoints
-        for (Map.Entry<Integer, PendingFieldBreakpoint> entry :
-            new ArrayList<>(pendingFieldBreakpointsById.entrySet())) {
+        for (Map.Entry<Integer, PendingFieldBreakpoint> entry : fieldSnapshot) {
             final int id = entry.getKey();
             final PendingFieldBreakpoint pending = entry.getValue();
             if (pending.getFailureReason() != null) {
@@ -943,8 +1036,18 @@ public class BreakpointTracker {
                 if (refType == null) {
                     continue;
                 }
-                if (promoteSinglePendingField(id, pending, refType, vm, erm, jdiService)) {
-                    promoted++;
+                // promoteSinglePendingField mutates state and is shared with the listener-side
+                // path; the synchronized block below makes the recheck + creation + map mutation
+                // atomic so a concurrent promotePendingFieldsForClass cannot wedge a duplicate
+                // watchpoint onto the target VM.
+                synchronized (this) {
+                    if (pendingFieldBreakpointsById.get(id) != pending
+                        || pending.getFailureReason() != null) {
+                        continue;
+                    }
+                    if (promoteSinglePendingField(id, pending, refType, vm, erm, jdiService)) {
+                        promoted++;
+                    }
                 }
             } catch (Exception e) {
                 log.debug("[Tracker] Failed to promote pending field BP {}: {}", id, e.getMessage());
@@ -1548,9 +1651,10 @@ public class BreakpointTracker {
      * {@link #getLastBreakpoint()} or the latest {@link EventHistory} entry based on the
      * returned value.
      * <p>
-     * Used by {@link JDWPTools#jdwp_resume_until_event(Integer)} to avoid the
-     * "step fired → no waiter armed → resume_until_event overshoots" race documented in
-     * P0-2/P0-3.
+     * Used by {@link JDWPTools#jdwp_resume_until_event(Integer)} to close the
+     * "event fires between two tool calls → no waiter armed yet → next resume_until_event
+     * overshoots the just-suspended thread" window: the flag is set unconditionally by
+     * {@link #fireNextEvent} so a late waiter sees the event without re-resuming the VM.
      */
     public synchronized boolean consumePendingFire() {
         if (pendingFire) {
@@ -1575,9 +1679,9 @@ public class BreakpointTracker {
     /**
      * Classifies the JDI event behind a {@link LastBreakpoint} snapshot so the renderer can
      * distinguish "thread is parked because BP #N fired" from "thread is parked because a step
-     * landed" or "…because an exception was thrown". Prior to F-RA2 every snapshot was implicitly
-     * {@link #BREAKPOINT} and a {@link #STEP} landing leaked the *previous* BP id into the
-     * "Event fired" line as a stale {@code breakpoint=N}.
+     * landed" or "…because an exception was thrown". Without this discriminator a {@link #STEP}
+     * landing would inherit and re-render the previous {@code breakpoint=N} from the prior
+     * snapshot, misleading the user about why the thread is parked.
      */
     public enum EventKind {
         /** A line / field / conditional breakpoint hit. */
