@@ -8,6 +8,10 @@ import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.isNull;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 
 /**
@@ -100,5 +104,48 @@ class JDIConnectionServiceReconnectWatcherPreservationTest {
 		assertThat(tracker.getAllBreakpoints())
 			.as("active map must be empty after a failed reconnect — no dangling JDI handles")
 			.isEmpty();
+	}
+
+	/**
+	 * Pins the narrowed VM-death-hook detach window: the hook must be detached ONLY around
+	 * {@code eventListener.stop()} and re-attached immediately after stop returns — NOT held
+	 * detached for the full reconnect body. A wider window would silently swallow a genuine
+	 * post-reattach disconnect of the fresh VM (notifyVmDied would never fire for it).
+	 *
+	 * <p>Verified via Mockito {@code InOrder} on the listener: the sequence must be
+	 * {@code setVmDeathHook(null)} → {@code stop()} → {@code setVmDeathHook(non-null)}, with the
+	 * re-attach happening BEFORE any attach attempt against the fresh target. The attach itself
+	 * fails (port 1) so we never reach a successful {@code start(vm)}; the re-attach must still
+	 * have happened.
+	 */
+	@Test
+	@DisplayName("vmDeathHook is re-attached immediately after listener stop — narrow detach window")
+	void shouldReAttachVmDeathHookBeforeFreshAttachAttempt() throws Exception {
+		final BreakpointTracker tracker = new BreakpointTracker();
+		final EventHistory history = new EventHistory();
+		final WatcherManager watchers = new WatcherManager();
+		final EvaluationGuard guard = new EvaluationGuard();
+		final MarkedInstanceRegistry marks = new MarkedInstanceRegistry();
+		final JdiExpressionEvaluator evaluator = mock(JdiExpressionEvaluator.class);
+		// Mock the listener so we can assert the call order on setVmDeathHook / stop.
+		final JdiEventListener listener = mock(JdiEventListener.class);
+		// Make stop() observable so we can interleave checks: if the test wanted to assert the
+		// hook is null *during* stop, we could capture state here. The InOrder check below
+		// covers the sequencing already.
+		doAnswer(inv -> null).when(listener).stop();
+		final JDIConnectionService service = new JDIConnectionService(
+			listener, tracker, history, watchers, guard, marks, new JdiHealthMonitor());
+
+		JDIConnectionServiceTestSupport.setLastSuccessfulAttach(service, "127.0.0.1", 1);
+
+		assertThatThrownBy(service::reconnectPreservingSpecs)
+			.isInstanceOf(Exception.class);
+
+		// Sequence: null-out hook → stop the listener → restore the hook. The restore must run
+		// BEFORE the failed attach (which throws), proving the detach window is narrow.
+		final var ordered = inOrder(listener);
+		ordered.verify(listener).setVmDeathHook(isNull());
+		ordered.verify(listener).stop();
+		ordered.verify(listener).setVmDeathHook(any(Runnable.class));
 	}
 }

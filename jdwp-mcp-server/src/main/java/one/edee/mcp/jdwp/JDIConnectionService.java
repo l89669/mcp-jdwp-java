@@ -512,153 +512,152 @@ public class JDIConnectionService {
         final int markedCount = markedInstances.list().size();
         final int objectCacheCount = objectCache.size();
 
-        // Detach the VM-death hook BEFORE stopping the listener. The hook is wired to
-        // notifyVmDied(), which calls watcherManager.clearAll() — keeping it attached would
-        // silently wipe the watchers that the reconnect contract promises to preserve. The
-        // teardown is done explicitly below (vm.dispose + clear marks / object cache /
-        // classpath cache); the hook is restored in the finally block once the fresh start
-        // has re-armed the listener.
+        // Detach the VM-death hook ONLY around the intentional eventListener.stop(). The hook is
+        // wired to notifyVmDied(), which calls watcherManager.clearAll() — keeping it attached
+        // during the stop would silently wipe the watchers that the reconnect contract promises
+        // to preserve. Re-attaching immediately after stop() returns means a genuine VM death
+        // AFTER the fresh attach still routes through notifyVmDied(); a wider window (e.g.
+        // detach for the whole method body) would silently swallow a real disconnect of the
+        // fresh VM in the gap between fresh-attach and method exit.
         eventListener.setVmDeathHook(null);
         try {
             // Tear down anything JDI-bound that cannot survive vm.dispose(). Done before the
             // dispose itself so the listener does not drain spurious events on the dying queue.
             eventListener.stop();
-            healthMonitor.stop();
-            if (vm != null) {
-                try {
-                    vm.dispose();
-                } catch (Exception ignored) {
-                    // VM may already be wedged or dead — the dispose is best-effort.
-                }
-                vm = null;
-            }
-            markedInstances.clearAll();
-            objectCache.clear();
-            cachedClasspath = null;
-            discoveredJdkPath = null;
-            targetMajorVersion = 0;
+        } finally {
+            eventListener.setVmDeathHook(this::notifyVmDied);
+        }
 
-            // Restore the tracker into pure-pending state BEFORE the fresh attach. After dispose
-            // the active maps are holding JDI request handles tied to the dead VM — any later
-            // snapshot/inspection on those would throw VMDisconnectedException. Putting the
-            // tracker into "everything pending, no JDI handles" state up front means that if the
-            // reattach itself fails, the agent can safely re-call jdwp_reconnect (or fall back
-            // to jdwp_connect, which calls cleanupSessionState anyway).
-            breakpointTracker.restoreFromSnapshotAsPending(snapshot);
-
-            // Fresh attach to the last known target — no host/port input from the caller so a
-            // mid-incident operator cannot accidentally swap targets while assuming their BPs survive.
-            lastConnectAttempt = Instant.now();
-            lastConnectAttemptHost = host;
-            lastConnectAttemptPort = port;
-            final VirtualMachineManager vmm = Bootstrap.virtualMachineManager();
-            AttachingConnector connector = null;
-            for (AttachingConnector ac : vmm.attachingConnectors()) {
-                if ("com.sun.jdi.SocketAttach".equals(ac.name())) {
-                    connector = ac;
-                    break;
-                }
-            }
-            if (connector == null) {
-                lastConnectError = "SocketAttach connector not found";
-                throw new RuntimeException("SocketAttach connector not found");
-            }
-            final Map<String, Connector.Argument> args = connector.defaultArguments();
-            Objects.requireNonNull(args.get("hostname"), "SocketAttach connector missing 'hostname' argument").setValue(host);
-            Objects.requireNonNull(args.get("port"), "SocketAttach connector missing 'port' argument").setValue(String.valueOf(port));
+        healthMonitor.stop();
+        if (vm != null) {
             try {
-                vm = connector.attach(args);
-            } catch (Exception e) {
-                lastConnectError = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
-                // Tracker is already in pending state from the restore above — the agent's BPs
-                // are recoverable via a retry. No further bookkeeping needed here beyond
-                // surfacing the original error.
-                throw e;
+                vm.dispose();
+            } catch (Exception ignored) {
+                // VM may already be wedged or dead — the dispose is best-effort.
             }
-            lastConnectError = null;
-            eventListener.start(vm);
-            healthMonitor.start(vm);
+            vm = null;
+        }
+        markedInstances.clearAll();
+        objectCache.clear();
+        cachedClasspath = null;
+        discoveredJdkPath = null;
+        targetMajorVersion = 0;
 
-            // Register a ClassPrepareRequest per unique pending class name so the listener picks
-            // up subsequent loads. The pending entries themselves were already restored above;
-            // already-loaded classes will bind immediately via tryPromotePending below.
-            final EventRequestManager erm = vm.eventRequestManager();
-            final Set<String> classesNeedingPrepare = new java.util.LinkedHashSet<>();
-            for (BreakpointTracker.LineBreakpointEntry e : snapshot.lineBreakpoints()) {
-                classesNeedingPrepare.add(e.className());
-            }
-            for (BreakpointTracker.ExceptionBreakpointEntry e : snapshot.exceptionBreakpoints()) {
-                classesNeedingPrepare.add(e.spec().exceptionClass());
-            }
-            for (BreakpointTracker.FieldBreakpointEntry e : snapshot.fieldBreakpoints()) {
-                classesNeedingPrepare.add(e.spec().className());
-            }
-            for (String className : classesNeedingPrepare) {
-                try {
-                    final ClassPrepareRequest cpr = erm.createClassPrepareRequest();
-                    cpr.addClassFilter(className);
-                    cpr.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
-                    cpr.enable();
-                    breakpointTracker.registerClassPrepareRequest(className, cpr);
-                } catch (Exception cprError) {
-                    // Best-effort: a CPR failure for one class must not prevent the rest of the
-                    // reconnect from completing. The opportunistic promoter below will still bind
-                    // already-loaded classes, and a subsequent class load will simply not auto-promote.
-                    log.warn("[Reconnect] Failed to register ClassPrepareRequest for {}: {}",
-                        className, cprError.getMessage());
-                }
-            }
+        // Restore the tracker into pure-pending state BEFORE the fresh attach. After dispose
+        // the active maps are holding JDI request handles tied to the dead VM — any later
+        // snapshot/inspection on those would throw VMDisconnectedException. Putting the
+        // tracker into "everything pending, no JDI handles" state up front means that if the
+        // reattach itself fails, the agent can safely re-call jdwp_reconnect (or fall back
+        // to jdwp_connect, which calls cleanupSessionState anyway).
+        breakpointTracker.restoreFromSnapshotAsPending(snapshot);
 
-            // Promote any pending entries whose class is already loaded in the fresh VM.
-            final int promoted;
+        // Fresh attach to the last known target — no host/port input from the caller so a
+        // mid-incident operator cannot accidentally swap targets while assuming their BPs survive.
+        lastConnectAttempt = Instant.now();
+        lastConnectAttemptHost = host;
+        lastConnectAttemptPort = port;
+        final VirtualMachineManager vmm = Bootstrap.virtualMachineManager();
+        AttachingConnector connector = null;
+        for (AttachingConnector ac : vmm.attachingConnectors()) {
+            if ("com.sun.jdi.SocketAttach".equals(ac.name())) {
+                connector = ac;
+                break;
+            }
+        }
+        if (connector == null) {
+            lastConnectError = "SocketAttach connector not found";
+            throw new RuntimeException("SocketAttach connector not found");
+        }
+        final Map<String, Connector.Argument> args = connector.defaultArguments();
+        Objects.requireNonNull(args.get("hostname"), "SocketAttach connector missing 'hostname' argument").setValue(host);
+        Objects.requireNonNull(args.get("port"), "SocketAttach connector missing 'port' argument").setValue(String.valueOf(port));
+        try {
+            vm = connector.attach(args);
+        } catch (Exception e) {
+            lastConnectError = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
+            // Tracker is already in pending state from the restore above — the agent's BPs
+            // are recoverable via a retry. No further bookkeeping needed here beyond
+            // surfacing the original error.
+            throw e;
+        }
+        lastConnectError = null;
+        eventListener.start(vm);
+        healthMonitor.start(vm);
+
+        // Register a ClassPrepareRequest per unique pending class name so the listener picks
+        // up subsequent loads. The pending entries themselves were already restored above;
+        // already-loaded classes will bind immediately via tryPromotePending below.
+        final EventRequestManager erm = vm.eventRequestManager();
+        final Set<String> classesNeedingPrepare = new java.util.LinkedHashSet<>();
+        for (BreakpointTracker.LineBreakpointEntry e : snapshot.lineBreakpoints()) {
+            classesNeedingPrepare.add(e.className());
+        }
+        for (BreakpointTracker.ExceptionBreakpointEntry e : snapshot.exceptionBreakpoints()) {
+            classesNeedingPrepare.add(e.spec().exceptionClass());
+        }
+        for (BreakpointTracker.FieldBreakpointEntry e : snapshot.fieldBreakpoints()) {
+            classesNeedingPrepare.add(e.spec().className());
+        }
+        for (String className : classesNeedingPrepare) {
             try {
-                promoted = breakpointTracker.tryPromotePending(this);
-            } catch (Exception e) {
-                // Defensive — the tracker's safety-net promoter is best-effort even on the regular
-                // path; an exception here must not turn a successful re-attach into a failure.
-                log.warn("[Reconnect] Opportunistic promotion threw: {}", e.getMessage());
-                eventHistory.record(new EventHistory.DebugEvent("RECONNECT",
-                    String.format("Reconnected to %s:%d; promotion error", host, port),
-                    Map.of("host", host, "port", String.valueOf(port))));
-                return new ReconnectResult(
-                    host, port,
-                    0,
-                    snapshot.lineBreakpoints().size(),
-                    snapshot.lineBreakpoints().size(),
-                    snapshot.exceptionBreakpoints().size(),
-                    snapshot.fieldBreakpoints().size(),
-                    watcherCount,
-                    markedCount,
-                    objectCacheCount
-                );
+                final ClassPrepareRequest cpr = erm.createClassPrepareRequest();
+                cpr.addClassFilter(className);
+                cpr.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
+                cpr.enable();
+                breakpointTracker.registerClassPrepareRequest(className, cpr);
+            } catch (Exception cprError) {
+                // Best-effort: a CPR failure for one class must not prevent the rest of the
+                // reconnect from completing. The opportunistic promoter below will still bind
+                // already-loaded classes, and a subsequent class load will simply not auto-promote.
+                log.warn("[Reconnect] Failed to register ClassPrepareRequest for {}: {}",
+                    className, cprError.getMessage());
             }
+        }
 
+        // Promote any pending entries whose class is already loaded in the fresh VM.
+        final int promoted;
+        try {
+            promoted = breakpointTracker.tryPromotePending(this);
+        } catch (Exception e) {
+            // Defensive — the tracker's safety-net promoter is best-effort even on the regular
+            // path; an exception here must not turn a successful re-attach into a failure.
+            log.warn("[Reconnect] Opportunistic promotion threw: {}", e.getMessage());
             eventHistory.record(new EventHistory.DebugEvent("RECONNECT",
-                String.format("Reconnected to %s:%d, promoted %d/%d line BPs", host, port,
-                    promoted, snapshot.lineBreakpoints().size()),
-                Map.of("host", host, "port", String.valueOf(port),
-                    "promoted", String.valueOf(promoted))));
-
-            // breakpointsById is the line-BP map; reading its size after tryPromotePending gives
-            // the exact count of line BPs that bound against already-loaded classes. The rest
-            // remain pending in pendingBreakpointsById.
-            final int activeLines = breakpointTracker.getAllBreakpoints().size();
-            final int deferredLines = snapshot.lineBreakpoints().size() - activeLines;
-
+                String.format("Reconnected to %s:%d; promotion error", host, port),
+                Map.of("host", host, "port", String.valueOf(port))));
             return new ReconnectResult(
                 host, port,
-                activeLines, Math.max(0, deferredLines),
+                0,
+                snapshot.lineBreakpoints().size(),
                 snapshot.lineBreakpoints().size(),
                 snapshot.exceptionBreakpoints().size(),
                 snapshot.fieldBreakpoints().size(),
-                watcherCount, markedCount, objectCacheCount
+                watcherCount,
+                markedCount,
+                objectCacheCount
             );
-        } finally {
-            // Re-attach the death hook so a subsequent natural VM death (after reconnect)
-            // still routes through notifyVmDied(). Runs even on the attach-failure path so
-            // the next jdwp_connect / jdwp_reconnect operates against a properly-wired listener.
-            eventListener.setVmDeathHook(this::notifyVmDied);
         }
+
+        eventHistory.record(new EventHistory.DebugEvent("RECONNECT",
+            String.format("Reconnected to %s:%d, promoted %d/%d line BPs", host, port,
+                promoted, snapshot.lineBreakpoints().size()),
+            Map.of("host", host, "port", String.valueOf(port),
+                "promoted", String.valueOf(promoted))));
+
+        // breakpointsById is the line-BP map; reading its size after tryPromotePending gives
+        // the exact count of line BPs that bound against already-loaded classes. The rest
+        // remain pending in pendingBreakpointsById.
+        final int activeLines = breakpointTracker.getAllBreakpoints().size();
+        final int deferredLines = snapshot.lineBreakpoints().size() - activeLines;
+
+        return new ReconnectResult(
+            host, port,
+            activeLines, Math.max(0, deferredLines),
+            snapshot.lineBreakpoints().size(),
+            snapshot.exceptionBreakpoints().size(),
+            snapshot.fieldBreakpoints().size(),
+            watcherCount, markedCount, objectCacheCount
+        );
     }
 
     /**
