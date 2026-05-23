@@ -175,14 +175,25 @@ public class JdiEventListener {
      * source line maps to multiple Locations (one in the enclosing method, one inside the
      * synthetic {@code lambda$...$N} method) and {@code locationsOfLine(line).get(0)} only
      * binds the first.
+     *
+     * <p>No-throw end-to-end. Both the structured form and the {@code toString()} fallback can
+     * raise JDI runtime exceptions (e.g. {@code VMDisconnectedException}, {@code ClassNotPreparedException})
+     * during VM-tear-down races; on any failure we return a fixed placeholder so a single
+     * diagnostic call cannot abort the surrounding BP install path or tool response.
      */
     static String describeLocation(Location location) {
         try {
             return location.method().name() + "@bci=" + location.codeIndex();
         } catch (Exception e) {
-            // Defensive — method() / codeIndex() can throw on certain pathological synthetic
-            // methods; fall back to the toString() form so the diagnostic still produces output.
-            return location.toString();
+            // method() / codeIndex() failed (e.g. pathological synthetic, VM mid-disconnect).
+            // Try the JDI toString() form as a softer fallback.
+            try {
+                return location.toString();
+            } catch (Exception ignored) {
+                // Even toString() can throw on a half-torn-down Location. Return a fixed marker
+                // so the diagnostic emits SOMETHING and the caller keeps running.
+                return "<location-unavailable>";
+            }
         }
     }
 
@@ -1096,20 +1107,26 @@ public class JdiEventListener {
                     // covers ONE of the code paths; if the user's code runs through the OTHER
                     // location, the BP silently misses. The bound-Location detail also helps
                     // confirm we bound where the user expected vs. an off-by-one source-map slip.
+                    // Logpoints share this pending-line path, so distinguish the label in the log
+                    // and event so an agent grepping for "logpoint" sees its hit.
+                    final boolean isLogpoint = breakpointTracker.isLogpoint(id);
+                    final String kindUpper = isLogpoint ? "LP" : "BP";
+                    final String kindLower = isLogpoint ? "logpoint" : "breakpoint";
                     if (locations.size() > 1) {
-                        log.warn("[JDI] Deferred breakpoint {} activated at {}:{} — line has {} Locations; bound only to {} (other paths will MISS this BP)",
-                            id, className, pending.getLineNumber(), locations.size(), describeLocation(location));
+                        log.warn("[JDI] Deferred {} {} activated at {}:{} — line has {} Locations; bound only to {} (other paths will MISS this {})",
+                            kindLower, id, className, pending.getLineNumber(), locations.size(), describeLocation(location), kindUpper);
                         eventHistory.record(new EventHistory.DebugEvent("BP_MULTI_LOCATION",
-                            String.format("BP #%d at %s:%d — line has %d bytecode locations; bound only to %s (other paths will MISS)",
-                                id, className, pending.getLineNumber(), locations.size(), describeLocation(location)),
+                            String.format("%s #%d at %s:%d — line has %d bytecode locations; bound only to %s (other paths will MISS)",
+                                kindUpper, id, className, pending.getLineNumber(), locations.size(), describeLocation(location)),
                             Map.of("breakpointId", String.valueOf(id),
+                                "kind", kindLower,
                                 "class", className,
                                 "line", String.valueOf(pending.getLineNumber()),
                                 "locationCount", String.valueOf(locations.size()),
                                 "boundLocation", describeLocation(location))));
                     } else {
-                        log.info("[JDI] Deferred breakpoint {} activated at {}:{} ({})",
-                            id, className, pending.getLineNumber(), describeLocation(location));
+                        log.info("[JDI] Deferred {} {} activated at {}:{} ({})",
+                            kindLower, id, className, pending.getLineNumber(), describeLocation(location));
                     }
 
                 } catch (AbsentInformationException e) {

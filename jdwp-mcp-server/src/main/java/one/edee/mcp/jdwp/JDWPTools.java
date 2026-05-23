@@ -2037,7 +2037,8 @@ public class JDWPTools {
                         // request while it is still being wired up. JDI delivers events the instant
                         // a request is enabled, so a chained BP enabled before its chain edge is
                         // registered could fire once unchained on a hot code path.
-                        final BreakpointRequest bpRequest = erm.createBreakpointRequest(locations.get(0));
+                        final Location boundLocation = locations.get(0);
+                        final BreakpointRequest bpRequest = erm.createBreakpointRequest(boundLocation);
                         bpRequest.setSuspendPolicy(jdiPolicy);
                         if (!breakpointTracker.promotePendingToActive(pendingId, bpRequest)) {
                             // Another path (listener or safety-net) won the promotion race; tear
@@ -2050,8 +2051,12 @@ public class JDWPTools {
                         } else if (triggerBreakpointId == null) {
                             bpRequest.setEnabled(true);
                         }
-                        return String.format("Breakpoint set at %s:%d (ID: %d, suspend: %s%s%s)",
-                            className, lineNumber, pendingId, policyLabel, conditionInfo, chainInfo);
+                        // Multi-location diagnostic — must apply to the race-guard path too, not
+                        // just the eager path, otherwise lambda-bearing lines silently miss
+                        // depending on whether the class loaded before or after BP registration.
+                        return String.format("Breakpoint set at %s:%d (ID: %d, suspend: %s%s%s%s)",
+                            className, lineNumber, pendingId, policyLabel, conditionInfo, chainInfo,
+                            multiLocationSuffix(locations, boundLocation, "BP"));
                     }
                 }
 
@@ -2090,12 +2095,9 @@ public class JDWPTools {
             // Diagnostic — see JdiEventListener.handleClassPrepareEvent for the rationale. A
             // line with multiple Locations (typical for lambdas) only gets a BP at the first
             // one; the other code paths through the same line silently miss.
-            final String multiLocSuffix = locations.size() > 1
-                ? String.format(", WARNING: line has %d Locations; bound only to %s — other paths will MISS this BP",
-                    locations.size(), JdiEventListener.describeLocation(boundLocation))
-                : "";
             return String.format("Breakpoint set at %s:%d (ID: %d, suspend: %s%s%s%s)",
-                className, lineNumber, breakpointId, policyLabel, conditionInfo, chainInfo, multiLocSuffix);
+                className, lineNumber, breakpointId, policyLabel, conditionInfo, chainInfo,
+                multiLocationSuffix(locations, boundLocation, "BP"));
         } catch (AbsentInformationException e) {
             cleanupOrphanPendingBreakpoint(pendingIdForCleanup);
             return "Error: No line number information available for this class. Compile with debug info (-g).";
@@ -2152,7 +2154,8 @@ public class JDWPTools {
                     final ReferenceType refType = recheck.get(0);
                     final List<Location> locations = refType.locationsOfLine(lineNumber);
                     if (!locations.isEmpty()) {
-                        final BreakpointRequest bpRequest = erm.createBreakpointRequest(locations.get(0));
+                        final Location boundLocation = locations.get(0);
+                        final BreakpointRequest bpRequest = erm.createBreakpointRequest(boundLocation);
                         bpRequest.setSuspendPolicy(jdiPolicy);
                         bpRequest.enable();
                         if (!breakpointTracker.promotePendingToActive(pendingId, bpRequest)) {
@@ -2164,8 +2167,10 @@ public class JDWPTools {
                                 // VM may already be disconnected — best-effort cleanup.
                             }
                         }
-                        return String.format("Logpoint set at %s:%d (ID: %d, expression: %s%s)",
-                            className, lineNumber, pendingId, expression, conditionInfo);
+                        // Multi-location diagnostic — same rationale as jdwp_set_breakpoint.
+                        return String.format("Logpoint set at %s:%d (ID: %d, expression: %s%s%s)",
+                            className, lineNumber, pendingId, expression, conditionInfo,
+                            multiLocationSuffix(locations, boundLocation, "LP"));
                     }
                 }
 
@@ -2192,12 +2197,9 @@ public class JDWPTools {
             }
 
             // Diagnostic — see jdwp_set_breakpoint for the rationale.
-            final String multiLocSuffix = locations.size() > 1
-                ? String.format(", WARNING: line has %d Locations; bound only to %s — other paths will MISS this LP",
-                    locations.size(), JdiEventListener.describeLocation(boundLocation))
-                : "";
             return String.format("Logpoint set at %s:%d (ID: %d, expression: %s%s%s)",
-                className, lineNumber, breakpointId, expression, conditionInfo, multiLocSuffix);
+                className, lineNumber, breakpointId, expression, conditionInfo,
+                multiLocationSuffix(locations, boundLocation, "LP"));
         } catch (AbsentInformationException e) {
             cleanupOrphanPendingBreakpoint(pendingIdForCleanup);
             return "Error: No line number information available. Compile with debug info (-g).";
@@ -2217,6 +2219,25 @@ public class JDWPTools {
         if (pendingId != null) {
             breakpointTracker.removePendingBreakpoint(pendingId);
         }
+    }
+
+    /**
+     * Formats the multi-location WARNING suffix appended to BP / LP install responses when a
+     * source line maps to more than one bytecode {@link Location}. Returns an empty string when
+     * there is only one Location, so the caller can splat the value into a format string
+     * unconditionally. {@code kind} is the short label ("BP" / "LP") used in the warning text.
+     * <p>
+     * Shared by both {@code jdwp_set_breakpoint} / {@code jdwp_set_logpoint} AND their race-guard
+     * paths (where the class loaded between the initial {@code classesByName} check and the
+     * ClassPrepareRequest registration) so the diagnostic surfaces uniformly regardless of which
+     * activation path the install took.
+     */
+    private static String multiLocationSuffix(List<Location> locations, Location boundLocation, String kind) {
+        if (locations.size() <= 1) {
+            return "";
+        }
+        return String.format(", WARNING: line has %d Locations; bound only to %s — other paths will MISS this %s",
+            locations.size(), JdiEventListener.describeLocation(boundLocation), kind);
     }
 
     @McpTool(description = "Clear a breakpoint by its synthetic ID (from jdwp_overview). Routes by kind: line, exception, and field breakpoints share one ID space.")
