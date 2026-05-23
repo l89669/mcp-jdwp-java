@@ -5,6 +5,120 @@ All notable changes to the `jdwp-debugging` plugin are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.2.0] — 2026-05-23
+
+### New — agent-driven JDI wedge recovery
+
+When the target JVM stops responding to JDI commands (paused in a native
+section, GC-stalled, frozen by another debugger client, or wedged behind a
+deferred-class-load deadlock), the MCP server used to hang every subsequent
+tool call indefinitely. Cancellation from the client was a no-op because the
+worker was parked in a JDI native wait. The agent had no signal to
+distinguish "the user hasn't hit my breakpoint yet" from "the JDI connection
+is dead." Resolves #4.
+
+Four cooperating pieces:
+
+- **`JdiHealthMonitor`** — a daemon-thread service that observes JDWP
+  traffic passively (every event drained by `JdiEventListener` brushes
+  against `notifyTraffic`) and escalates to a single `vm.allThreads()`
+  probe wrapped in `Future.get(5s)` after 30 s of silence. The snapshot
+  (`RESPONSIVE` / `UNRESPONSIVE` / `DISCONNECTED` with last-traffic and
+  last-probe timestamps) is read-only state for downstream renderers — the
+  monitor never auto-recovers.
+- **Soft wait protocol** — `jdwp_resume_until_event` and
+  `jdwp_wait_for_attach` now lead their timeout responses with a structured
+  `still_waiting` envelope citing the current JDI Health classification
+  plus the `wait_more` / `reconnect` / `abort` options. No hard server-side
+  backstop: the agent re-calls to wait more.
+- **`jdwp_reconnect`** — `vm.dispose()`s the current connection and
+  re-attaches to the last `host:port`, preserving the synthetic
+  breakpoint-ID space, line / exception / field BP specs, conditions,
+  logpoint expressions, chain edges, watchers, and event history. Marked
+  instances, the object cache, last-suspended-thread context, and the
+  classpath cache cannot survive `vm.dispose` and are dropped (the response
+  enumerates what was preserved vs lost). A different target host:port
+  needs `jdwp_connect`.
+- **`jdwp_diagnose` extension** — a new JDI Health block renders status,
+  last-traffic age, last-probe outcome, and the recommended action when
+  the connection is wedged.
+
+### Fixed — passive breakpoint registration (no more debugger-induced side effects)
+
+Until this release, every `jdwp_set_*` tool (line, exception, field BPs and
+logpoints) invoked `Class.forName(name)` inside the target VM when the
+class was not yet visible to JDI. That changes target-application
+behaviour the way a debugger never should: it triggers `<clinit>` early,
+cascade-loads dependencies, can fire user breakpoints, and masks the
+lazy-load diagnostics users attach a debugger to investigate. Resolves #3.
+
+- **Default behaviour is now passive** — `JDIConnectionService.findLoadedClass`
+  does `classesByName` + `allClasses` scan only (no `invokeMethod`).
+  Unresolved classes are deferred via `ClassPrepareRequest`, matching
+  IntelliJ / Eclipse / `jdb` semantics.
+- **`forceLoad` opt-in** — all six set-breakpoint MCP tools accept a
+  Boolean `forceLoad`; default `false`. Set `true` only when you need the
+  bootstrap-class case for exception BPs (the primary motivator).
+- **`BreakpointTracker.tryPromotePending`** now uses `findLoadedClass`
+  exclusively; the unused `preferredThread` parameter is dropped.
+
+### Fixed — deferred class-load deadlock in `BreakpointTracker.tryPromotePending`
+
+`tryPromotePending` was `synchronized` and called `findOrForceLoadClass`
+(which issues a target-VM `invokeMethod`) while holding the
+`BreakpointTracker` monitor. The JDI event listener takes that same
+monitor in `promotePendingFieldsForClass`, so a worker parked in
+`invokeMethod` blocked the listener that had to deliver the reply,
+permanently wedging the MCP server. Any subsequent MCP tool call queued
+behind the worker on `JDIConnectionService`'s monitor, so the whole server
+became unresponsive. Resolves #1.
+
+- **`tryPromotePending` refactored** to snapshot the three pending maps
+  under a brief synchronized block, drop the monitor before any JDI
+  round-trip, and re-acquire it per entry for an atomic
+  recheck-and-mutate.
+- **`JDIConnectionService.findOrForceLoadClass`** split into three phases
+  (lookup under monitor → `invokeMethod` outside monitor → post-invoke
+  lookup on captured `vmRef`) so the same hazard cannot recur on the
+  connection-service monitor.
+- **`getVM()` restructured** to release its monitor before calling
+  `tryPromotePending`, closing the reentrant-hold variant of the same
+  cycle.
+- **Two double-promotion races closed** — `promotePendingToActive` and
+  `promotePendingExceptionToActive` are now `synchronized` and return
+  `boolean`; `false` means "already promoted, caller must
+  `erm.deleteEventRequest` the surplus request." All call sites updated.
+
+### Fixed — review polish on the wedge-recovery feature
+
+A round of code-review follow-ups before the release cut:
+
+- **`jdwp_reconnect` leaves a recoverable tracker on attach failure** —
+  active-map entries pointing at dead JDI request handles used to survive
+  a failed reattach and trip `VMDisconnectedException` on the next
+  `jdwp_reconnect`. The tracker is now restored to pure-pending state
+  BEFORE the attach attempt.
+- **`JdiHealthMonitor` probe / stop race closed** — the three snapshot
+  publishes in `runActiveProbe` and the in-threshold publish in
+  `probeTick` are wrapped in `synchronized(this)` blocks with a
+  `vmRef.get() == vm` re-check, so a concurrent `stop()` cannot be
+  overwritten back to `RESPONSIVE` / `UNRESPONSIVE`. `notifyTraffic()` is
+  now `synchronized` and bails when `vmRef` is null, so a late
+  event-listener drain after disconnect cannot revive a stopped monitor.
+  `cancelProbeTask` switched from `cancel(false)` to `cancel(true)` to
+  interrupt an in-flight probe promptly.
+- **`vmDeathHook` detach window narrowed** during
+  `reconnectPreservingSpecs` — the hook is now detached only around the
+  listener `stop()` call (and re-attached in an inner `finally`) so any
+  real `VMDeath` / `VMDisconnect` of the fresh VM during dispose, attach,
+  listener start, or pending-BP promotion still invokes `notifyVmDied()`.
+  The original intent — preventing `notifyVmDied → watcherManager.clearAll()`
+  from firing during the intentional stop — is preserved.
+- **Watchers preserved across `jdwp_reconnect`** — `JdiEventListener.stop()`
+  invokes the VM-death hook; the hook now detaches around stop so the
+  contract's "watchers survive" promise is honoured. Pinned by a new
+  reconnect-watcher-preservation test.
+
 ## [2.1.2] — 2026-05-19
 
 ### Fixed — JDK discovery on SDKMAN / honors JAVA_HOME
