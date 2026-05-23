@@ -16,12 +16,19 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 /**
- * Tests {@link JdiExpressionEvaluator}'s private {@code getDeclaredType(ReferenceType)} helper.
- * This routine resolves the type name the wrapper class should reference, taking care of
- * dynamic proxies (CGLIB / Guice / Mockito {@code $$}) and non-public types (walks up to a
- * public supertype, falling back to {@code java.lang.Object}).
+ * Tests {@link JdiExpressionEvaluator}'s private
+ * {@code getDeclaredType(ReferenceType, String)} helper. This routine resolves the type name
+ * the wrapper class should reference, taking care of dynamic proxies (CGLIB / Guice / Mockito
+ * {@code $$}) and non-public types (walks up to a public supertype, or to a same-package type
+ * the wrapper can see by being emitted into that package, falling back to {@code java.lang.Object}).
  */
 class JdiExpressionEvaluatorGetDeclaredTypeTest {
+
+	/**
+	 * The default isolated wrapper package — passing this disables the "share package with target"
+	 * shortcut and exercises the legacy walk-to-public-supertype behaviour.
+	 */
+	private static final String DEFAULT_WRAPPER_PACKAGE = "mcp.jdi.evaluation";
 
 	private JdiExpressionEvaluator evaluator;
 
@@ -143,8 +150,72 @@ class JdiExpressionEvaluatorGetDeclaredTypeTest {
 	}
 
 	private String invokeGetDeclaredType(ReferenceType type) throws Exception {
+		return invokeGetDeclaredType(type, DEFAULT_WRAPPER_PACKAGE);
+	}
+
+	private String invokeGetDeclaredType(ReferenceType type, String wrapperPackage) throws Exception {
 		return TestReflectionUtils.invokePrivate(
 			evaluator, "getDeclaredType",
-			new Class[]{ReferenceType.class}, type);
+			new Class[]{ReferenceType.class, String.class}, type, wrapperPackage);
+	}
+
+	@Nested
+	@DisplayName("Wrapper-shares-package mode")
+	class WrapperSharesPackage {
+
+		@Test
+		@DisplayName("non-public type in wrapper package — returned as-is")
+		void shouldReturnNonPublicTypeWhenWrapperSharesPackage() throws Exception {
+			ClassType type = mock(ClassType.class);
+			when(type.name()).thenReturn("com.example.PackagePrivate");
+			when(type.isPublic()).thenReturn(false);
+			// No need to mock superclass — the same-package check short-circuits the walk.
+
+			assertThat(invokeGetDeclaredType(type, "com.example")).isEqualTo("com.example.PackagePrivate");
+		}
+
+		@Test
+		@DisplayName("non-public type in OTHER package — still walks up to public supertype")
+		void shouldStillWalkUpWhenWrapperPackageDiffers() throws Exception {
+			ClassType pub = mock(ClassType.class);
+			when(pub.name()).thenReturn("com.example.PublicAncestor");
+			when(pub.isPublic()).thenReturn(true);
+
+			ClassType type = mock(ClassType.class);
+			when(type.name()).thenReturn("com.elsewhere.Hidden");
+			when(type.isPublic()).thenReturn(false);
+			when(type.superclass()).thenReturn(pub);
+
+			assertThat(invokeGetDeclaredType(type, "com.example"))
+				.isEqualTo("com.example.PublicAncestor");
+		}
+
+		@Test
+		@DisplayName("nested-class binary name — `$` is rewritten to `.` in the source form")
+		void shouldRewriteNestedClassDollarToDot() throws Exception {
+			ClassType type = mock(ClassType.class);
+			when(type.name()).thenReturn("com.example.Outer$Inner");
+			when(type.isPublic()).thenReturn(true);
+
+			assertThat(invokeGetDeclaredType(type, "com.example"))
+				.isEqualTo("com.example.Outer.Inner");
+		}
+
+		@Test
+		@DisplayName("anonymous-class binary name — refuses to expose, walks to a public supertype")
+		void shouldNotExposeAnonymousClass() throws Exception {
+			ClassType pub = mock(ClassType.class);
+			when(pub.name()).thenReturn("com.example.Public");
+			when(pub.isPublic()).thenReturn(true);
+
+			// `Outer$1` is an anonymous class — JLS does not let any class reference it by name,
+			// including from its own package. The walk should keep going up to the public ancestor.
+			ClassType anon = mock(ClassType.class);
+			when(anon.name()).thenReturn("com.example.Outer$1");
+			when(anon.isPublic()).thenReturn(false);
+			when(anon.superclass()).thenReturn(pub);
+
+			assertThat(invokeGetDeclaredType(anon, "com.example")).isEqualTo("com.example.Public");
+		}
 	}
 }

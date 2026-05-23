@@ -40,9 +40,12 @@ public class JdiExpressionEvaluator {
     private static final Logger log = LoggerFactory.getLogger(JdiExpressionEvaluator.class);
 
     /**
-     * Package name baked into every generated wrapper class — kept short and isolated from app code.
+     * Default package used for the generated wrapper class when {@code this} is public (or absent).
+     * Kept short and isolated from app code. Non-public {@code this} types may instead emit the
+     * wrapper into {@code this}'s own package so package-private fields and the type itself become
+     * reachable — see {@link #resolveWrapperPackage}.
      */
-    private static final String EVALUATION_PACKAGE = "mcp.jdi.evaluation";
+    private static final String DEFAULT_EVALUATION_PACKAGE = "mcp.jdi.evaluation";
     /**
      * Class name prefix; the actual name is `<prefix><UUID>` for collision-free reloads.
      */
@@ -290,8 +293,13 @@ public class JdiExpressionEvaluator {
      *                       order is preserved as wrapper-method parameter order — pass a
      *                       {@link java.util.LinkedHashMap} or {@code Map.of(...)} to keep the
      *                       order deterministic.
+     * @param wrapperPackage the package the wrapper class will live in. When this matches the
+     *                       package of a referenced type, that type's package-private members
+     *                       become accessible to the wrapper, so the type can be exposed by its
+     *                       actual (non-public) name instead of walking up to a public supertype.
      */
-    private static EvaluationContext buildContext(StackFrame frame, Map<String, Value> extraBindings)
+    private static EvaluationContext buildContext(StackFrame frame, Map<String, Value> extraBindings,
+                                                  String wrapperPackage)
         throws AbsentInformationException {
         final List<ContextVariable> variables = new ArrayList<>();
         final List<Value> values = new ArrayList<>();
@@ -299,7 +307,7 @@ public class JdiExpressionEvaluator {
         final ObjectReference thisObject = frame.thisObject();
         if (thisObject != null) {
             // Use declared type instead of runtime type to avoid issues with dynamic proxies (Guice, CGLIB, etc.)
-            final String declaredType = getDeclaredType(thisObject.referenceType());
+            final String declaredType = getDeclaredType(thisObject.referenceType(), wrapperPackage);
             variables.add(new ContextVariable("_this", declaredType));
             values.add(thisObject);
         }
@@ -310,7 +318,7 @@ public class JdiExpressionEvaluator {
             // inside it. The `isArgument()` allowance is defensive — a real argument named `this$N`
             // would be unusual but is technically valid bytecode.
             if (var.isArgument() || !var.name().startsWith("this$")) {
-                final String typeName = resolveLocalVarType(var);
+                final String typeName = resolveLocalVarType(var, wrapperPackage);
                 variables.add(new ContextVariable(var.name(), typeName));
                 values.add(frame.getValue(var));
             }
@@ -320,7 +328,7 @@ public class JdiExpressionEvaluator {
         // signature. Cache key (signature + expression) naturally varies on the bound type, so two
         // different exception subclasses thrown at the same site get distinct cached compilations.
         for (Map.Entry<String, Value> entry : extraBindings.entrySet()) {
-            variables.add(new ContextVariable(entry.getKey(), inferDeclaredType(entry.getValue())));
+            variables.add(new ContextVariable(entry.getKey(), inferDeclaredType(entry.getValue(), wrapperPackage)));
             values.add(entry.getValue());
         }
 
@@ -329,13 +337,13 @@ public class JdiExpressionEvaluator {
 
     /**
      * Resolves a wrapper-visible declared type for a JDI {@link Value}. Mirrors the public-supertype
-     * walk performed by {@link #getDeclaredType(ReferenceType)} so a non-public exception subclass
-     * still binds as a public ancestor (worst case {@code java.lang.Object}). Falls back to
-     * {@code java.lang.Object} for {@code null} and unrecognised value kinds.
+     * walk performed by {@link #getDeclaredType(ReferenceType, String)} so a non-public exception
+     * subclass still binds as a public ancestor (worst case {@code java.lang.Object}). Falls back
+     * to {@code java.lang.Object} for {@code null} and unrecognised value kinds.
      */
-    private static String inferDeclaredType(@Nullable Value value) {
+    private static String inferDeclaredType(@Nullable Value value, String wrapperPackage) {
         if (value instanceof ObjectReference objRef) {
-            return getDeclaredType(objRef.referenceType());
+            return getDeclaredType(objRef.referenceType(), wrapperPackage);
         }
         if (value instanceof PrimitiveValue primValue) {
             return primValue.type().name();
@@ -345,13 +353,14 @@ public class JdiExpressionEvaluator {
 
     /**
      * Resolves a local variable's declared type to one the wrapper class can reference.
-     * Falls back to a public supertype (or Object) for non-public types.
+     * Falls back to a public supertype (or Object) for non-public types that live outside the
+     * wrapper's package.
      */
-    private static String resolveLocalVarType(LocalVariable var) {
+    private static String resolveLocalVarType(LocalVariable var, String wrapperPackage) {
         try {
             final Type t = var.type();
             if (t instanceof ReferenceType refType) {
-                return getDeclaredType(refType);
+                return getDeclaredType(refType, wrapperPackage);
             }
             return t.name();
         } catch (ClassNotLoadedException e) {
@@ -366,10 +375,16 @@ public class JdiExpressionEvaluator {
      * is wrapped in `(Object)(...)` so any value type — including primitives via autoboxing —
      * can be returned. The bare `this` keyword in the expression is tokenizer-rewritten to `_this`
      * because the wrapper class doesn't have a `this` reference (it's a static method).
+     *
+     * <p>The package portion of {@code className} drives the wrapper's {@code package} declaration.
+     * When the caller routes a non-public {@code this} type into its own package via
+     * {@link #resolveWrapperPackage}, the wrapper compiles next to that type and can dereference
+     * its package-private members directly.
      */
     private static String generateSourceCode(String className, EvaluationContext context, String expression) {
-        final String packageName = EVALUATION_PACKAGE;
-        final String simpleClassName = className.substring(packageName.length() + 1);
+        final int lastDot = className.lastIndexOf('.');
+        final String packageName = lastDot < 0 ? "" : className.substring(0, lastDot);
+        final String simpleClassName = lastDot < 0 ? className : className.substring(lastDot + 1);
 
         final String methodParameters = context.getVariables().stream()
             .map(v -> v.type + ' ' + v.name)
@@ -380,8 +395,8 @@ public class JdiExpressionEvaluator {
         // literals are NOT rewritten — see {@link #rewriteThisKeyword(String)}.
         final String safeExpression = rewriteThisKeyword(expression);
 
-        return "package " + packageName + ";\n" +
-            '\n' +
+        final String packageDecl = packageName.isEmpty() ? "" : "package " + packageName + ";\n\n";
+        return packageDecl +
             "// Automatically generated class for JDI expression evaluation\n" +
             "public class " + simpleClassName + " {\n" +
             "    public static Object " + EVALUATION_METHOD_NAME + '(' + methodParameters + ") {\n" +
@@ -393,15 +408,22 @@ public class JdiExpressionEvaluator {
 
     /**
      * Get a name suitable to use in the generated wrapper class for the given runtime type.
-     * Handles two cases the wrapper compiler cannot otherwise express:
+     * Handles three cases the wrapper compiler cannot otherwise express:
      * <ul>
      *   <li><b>Dynamic proxies</b> (Guice, CGLIB, Mockito, Spring AOP) — unwrap to the real class.</li>
-     *   <li><b>Non-public types</b> (e.g., package-private test classes) — walk up the superclass
-     *       chain until a public type is found, falling back to {@code java.lang.Object}. The wrapper
-     *       class lives in {@code mcp.jdi.evaluation} and can only reference public types.</li>
+     *   <li><b>Non-public types in {@code wrapperPackage}</b> — exposed by their actual binary name
+     *       (with nested-class {@code $} → {@code .} so the compiler accepts the source form). The
+     *       wrapper lives in the same package, so package-private types and members are reachable.</li>
+     *   <li><b>Non-public types in other packages</b> — walk up the superclass chain until a type
+     *       the wrapper CAN reference is found (public, or sharing {@code wrapperPackage}), falling
+     *       back to {@code java.lang.Object}.</li>
      * </ul>
+     *
+     * @param wrapperPackage the package the wrapper class lives in; types in this package are
+     *                       reachable even when package-private. Pass {@link #DEFAULT_EVALUATION_PACKAGE}
+     *                       for the legacy "only public types reachable" behaviour.
      */
-    private static String getDeclaredType(ReferenceType type) {
+    private static String getDeclaredType(ReferenceType type, String wrapperPackage) {
         while (true) {
             String typeName = type.name();
 
@@ -423,20 +445,128 @@ public class JdiExpressionEvaluator {
                 }
             }
 
-            // Walk up to find a public supertype the wrapper can reference
+            // Walk up to find a supertype the wrapper can reference: either public, or a non-public
+            // type that shares the wrapper's package (which makes package-private access legal).
             if (type instanceof ClassType classType) {
                 ClassType current = classType;
-                while (current != null && !current.isPublic()) {
+                while (current != null && !isReachableFromWrapper(current, wrapperPackage)) {
                     current = current.superclass();
                 }
                 if (current != null) {
-                    return current.name();
+                    return toSourceTypeName(current.name());
                 }
                 return "java.lang.Object";
             }
 
-            return typeName;
+            return toSourceTypeName(typeName);
         }
+    }
+
+    /**
+     * Whether {@code type} can be referenced by name from a wrapper class living in
+     * {@code wrapperPackage}. True if the type is public, or if it lives in the same package and
+     * is not a local/anonymous class (those are unaddressable from source even within their own
+     * package because their names contain {@code $<digit>} which is not a valid source-form
+     * nested-class separator).
+     */
+    private static boolean isReachableFromWrapper(ClassType type, String wrapperPackage) {
+        if (type.isPublic()) {
+            return true;
+        }
+        if (!packageOf(type.name()).equals(wrapperPackage)) {
+            return false;
+        }
+        return !isLocalOrAnonymous(type.name());
+    }
+
+    /**
+     * Extracts the package portion of a fully qualified binary class name. Returns the empty
+     * string for default-package classes. Treats only the last {@code .} before any {@code $} as
+     * the package/class separator — inner-class {@code $} segments stay attached to the simple
+     * name.
+     */
+    private static String packageOf(String binaryName) {
+        // Stop at the first $ so nested-class binary names like com.example.Outer$Inner still
+        // report "com.example" rather than walking into the nested portion.
+        final int dollar = binaryName.indexOf('$');
+        final String topLevel = dollar < 0 ? binaryName : binaryName.substring(0, dollar);
+        final int dot = topLevel.lastIndexOf('.');
+        return dot < 0 ? "" : topLevel.substring(0, dot);
+    }
+
+    /**
+     * Recognises local-class ({@code Outer$1Local}) and anonymous-class ({@code Outer$1}) binary
+     * names. The JLS only allows nested classes to be referenced from source by their dotted form,
+     * so a binary name where a segment after {@code $} starts with a digit cannot be written as a
+     * Java type reference anywhere — not even from the enclosing class's own package.
+     */
+    private static boolean isLocalOrAnonymous(String binaryName) {
+        int dollar = binaryName.indexOf('$');
+        while (dollar >= 0 && dollar + 1 < binaryName.length()) {
+            if (Character.isDigit(binaryName.charAt(dollar + 1))) {
+                return true;
+            }
+            dollar = binaryName.indexOf('$', dollar + 1);
+        }
+        return false;
+    }
+
+    /**
+     * Converts a JDI binary class name to its Java source form by replacing nested-class
+     * {@code $} separators with {@code .}. Top-level classes (no {@code $}) and dynamic-proxy
+     * names ({@code $$} from CGLIB / Guice / Mockito) pass through unchanged — proxy markers are
+     * NOT nested-class separators and rewriting them produces nonsense like {@code Bar..Mock}.
+     * Local and anonymous classes ({@code $<digit>}) must be filtered upstream; this method
+     * does not reject them because the same conversion is occasionally useful for diagnostics.
+     */
+    private static String toSourceTypeName(String binaryName) {
+        if (binaryName.indexOf('$') < 0 || binaryName.contains("$$")) {
+            return binaryName;
+        }
+        return binaryName.replace('$', '.');
+    }
+
+    /**
+     * Decides which package the generated wrapper class should live in for {@code thisObject}.
+     * Returns {@code thisObject}'s own package when emitting the wrapper there will buy us
+     * additional reachability — i.e. {@code this}'s declared type is non-public AND lives in a
+     * package we are allowed to define new classes in (not {@code java.*} / {@code javax.*},
+     * not a local/anonymous class). Otherwise returns {@link #DEFAULT_EVALUATION_PACKAGE} so the
+     * wrapper stays isolated from app code, matching the pre-existing behaviour.
+     *
+     * <p>Dynamic proxies are unwrapped first so a CGLIB proxy of a package-private service still
+     * resolves to the underlying service's package.
+     */
+    private static String resolveWrapperPackage(@Nullable ObjectReference thisObject) {
+        if (thisObject == null || !(thisObject.referenceType() instanceof ClassType startClass)) {
+            return DEFAULT_EVALUATION_PACKAGE;
+        }
+        // Walk proxies to the real class; reuse the same heuristic as getDeclaredType.
+        ClassType effective = startClass;
+        while (effective != null && effective.name().contains("$$")) {
+            final ClassType next = effective.superclass();
+            if (next == null || "java.lang.Object".equals(next.name())) {
+                break;
+            }
+            effective = next;
+        }
+        if (effective == null || effective.isPublic()) {
+            return DEFAULT_EVALUATION_PACKAGE;
+        }
+        final String binaryName = effective.name();
+        if (isLocalOrAnonymous(binaryName)) {
+            return DEFAULT_EVALUATION_PACKAGE;
+        }
+        final String pkg = packageOf(binaryName);
+        // Refuse to define classes into restricted JDK packages — `java.*` is enforced by the JVM
+        // itself, the rest are flagged here so we get a clean log message rather than a runtime
+        // SecurityException far from the decision site.
+        if (pkg.isEmpty() || pkg.startsWith("java.") || pkg.equals("java")
+            || pkg.startsWith("javax.") || pkg.equals("javax")
+            || pkg.startsWith("sun.") || pkg.startsWith("jdk.")) {
+            return DEFAULT_EVALUATION_PACKAGE;
+        }
+        return pkg;
     }
 
     /**
@@ -534,24 +664,36 @@ public class JdiExpressionEvaluator {
             // NOTE: Classpath configuration must be done BEFORE calling evaluate() to avoid nested JDI calls
             // The caller (e.g., jdwp_evaluate_watchers) is responsible for calling configureCompilerClasspath()
 
+            // 0. Decide which package the wrapper class will live in. For a non-public `this` in an
+            //    addressable package, we emit the wrapper alongside it so package-private fields and
+            //    the type itself become reachable; otherwise we use the default isolated package.
+            final ObjectReference thisObject = frame.thisObject();
+            final String wrapperPackage = resolveWrapperPackage(thisObject);
+
             // 1. Analyze the frame to build the evaluation context
-            final EvaluationContext context = buildContext(frame, extraBindings);
+            final EvaluationContext context = buildContext(frame, extraBindings, wrapperPackage);
 
             // Auto-rewrite bare references to fields of `this` so users can write
             // `sessions.containsKey(session)` instead of `_this.sessions.containsKey(session)`.
-            // Only safe when `this`'s declared type is public AND the specific field is public —
-            // otherwise the wrapper class either can't reference the type or can't access the field,
-            // and we'd just produce a misleading compile error ("not visible" instead of a real hint).
-            final ObjectReference thisObject = frame.thisObject();
-            if (thisObject != null && thisObject.referenceType() instanceof ClassType thisClass && thisClass.isPublic()) {
-                final Set<String> shadowingLocals = context.getVariables().stream()
-                    .map(v -> v.name)
-                    .collect(Collectors.toSet());
-                final Set<String> publicFieldNames = thisClass.allFields().stream()
-                    .filter(Field::isPublic)
-                    .map(Field::name)
-                    .collect(Collectors.toSet());
-                expression = rewriteThisFieldReferences(expression, publicFieldNames, shadowingLocals);
+            // The set of rewritable fields depends on what the wrapper can actually see:
+            //  - When the wrapper lives in the default isolated package, only public fields on a
+            //    public declaring type are reachable.
+            //  - When the wrapper lives in `this`'s own package, public/protected/package-private
+            //    fields are all reachable. Private fields still aren't, so they stay un-rewritten
+            //    and produce a compile error the user can fix (or work around via reflection).
+            if (thisObject != null && thisObject.referenceType() instanceof ClassType thisClass) {
+                final boolean sharingPackage = !wrapperPackage.equals(DEFAULT_EVALUATION_PACKAGE)
+                    && wrapperPackage.equals(packageOf(thisClass.name()));
+                if (thisClass.isPublic() || sharingPackage) {
+                    final Set<String> shadowingLocals = context.getVariables().stream()
+                        .map(v -> v.name)
+                        .collect(Collectors.toSet());
+                    final Set<String> rewritableFieldNames = thisClass.allFields().stream()
+                        .filter(f -> sharingPackage ? !f.isPrivate() : f.isPublic())
+                        .map(Field::name)
+                        .collect(Collectors.toSet());
+                    expression = rewriteThisFieldReferences(expression, rewritableFieldNames, shadowingLocals);
+                }
             }
 
             // 2. Use cache key based on context + expression (excludes UUID for cache hits)
@@ -577,7 +719,7 @@ public class JdiExpressionEvaluator {
             } else {
                 // Cache miss — generate unique class name, compile, and cache
                 final String uniqueId = UUID.randomUUID().toString().replace("-", "");
-                className = EVALUATION_PACKAGE + '.' + EVALUATION_CLASS_PREFIX + uniqueId;
+                className = wrapperPackage + '.' + EVALUATION_CLASS_PREFIX + uniqueId;
 
                 final String sourceCode = generateSourceCode(className, context, expression);
 
