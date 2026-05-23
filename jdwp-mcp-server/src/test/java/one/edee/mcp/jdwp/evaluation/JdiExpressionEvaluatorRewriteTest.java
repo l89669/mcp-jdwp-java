@@ -446,4 +446,34 @@ class JdiExpressionEvaluatorRewriteTest {
 	void shouldDetectEmptyBlock() {
 		assertThat(JdiExpressionEvaluator.isBlockMode("{}")).isTrue();
 	}
+
+	@Test
+	@DisplayName("isBlockMode: `}` inside a `/* ... */` block comment does NOT close the outer block")
+	void shouldNotConfuseBracesInsideBlockComment() {
+		// Without comment-skip, the `}` inside the comment would drop depth to 0 and the
+		// outer block would be rejected as non-block input.
+		assertThat(JdiExpressionEvaluator.isBlockMode("{ /* close: } */ return 1; }")).isTrue();
+	}
+
+	@Test
+	@DisplayName("isBlockMode: `}` inside a `//` line comment does NOT close the outer block")
+	void shouldNotConfuseBracesInsideLineComment() {
+		assertThat(JdiExpressionEvaluator.isBlockMode("{ // }\n return 1; }")).isTrue();
+	}
+
+	@Test
+	@DisplayName("isBlockMode: `/* nested } */` followed by real `}` still balances")
+	void shouldHandleBlockCommentWithBraceAtVariousDepths() {
+		// Nested braces in code, plus a `}` hidden inside a comment, plus the real closer.
+		assertThat(JdiExpressionEvaluator.isBlockMode(
+			"{ if (x) { /* not a closer: } */ return 1; } return 0; }")).isTrue();
+	}
+
+	@Test
+	@DisplayName("isBlockMode: unterminated block comment is tolerated, treats remainder as comment")
+	void shouldTolerateUnterminatedBlockComment() {
+		// `/* …` without a closing `*/` swallows the rest of the input including the trailing `}`.
+		// The outer brace then never closes → not block-mode. Must not throw.
+		assertThat(JdiExpressionEvaluator.isBlockMode("{ /* unterminated }")).isFalse();
+	}
 }
