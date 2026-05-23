@@ -465,18 +465,49 @@ public class JdiExpressionEvaluator {
     /**
      * Whether {@code type} can be referenced by name from a wrapper class living in
      * {@code wrapperPackage}. True if the type is public, or if it lives in the same package and
-     * is not a local/anonymous class (those are unaddressable from source even within their own
-     * package because their names contain {@code $<digit>} which is not a valid source-form
-     * nested-class separator).
+     * is neither {@code private} nor a local/anonymous class. Private nested classes are
+     * accessible only from inside their enclosing class — even another top-level class in the
+     * same package can't reach them — so they walk to a public supertype like any other
+     * unreachable case. Local/anonymous classes ({@code $<digit>} in the binary name) are
+     * unaddressable from source anywhere.
      */
     private static boolean isReachableFromWrapper(ClassType type, String wrapperPackage) {
         if (type.isPublic()) {
             return true;
         }
+        if (type.isPrivate()) {
+            return false;
+        }
         if (!packageOf(type.name()).equals(wrapperPackage)) {
             return false;
         }
         return !isLocalOrAnonymous(type.name());
+    }
+
+    /**
+     * Whether {@code field} can be referenced from the generated wrapper class, given the
+     * wrapper's package and whether it shares that package with {@code this}'s declared type.
+     * <ul>
+     *   <li>{@code public} fields are always reachable.</li>
+     *   <li>When the wrapper does NOT share {@code this}'s package, only public fields are
+     *       reachable — the wrapper is in the isolated {@code mcp.jdi.evaluation} and cannot see
+     *       package-private or protected members of app code.</li>
+     *   <li>When the wrapper DOES share {@code this}'s package, non-private fields are reachable
+     *       only if their declaring type ALSO lives in that package. A protected field inherited
+     *       from a class in a different package is accessible only via subclassing, and the
+     *       wrapper is not a subclass — so we leave such fields un-rewritten to avoid a
+     *       misleading "not visible" compile error.</li>
+     *   <li>Private fields are never rewritten (the wrapper is not the declaring class).</li>
+     * </ul>
+     */
+    private static boolean isFieldAccessibleFromWrapper(Field field, String wrapperPackage, boolean sharingPackage) {
+        if (field.isPublic()) {
+            return true;
+        }
+        if (!sharingPackage || field.isPrivate()) {
+            return false;
+        }
+        return packageOf(field.declaringType().name()).equals(wrapperPackage);
     }
 
     /**
@@ -513,9 +544,17 @@ public class JdiExpressionEvaluator {
 
     /**
      * Converts a JDI binary class name to its Java source form by replacing nested-class
-     * {@code $} separators with {@code .}. Top-level classes (no {@code $}) and dynamic-proxy
-     * names ({@code $$} from CGLIB / Guice / Mockito) pass through unchanged — proxy markers are
-     * NOT nested-class separators and rewriting them produces nonsense like {@code Bar..Mock}.
+     * {@code $} separators with {@code .}. Only rewrites a {@code $} when it is a genuine
+     * nested-class separator: preceded AND followed by a non-{@code $} Java identifier part,
+     * and not immediately after a {@code .}. Specifically left unchanged:
+     * <ul>
+     *   <li>Dynamic-proxy names containing {@code $$} (CGLIB / Guice / Mockito) — proxy markers
+     *       are not nested separators; rewriting produces nonsense like {@code Bar..Mock}.</li>
+     *   <li>JDK dynamic-proxy names like {@code com.sun.proxy.$Proxy12} where {@code $} starts a
+     *       simple-name component (preceded by {@code .}); rewriting would yield the invalid
+     *       {@code com.sun.proxy..Proxy12}.</li>
+     *   <li>Names where {@code $} sits at the start or end of the binary name.</li>
+     * </ul>
      * Local and anonymous classes ({@code $<digit>}) must be filtered upstream; this method
      * does not reject them because the same conversion is occasionally useful for diagnostics.
      */
@@ -523,7 +562,37 @@ public class JdiExpressionEvaluator {
         if (binaryName.indexOf('$') < 0 || binaryName.contains("$$")) {
             return binaryName;
         }
-        return binaryName.replace('$', '.');
+        final int n = binaryName.length();
+        final StringBuilder sb = new StringBuilder(n);
+        for (int i = 0; i < n; i++) {
+            final char c = binaryName.charAt(i);
+            if (c == '$' && isNestedClassSeparator(binaryName, i)) {
+                sb.append('.');
+            } else {
+                sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Returns {@code true} when the {@code $} at {@code pos} in {@code name} is a genuine
+     * nested-class separator (i.e. the form emitted by {@code javac} for {@code Outer.Inner}
+     * compiled to {@code Outer$Inner}) and not, e.g., the leading {@code $} of a JDK dynamic-proxy
+     * simple name. Helper for {@link #toSourceTypeName}.
+     */
+    private static boolean isNestedClassSeparator(String name, int pos) {
+        if (pos == 0 || pos == name.length() - 1) {
+            return false;
+        }
+        final char prev = name.charAt(pos - 1);
+        final char next = name.charAt(pos + 1);
+        // `prev == '.'` covers `com.sun.proxy.$Proxy12` and similar JDK proxy forms.
+        // `prev`/`next == '$'` covers adjacent proxy `$$` (the contains-check above already
+        // short-circuits the typical case, but stays defensive against future name shapes).
+        return prev != '.' && prev != '$' && next != '$'
+            && Character.isJavaIdentifierPart(prev)
+            && Character.isJavaIdentifierPart(next);
     }
 
     /**
@@ -629,9 +698,12 @@ public class JdiExpressionEvaluator {
     /**
      * Evaluates `expression` in the context of `frame` plus any caller-supplied synthetic bindings,
      * and returns the result as a JDI {@link Value}. Side effect: populates {@link #compilationCache}.
-     * The auto-rewrite of bare `this.field` references only runs when `this`'s declared type is
-     * public — for non-public types the wrapper class can't reference the type at all, so the
-     * rewrite would just produce a misleading "type not visible" error.
+     *
+     * <p>The auto-rewrite of bare {@code this.field} references runs when EITHER {@code this}'s
+     * declared type is public OR the wrapper is emitted into {@code this}'s own package (see
+     * {@link #resolveWrapperPackage}). In the latter case package-private and protected fields
+     * also become candidates — subject to {@link #isFieldAccessibleFromWrapper}'s per-field
+     * accessibility check.
      *
      * <p>Synthetic bindings (e.g. {@code "$exception" -> ObjectReference}) appear in the wrapper's
      * parameter list after the real locals and can be referenced by name in the expression. This is
@@ -675,12 +747,15 @@ public class JdiExpressionEvaluator {
 
             // Auto-rewrite bare references to fields of `this` so users can write
             // `sessions.containsKey(session)` instead of `_this.sessions.containsKey(session)`.
-            // The set of rewritable fields depends on what the wrapper can actually see:
+            // Each candidate field is filtered for accessibility from the wrapper class:
             //  - When the wrapper lives in the default isolated package, only public fields on a
             //    public declaring type are reachable.
             //  - When the wrapper lives in `this`'s own package, public/protected/package-private
-            //    fields are all reachable. Private fields still aren't, so they stay un-rewritten
-            //    and produce a compile error the user can fix (or work around via reflection).
+            //    fields are reachable PROVIDED the field's declaring type ALSO lives in that
+            //    package. A protected field inherited from a class in some other package is not
+            //    accessible from a non-subclass even when `this`'s runtime type is in the wrapper
+            //    package — so we'd produce a misleading "not visible" error if we rewrote it.
+            //  - Private fields are never rewritten.
             if (thisObject != null && thisObject.referenceType() instanceof ClassType thisClass) {
                 final boolean sharingPackage = !wrapperPackage.equals(DEFAULT_EVALUATION_PACKAGE)
                     && wrapperPackage.equals(packageOf(thisClass.name()));
@@ -689,7 +764,7 @@ public class JdiExpressionEvaluator {
                         .map(v -> v.name)
                         .collect(Collectors.toSet());
                     final Set<String> rewritableFieldNames = thisClass.allFields().stream()
-                        .filter(f -> sharingPackage ? !f.isPrivate() : f.isPublic())
+                        .filter(f -> isFieldAccessibleFromWrapper(f, wrapperPackage, sharingPackage))
                         .map(Field::name)
                         .collect(Collectors.toSet());
                     expression = rewriteThisFieldReferences(expression, rewritableFieldNames, shadowingLocals);

@@ -25,8 +25,10 @@ import static org.mockito.Mockito.when;
 class JdiExpressionEvaluatorGetDeclaredTypeTest {
 
 	/**
-	 * The default isolated wrapper package — passing this disables the "share package with target"
-	 * shortcut and exercises the legacy walk-to-public-supertype behaviour.
+	 * The default isolated wrapper package — passing this exercises the legacy
+	 * walk-to-public-supertype behaviour for typical target types. A non-public type whose package
+	 * happens to literally equal {@code mcp.jdi.evaluation} would still trigger the share-package
+	 * shortcut; the tests don't exercise that theoretical edge case.
 	 */
 	private static final String DEFAULT_WRAPPER_PACKAGE = "mcp.jdi.evaluation";
 
@@ -216,6 +218,43 @@ class JdiExpressionEvaluatorGetDeclaredTypeTest {
 			when(anon.superclass()).thenReturn(pub);
 
 			assertThat(invokeGetDeclaredType(anon, "com.example")).isEqualTo("com.example.Public");
+		}
+
+		@Test
+		@DisplayName("private nested class in wrapper package — NOT reachable, walks to a public supertype")
+		void shouldNotExposePrivateNestedClassEvenInSamePackage() throws Exception {
+			ClassType pub = mock(ClassType.class);
+			when(pub.name()).thenReturn("com.example.Public");
+			when(pub.isPublic()).thenReturn(true);
+
+			// A private nested class is accessible only from its enclosing class — even another
+			// top-level class in the same package cannot reference it. The walk should skip past it.
+			ClassType priv = mock(ClassType.class);
+			when(priv.name()).thenReturn("com.example.Outer$PrivateInner");
+			when(priv.isPublic()).thenReturn(false);
+			when(priv.isPrivate()).thenReturn(true);
+			when(priv.superclass()).thenReturn(pub);
+
+			assertThat(invokeGetDeclaredType(priv, "com.example")).isEqualTo("com.example.Public");
+		}
+	}
+
+	@Nested
+	@DisplayName("JDK dynamic-proxy binary names")
+	class JdkDynamicProxy {
+
+		@Test
+		@DisplayName("`com.sun.proxy.$Proxy12` — leading-$ simple name is NOT rewritten to `..Proxy12`")
+		void shouldNotRewriteJdkDynamicProxyName() throws Exception {
+			// JDK java.lang.reflect.Proxy generates classes like `com.sun.proxy.$Proxy12`. The `$`
+			// is part of the simple-name component, NOT a nested-class separator — rewriting it
+			// to `.` would yield the invalid name `com.sun.proxy..Proxy12` and break wrapper
+			// compilation.
+			ClassType proxy = mock(ClassType.class);
+			when(proxy.name()).thenReturn("com.sun.proxy.$Proxy12");
+			when(proxy.isPublic()).thenReturn(true);
+
+			assertThat(invokeGetDeclaredType(proxy)).isEqualTo("com.sun.proxy.$Proxy12");
 		}
 	}
 }
