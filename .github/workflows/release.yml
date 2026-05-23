@@ -53,8 +53,14 @@ jobs:
           # env: for consistency with the defense-in-depth pattern.
           CUR: ${{ github.ref_name }}
         run: |
-          # Previous v* tag in semver order, excluding the current one.
-          prev=$(git tag --list 'v*' --sort=-v:refname | grep -vxF "$CUR" | head -n1 || true)
+          # Immediately-lower v* tag in semver order. Locate CUR in the
+          # descending-sorted list and emit the next entry — that's the
+          # correct predecessor regardless of whether CUR itself is the
+          # highest tag (the back-fill case pushed v2.1.2 after v2.2.0
+          # already existed and the old "highest other tag" heuristic
+          # picked v2.2.0 as previous, producing an empty changelog).
+          prev=$(git tag --list 'v*' --sort=-v:refname \
+            | awk -v cur="$CUR" 'found{print;exit} $0==cur{found=1}')
           {
             echo "cur=$CUR"
             echo "prev=$prev"

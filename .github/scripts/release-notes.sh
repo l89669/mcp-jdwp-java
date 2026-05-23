@@ -37,7 +37,11 @@ app="jdwp-debugging"
 version="${cur#v}"
 
 if [[ -z "$prev" ]]; then
-  prev=$(git tag --list 'v*' --sort=-v:refname | grep -vxF "$cur" | head -n1 || true)
+  # Immediately-lower v* tag (next entry below CUR in the descending
+  # semver list), not just "any other tag" — back-filling an older tag
+  # otherwise picks a newer one as predecessor and yields empty notes.
+  prev=$(git tag --list 'v*' --sort=-v:refname \
+    | awk -v cur="$cur" 'found{print;exit} $0==cur{found=1}')
 fi
 
 range_arg=""
