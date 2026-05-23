@@ -198,10 +198,16 @@ public class JdiHealthMonitor {
      *   <li>{@link #probeTick} on a successful active probe (closes the loop so the next tick does
      *       not re-probe in a tight window).</li>
      * </ul>
-     * The method is cheap — single volatile write — so callers do not need to gate it behind
-     * "are we even in a connected state" checks.
+     * Synchronized on {@code this} to pair with {@link #stop()}: a concurrent {@code stop()} cannot
+     * interleave between the {@code vmRef} check and the snapshot publish, so a late
+     * {@code notifyTraffic} from an event drained right before disconnect cannot revive the monitor
+     * by overwriting the DISCONNECTED snapshot. Bails early when {@code vmRef} is null because no
+     * session is active.
      */
-    public void notifyTraffic() {
+    public synchronized void notifyTraffic() {
+        if (vmRef.get() == null) {
+            return;
+        }
         final Instant now = Instant.now();
         lastTrafficAt.set(now);
         // Optimistically classify as responsive — the watchdog will downgrade us if the next
@@ -240,12 +246,17 @@ public class JdiHealthMonitor {
             final Duration silentFor = Duration.between(lastSeen, Instant.now());
             if (silentFor.compareTo(SILENCE_THRESHOLD) < 0) {
                 // Still inside the responsive window — refresh the snapshot's silentFor so the
-                // diagnose renderer shows a current value, but don't probe.
-                final JdiHealthSnapshot prev = snapshotRef.get();
-                snapshotRef.set(new JdiHealthSnapshot(
-                    Status.RESPONSIVE, lastSeen, silentFor,
-                    prev.lastProbeAt(), prev.lastProbeOutcome()
-                ));
+                // diagnose renderer shows a current value, but don't probe. Synchronized + re-check
+                // pairs with stop() so a stopped monitor cannot be revived by a late tick.
+                synchronized (this) {
+                    if (vmRef.get() == vm) {
+                        final JdiHealthSnapshot prev = snapshotRef.get();
+                        snapshotRef.set(new JdiHealthSnapshot(
+                            Status.RESPONSIVE, lastSeen, silentFor,
+                            prev.lastProbeAt(), prev.lastProbeOutcome()
+                        ));
+                    }
+                }
                 return;
             }
             runActiveProbe(vm, lastSeen, silentFor);
@@ -274,46 +285,52 @@ public class JdiHealthMonitor {
             final Future<Integer> probe = probeWorker.submit(() -> vm.allThreads().size());
             try {
                 final int count = probe.get(PROBE_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
-                // Successful probe — the connection is alive after all. Update snapshot and
-                // refresh the last-traffic timestamp so the next tick does not immediately re-probe.
-                // Skip the snapshot publish if stop() has run (or a different VM is now registered)
-                // between probe submit and probe return — overwriting DISCONNECTED with RESPONSIVE
-                // would silently revive a stopped monitor.
-                if (vmRef.get() == vm) {
-                    notifyTraffic();
-                    snapshotRef.set(new JdiHealthSnapshot(
-                        Status.RESPONSIVE,
-                        lastTrafficAt.get(),
-                        Duration.ZERO,
-                        probeStartedAt,
-                        String.format("OK (%d threads)", count)
-                    ));
+                // Successful probe — the connection is alive after all. The check+publish is
+                // wrapped in synchronized(this) so a concurrent stop() cannot interleave between
+                // the vmRef re-check and either write below (notifyTraffic or snapshotRef.set).
+                // Without the lock, the check-then-act would race stop() and revive a stopped
+                // monitor by overwriting its DISCONNECTED snapshot.
+                synchronized (this) {
+                    if (vmRef.get() == vm) {
+                        notifyTraffic();
+                        snapshotRef.set(new JdiHealthSnapshot(
+                            Status.RESPONSIVE,
+                            lastTrafficAt.get(),
+                            Duration.ZERO,
+                            probeStartedAt,
+                            String.format("OK (%d threads)", count)
+                        ));
+                    }
                 }
                 log.debug("[Health] Active probe succeeded after {}s silence (threads={})",
                     silentFor.toSeconds(), count);
             } catch (TimeoutException timeout) {
                 probe.cancel(true);
-                if (vmRef.get() == vm) {
-                    snapshotRef.set(new JdiHealthSnapshot(
-                        Status.UNRESPONSIVE,
-                        lastSeen,
-                        silentFor,
-                        probeStartedAt,
-                        String.format("vm.allThreads() timed out after %ds", PROBE_TIMEOUT.toSeconds())
-                    ));
+                synchronized (this) {
+                    if (vmRef.get() == vm) {
+                        snapshotRef.set(new JdiHealthSnapshot(
+                            Status.UNRESPONSIVE,
+                            lastSeen,
+                            silentFor,
+                            probeStartedAt,
+                            String.format("vm.allThreads() timed out after %ds", PROBE_TIMEOUT.toSeconds())
+                        ));
+                    }
                 }
                 log.warn("[Health] JDI probe timed out — connection appears wedged (silent for {}s)",
                     silentFor.toSeconds());
             } catch (ExecutionException ee) {
                 final Throwable cause = ee.getCause() != null ? ee.getCause() : ee;
-                if (vmRef.get() == vm) {
-                    snapshotRef.set(new JdiHealthSnapshot(
-                        Status.UNRESPONSIVE,
-                        lastSeen,
-                        silentFor,
-                        probeStartedAt,
-                        String.format("vm.allThreads() failed: %s", cause.getClass().getSimpleName())
-                    ));
+                synchronized (this) {
+                    if (vmRef.get() == vm) {
+                        snapshotRef.set(new JdiHealthSnapshot(
+                            Status.UNRESPONSIVE,
+                            lastSeen,
+                            silentFor,
+                            probeStartedAt,
+                            String.format("vm.allThreads() failed: %s", cause.getClass().getSimpleName())
+                        ));
+                    }
                 }
                 log.warn("[Health] JDI probe failed with {}: {}",
                     cause.getClass().getSimpleName(), cause.getMessage());

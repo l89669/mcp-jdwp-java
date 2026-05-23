@@ -164,8 +164,11 @@ class JDWPToolsReconnectAndSoftWaitTest {
 		@Test
 		@DisplayName("envelope reflects RESPONSIVE health when traffic has been observed")
 		void shouldRenderResponsiveHealthWhenMonitorActive() throws Exception {
-			healthMonitor.notifyTraffic();
 			final VirtualMachine vm = mock(VirtualMachine.class);
+			// Start the monitor against the mock vm so notifyTraffic publishes (the synchronized
+			// + null-vmRef guard short-circuits when no session is bound).
+			healthMonitor.start(vm);
+			healthMonitor.notifyTraffic();
 			when(jdiService.getVM()).thenReturn(vm);
 			final CountDownLatch latch = new CountDownLatch(1);
 			when(breakpointTracker.armNextEventLatch()).thenReturn(latch);
