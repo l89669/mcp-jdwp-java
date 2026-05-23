@@ -371,10 +371,24 @@ public class JdiExpressionEvaluator {
 
     /**
      * Generates a wrapper class with a static `evaluate()` method that accepts the context
-     * variables as parameters and returns the result of the user expression. The user expression
-     * is wrapped in `(Object)(...)` so any value type — including primitives via autoboxing —
-     * can be returned. The bare `this` keyword in the expression is tokenizer-rewritten to `_this`
-     * because the wrapper class doesn't have a `this` reference (it's a static method).
+     * variables as parameters and returns the result of the user input.
+     *
+     * <p>Two input modes, picked by {@link #isBlockMode}:
+     * <ul>
+     *   <li><b>Expression mode (default).</b> The input is treated as a single Java expression and
+     *       wrapped as {@code return (Object) (<expr>);} so any value type — including primitives
+     *       via autoboxing — flows back as the method's return value.</li>
+     *   <li><b>Block mode.</b> The trimmed input starts with {@code {} and ends with {@code }};
+     *       the inside is spliced into the method body verbatim, with a trailing
+     *       {@code return null;} appended so the method is reachable-fall-through-safe even if
+     *       the user forgot a {@code return}. The user is responsible for writing {@code return X;}
+     *       statements to yield a value — block mode supports {@code try/catch}, intermediate
+     *       locals, early {@code return}, and other statement-level constructs that the single-
+     *       expression mode could not express.</li>
+     * </ul>
+     *
+     * <p>In both modes, the bare {@code this} keyword is tokenizer-rewritten to {@code _this}
+     * because the wrapper is a static method.
      *
      * <p>The package portion of {@code className} drives the wrapper's {@code package} declaration.
      * When the caller routes a non-public {@code this} type into its own package via
@@ -395,15 +409,82 @@ public class JdiExpressionEvaluator {
         // literals are NOT rewritten — see {@link #rewriteThisKeyword(String)}.
         final String safeExpression = rewriteThisKeyword(expression);
 
+        final String methodBody;
+        if (isBlockMode(safeExpression)) {
+            // Extract the body inside the outermost braces — already balanced because
+            // isBlockMode verified start with `{` and end with `}` and the tokenizer skips
+            // string/char/text-block content. The trailing `return null;` keeps the method
+            // type-correct when the user's block falls through without a return; an explicit
+            // `return X;` inside the user block wins, and `unreachable code` does not occur
+            // because the unconditional return is a separate statement, not part of the user
+            // body.
+            final String trimmed = safeExpression.trim();
+            final String userBody = trimmed.substring(1, trimmed.length() - 1);
+            methodBody =
+                "        // User block:\n" +
+                userBody + '\n' +
+                "        // Fallthrough guard — block reached end without a `return`.\n" +
+                "        return null;\n";
+        } else {
+            methodBody =
+                "        // User expression:\n" +
+                "        return (Object) (" + safeExpression + ");\n";
+        }
+
         final String packageDecl = packageName.isEmpty() ? "" : "package " + packageName + ";\n\n";
         return packageDecl +
             "// Automatically generated class for JDI expression evaluation\n" +
             "public class " + simpleClassName + " {\n" +
             "    public static Object " + EVALUATION_METHOD_NAME + '(' + methodParameters + ") {\n" +
-            "        // User expression:\n" +
-            "        return (Object) (" + safeExpression + ");\n" +
+            methodBody +
             "    }\n" +
             "}\n";
+    }
+
+    /**
+     * Returns {@code true} when the user input is in block mode — i.e. its trimmed form starts
+     * with {@code {} and ends with the matching {@code }}. Tokenizer-aware: it makes sure the
+     * trailing {@code }} is at the top level and not buried inside a string / char / text-block
+     * literal, so an input like {@code "{x}".length()} (a method call on a string literal that
+     * happens to start with {@code {}) stays in expression mode.
+     *
+     * <p>Static + package-private so it can be unit-tested without a real {@link StackFrame}.
+     */
+    static boolean isBlockMode(String expression) {
+        final String trimmed = expression.trim();
+        if (trimmed.length() < 2 || trimmed.charAt(0) != '{' || trimmed.charAt(trimmed.length() - 1) != '}') {
+            return false;
+        }
+        // Walk the inside and confirm brace balance returns to zero at exactly the closing `}`.
+        // Tokenizer-aware so braces inside string / char / text-block literals are ignored.
+        final int n = trimmed.length() - 1;
+        int depth = 1;
+        int i = 1;
+        while (i < n) {
+            final char c = trimmed.charAt(i);
+            if (c == '"') {
+                i = skipStringLiteral(trimmed, i);
+                continue;
+            }
+            if (c == '\'') {
+                i = skipCharLiteral(trimmed, i);
+                continue;
+            }
+            if (c == '{') {
+                depth++;
+            } else if (c == '}') {
+                depth--;
+                if (depth == 0) {
+                    // Hit a top-level `}` before the trailing one — input is something like
+                    // `{stmt;} + foo` so the trailing `}` of the trimmed form is a different
+                    // closer and block-mode does not apply.
+                    return false;
+                }
+            }
+            i++;
+        }
+        // Trailing `}` at index n closes the outer brace.
+        return depth == 1;
     }
 
     /**

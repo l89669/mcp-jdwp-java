@@ -383,4 +383,67 @@ class JdiExpressionEvaluatorRewriteTest {
 		// The bare `this` before the literal should still be rewritten
 		assertThat(result).isEqualTo("_this + \"unterminated");
 	}
+
+	// ── isBlockMode: detect `{ ... }` block input vs expression input ────────────────────
+
+	@Test
+	@DisplayName("isBlockMode: plain expression is NOT a block")
+	void shouldNotDetectBlockForPlainExpression() {
+		assertThat(JdiExpressionEvaluator.isBlockMode("foo.bar() + baz")).isFalse();
+	}
+
+	@Test
+	@DisplayName("isBlockMode: `{ stmt; }` IS a block")
+	void shouldDetectSingleStatementBlock() {
+		assertThat(JdiExpressionEvaluator.isBlockMode("{ return x; }")).isTrue();
+	}
+
+	@Test
+	@DisplayName("isBlockMode: leading/trailing whitespace is allowed")
+	void shouldDetectBlockWithSurroundingWhitespace() {
+		assertThat(JdiExpressionEvaluator.isBlockMode("  \n  { return x; }\n  ")).isTrue();
+	}
+
+	@Test
+	@DisplayName("isBlockMode: nested braces are matched correctly")
+	void shouldDetectBlockWithNestedBraces() {
+		assertThat(JdiExpressionEvaluator.isBlockMode(
+			"{ if (x > 0) { return x; } else { return 0; } }")).isTrue();
+	}
+
+	@Test
+	@DisplayName("isBlockMode: braces inside a string literal do NOT terminate the outer block")
+	void shouldNotConfuseBracesInsideStringLiteral() {
+		// The `}` inside the string would mislead a naive matcher; the tokenizer must skip it.
+		assertThat(JdiExpressionEvaluator.isBlockMode("{ return \"}\"; }")).isTrue();
+	}
+
+	@Test
+	@DisplayName("isBlockMode: `{x}.foo()` is NOT a block (trailing `}` is not the outer closer)")
+	void shouldNotDetectBlockWhenClosingBraceIsMidExpression() {
+		// `{x}` opens-and-closes before `.foo()`, so the trailing closer of the trimmed input
+		// is `)` — block mode should not apply.
+		assertThat(JdiExpressionEvaluator.isBlockMode("{x}.foo()")).isFalse();
+	}
+
+	@Test
+	@DisplayName("isBlockMode: brace-balanced internals followed by expression text are NOT a block")
+	void shouldNotDetectBlockWhenInternalBraceClosesEarly() {
+		// `{a;}+b;` — the first `}` closes the outer brace at i=4, depth goes to 0 before the
+		// trailing `}` at i=7. Block detection must reject this.
+		assertThat(JdiExpressionEvaluator.isBlockMode("{a;}+b;")).isFalse();
+	}
+
+	@Test
+	@DisplayName("isBlockMode: an empty input is NOT a block")
+	void shouldNotDetectBlockForEmptyInput() {
+		assertThat(JdiExpressionEvaluator.isBlockMode("")).isFalse();
+		assertThat(JdiExpressionEvaluator.isBlockMode("   ")).isFalse();
+	}
+
+	@Test
+	@DisplayName("isBlockMode: a lone `{}` is a (trivial, empty) block")
+	void shouldDetectEmptyBlock() {
+		assertThat(JdiExpressionEvaluator.isBlockMode("{}")).isTrue();
+	}
 }
