@@ -25,6 +25,7 @@ import java.lang.management.ManagementFactory;
 import java.lang.reflect.Modifier;
 import java.net.SocketException;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -91,12 +92,19 @@ public class JDWPTools {
     private final EvaluationGuard evaluationGuard;
     private final JvmDiscoveryService jvmDiscoveryService;
     private final MarkedInstanceRegistry markedInstances;
+    /**
+     * Passive JDI traffic observer + active wedge probe. Surfaced through {@code jdwp_diagnose}
+     * (renderer) and the soft-wait envelopes (still-waiting responses cite the current health
+     * status). Lifecycle is owned by {@link JDIConnectionService}; this class only reads snapshots.
+     */
+    private final JdiHealthMonitor healthMonitor;
 
     public JDWPTools(JDIConnectionService jdiService, BreakpointTracker breakpointTracker,
                      WatcherManager watcherManager, JdiExpressionEvaluator expressionEvaluator,
                      EventHistory eventHistory, EvaluationGuard evaluationGuard,
                      JvmDiscoveryService jvmDiscoveryService,
-                     MarkedInstanceRegistry markedInstances) {
+                     MarkedInstanceRegistry markedInstances,
+                     JdiHealthMonitor healthMonitor) {
         this.jdiService = jdiService;
         this.breakpointTracker = breakpointTracker;
         this.watcherManager = watcherManager;
@@ -105,6 +113,7 @@ public class JDWPTools {
         this.evaluationGuard = evaluationGuard;
         this.jvmDiscoveryService = jvmDiscoveryService;
         this.markedInstances = markedInstances;
+        this.healthMonitor = healthMonitor;
     }
 
     /**
@@ -339,13 +348,16 @@ public class JDWPTools {
             }
         }
 
-        final String baseMessage = String.format("""
-                [TIMEOUT] No JVM listening on %s:%d after %d attempt(s) over %dms.
+        final String baseMessage = renderSoftWaitEnvelope("jdwp_wait_for_attach", deadlineMs)
+            + '\n'
+            + String.format("""
+
+                No JVM listening on %s:%d after %d attempt(s) over %dms.
                 Last error: %s
 
                 Make sure the target JVM was launched with -agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=*:%d
                 For Maven tests in this repo, use: mvn test -Dmaven.surefire.debug""",
-            resolvedHost, resolvedPort, attempts, deadlineMs, lastError, resolvedPort);
+                resolvedHost, resolvedPort, attempts, deadlineMs, lastError, resolvedPort);
         // Run discovery on timeout — surfacing the local-JVM list helps the user spot a JVM
         // that came up on a different port, or didn't come up at all. Same time budget as
         // jdwp_diagnose; failures degrade silently to just the base message.
@@ -361,6 +373,56 @@ public class JDWPTools {
     @McpTool(description = "Disconnect from the JDWP server")
     public String jdwp_disconnect() {
         return jdiService.disconnect();
+    }
+
+    @McpTool(description =
+        "Recover from a wedged JDI connection by disposing the current VM and re-attaching to the "
+        + "LAST KNOWN host:port. Breakpoint specs (line/exception/field), conditions, logpoint "
+        + "expressions, chain edges, watchers, and synthetic breakpoint IDs are preserved across "
+        + "the reattach so a breakpoint that was #7 before is still #7 after. Marked instances, "
+        + "the object cache, the last-suspended-thread context, and classpath discovery cache are "
+        + "LOST — they cannot survive vm.dispose(). The target VM resumes after reconnect; "
+        + "previously-suspended threads are now running. To attach to a different target, use "
+        + "jdwp_connect or jdwp_wait_for_attach instead — jdwp_reconnect is deliberately scoped "
+        + "to the last successful target so an incident-time recovery cannot accidentally swap "
+        + "VMs while the agent assumes BPs survived.")
+    public String jdwp_reconnect() {
+        try {
+            final JDIConnectionService.ReconnectResult result = jdiService.reconnectPreservingSpecs();
+            return formatReconnectReport(result);
+        } catch (IllegalStateException badPrecondition) {
+            return "[ERROR] " + badPrecondition.getMessage();
+        } catch (Exception e) {
+            final String msg = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
+            return String.format("[ERROR] jdwp_reconnect failed: %s%n"
+                + "The previous JDI connection was disposed; breakpoint specs are still tracked client-side. "
+                + "Run jdwp_diagnose to inspect, or retry jdwp_reconnect once the target JVM is reachable.", msg);
+        }
+    }
+
+    /**
+     * Renders the reconnect contract for the agent: what survived, what was lost, and the
+     * explicit "target VM is running" status (re-suspending threads after a reattach is not
+     * feasible in JDI). The structure is stable so the agent can pattern-match on it across calls.
+     */
+    private static String formatReconnectReport(JDIConnectionService.ReconnectResult result) {
+        final StringBuilder out = new StringBuilder();
+        out.append(String.format("Reconnected to %s:%d%n", result.host(), result.port()));
+        out.append("Restored:\n");
+        out.append(String.format("  - Line breakpoints: %d (%d active, %d deferred — class not yet loaded)%n",
+            result.restoredLineTotal(), result.restoredLineActive(), result.restoredLineDeferred()));
+        out.append(String.format("  - Exception breakpoints: %d%n", result.restoredExceptionTotal()));
+        out.append(String.format("  - Field breakpoints: %d%n", result.restoredFieldTotal()));
+        out.append(String.format("  - Watchers: %d%n", result.watchersPreserved()));
+        out.append("Lost (cannot be preserved across VM dispose):\n");
+        out.append(String.format("  - Marked instances: %d (call jdwp_mark_instance again if needed)%n",
+            result.markedInstancesLost()));
+        out.append(String.format("  - Object cache: %d entries cleared%n", result.objectCacheLost()));
+        out.append("  - Last suspended thread: cleared\n");
+        out.append("  - Classpath discovery cache: cleared\n");
+        out.append("Target VM state after reconnect: RUNNING ");
+        out.append("(re-suspend is not attempted; previously-suspended threads are now running)\n");
+        return out.toString();
     }
 
     @McpTool(description = "Get JVM version information")
@@ -915,7 +977,9 @@ public class JDWPTools {
 
                 final boolean fired = latch.await(deadlineMs, TimeUnit.MILLISECONDS);
                 if (!fired) {
-                    return buildDiagnosticReport(true, deadlineMs);
+                    return renderSoftWaitEnvelope("jdwp_resume_until_event", deadlineMs)
+                        + "\n\n"
+                        + buildDiagnosticReport(true, deadlineMs);
                 }
                 // The waiter consumed the signal; clear the pending flag so the NEXT call doesn't
                 // immediately short-circuit on this same event.
@@ -983,6 +1047,87 @@ public class JDWPTools {
             final String msg = e.getMessage();
             return "Error in jdwp_resume_until_event: " + (msg != null ? msg : e.getClass().getSimpleName());
         }
+    }
+
+    /**
+     * Renders the {@code JDI Health} block inside the {@code jdwp_diagnose} output. Format:
+     * <pre>
+     * ▸ JDI Health
+     *   Status: responsive | unresponsive_for_47s | disconnected
+     *   Last observed traffic: 5s ago
+     *   Last active probe: never  (or: 17s ago — vm.allThreads() OK / timed out after 5s)
+     *   [Recommended action: consider jdwp_reconnect]   (only when UNRESPONSIVE)
+     * </pre>
+     * The "Recommended action" line is suppressed in the {@link JdiHealthMonitor.Status#RESPONSIVE}
+     * and {@link JdiHealthMonitor.Status#DISCONNECTED} cases so the renderer stays terse on the
+     * common path — only the wedge case prompts the agent to act.
+     */
+    private String renderJdiHealthBlock(JdiHealthMonitor.JdiHealthSnapshot snapshot) {
+        final StringBuilder out = new StringBuilder();
+        out.append("\n▸ JDI Health\n");
+        out.append(String.format("  Status: %s%n", formatHealthLine(snapshot)));
+        if (snapshot.lastTrafficAt() != null) {
+            final long seconds = Duration.between(snapshot.lastTrafficAt(), Instant.now()).toSeconds();
+            out.append(String.format("  Last observed traffic: %ds ago%n", Math.max(0, seconds)));
+        } else {
+            out.append("  Last observed traffic: never\n");
+        }
+        if (snapshot.lastProbeAt() != null) {
+            final long seconds = Duration.between(snapshot.lastProbeAt(), Instant.now()).toSeconds();
+            final String outcome = snapshot.lastProbeOutcome() != null ? snapshot.lastProbeOutcome() : "(no outcome recorded)";
+            out.append(String.format("  Last active probe: %ds ago — %s%n", Math.max(0, seconds), outcome));
+        } else {
+            out.append("  Last active probe: never (no silence period detected)\n");
+        }
+        if (snapshot.status() == JdiHealthMonitor.Status.UNRESPONSIVE) {
+            out.append("  Recommended action: consider jdwp_reconnect\n");
+        }
+        return out.toString();
+    }
+
+    /**
+     * Renders the "still_waiting" envelope returned by every soft-waiting tool when
+     * its 30s ceiling elapses without the awaited event. The structure (Status / Elapsed / JDI
+     * Health / Options) is part of the contract: the agent decides whether to wait_more,
+     * reconnect, or abort based on the current health classification, never on a hardcoded
+     * server-side backstop.
+     *
+     * <p>The {@code tool} parameter names the calling tool so the {@code wait_more} option's
+     * "re-call with the same parameters" hint is unambiguous when the envelope is rendered
+     * inline with a follow-up diagnostic block.
+     *
+     * @param tool       MCP tool name to echo in the envelope (e.g. {@code "jdwp_resume_until_event"})
+     * @param elapsedMs  how long this soft-wait call has been parked, before the envelope was rendered
+     */
+    private String renderSoftWaitEnvelope(String tool, int elapsedMs) {
+        return String.format("""
+                Status: still_waiting
+                Tool: %s
+                Elapsed: %dms
+                JDI Health: %s
+                Options:
+                  - wait_more   — re-call %s with the same parameters to wait another window
+                  - reconnect   — call jdwp_reconnect to dispose and reattach (breakpoints preserved)
+                  - abort       — call jdwp_disconnect for clean shutdown""",
+            tool, elapsedMs, formatHealthLine(healthMonitor.snapshot()), tool);
+    }
+
+    /**
+     * Single-line {@code JDI Health} summary used inside the soft-wait envelope. The
+     * {@code unresponsive_for_Ns} form is emitted only when the watchdog has actually classified
+     * the connection as wedged; in the steady-state case the line reads simply {@code responsive}.
+     */
+    private static String formatHealthLine(JdiHealthMonitor.JdiHealthSnapshot snapshot) {
+        return switch (snapshot.status()) {
+            case RESPONSIVE -> "responsive";
+            case DISCONNECTED -> "disconnected";
+            case UNRESPONSIVE -> {
+                final Duration silent = snapshot.silentFor();
+                yield silent != null
+                    ? "unresponsive_for_" + silent.toSeconds() + "s"
+                    : "unresponsive";
+            }
+        };
     }
 
     /**
@@ -1217,6 +1362,10 @@ public class JDWPTools {
             ),
             JVM_JDWP_PORT
         ));
+        // JDI Health block — the agent's deliberate "is the server OK?" probe, independent of
+        // any long-waiting tool. Surfaces silence interval, last active probe outcome, and a
+        // recommended action when the watchdog has classified the connection as wedged.
+        out.append(renderJdiHealthBlock(healthMonitor.snapshot()));
         // Capabilities block — only meaningful when connected (the renderer collapses to empty
         // string when both are false). We probe the live VM defensively because the call can
         // race with a VM-death event; failure degrades to "no capabilities reported".

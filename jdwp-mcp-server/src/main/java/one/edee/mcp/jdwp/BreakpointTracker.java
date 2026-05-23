@@ -380,6 +380,146 @@ public class BreakpointTracker {
         idCounter.set(1);
     }
 
+    // ── Reconnect snapshot / restore ──
+
+    /**
+     * Captures every breakpoint spec, metadata row, chain edge, and trigger-fire memory currently
+     * held by the tracker. Used by {@link JDIConnectionService} during {@code jdwp_reconnect} to
+     * preserve user state across {@code vm.dispose()}.
+     *
+     * <p>The snapshot records only data that survives the VM going away: synthetic IDs (which the
+     * tracker mints client-side), specs (which the tracker stores client-side), metadata (likewise),
+     * and chain edges (likewise). Object references, suspended-thread context, and live JDI
+     * request handles are deliberately omitted — they cannot survive a {@code vm.dispose()} and
+     * pretending otherwise would mislead the caller.
+     *
+     * <p>For active line BPs the {@code className} and {@code lineNumber} are extracted from the
+     * live {@link BreakpointRequest#location()} so the spec can be replayed against a fresh VM;
+     * the {@code suspendPolicy} round-trips through the JDI request as well. Active exception and
+     * field BPs already store their full {@link ExceptionBreakpointSpec} / {@link FieldBreakpointSpec},
+     * so the snapshot just references them directly.
+     */
+    public synchronized ReconnectSnapshot snapshotForReconnect() {
+        final List<LineBreakpointEntry> lineEntries = new ArrayList<>();
+        for (Map.Entry<Integer, BreakpointRequest> e : breakpointsById.entrySet()) {
+            final Location loc = e.getValue().location();
+            lineEntries.add(new LineBreakpointEntry(
+                e.getKey(),
+                loc.declaringType().name(),
+                loc.lineNumber(),
+                e.getValue().suspendPolicy(),
+                suspendPolicyLabel(e.getValue().suspendPolicy())
+            ));
+        }
+        for (Map.Entry<Integer, PendingBreakpoint> e : pendingBreakpointsById.entrySet()) {
+            final PendingBreakpoint pb = e.getValue();
+            lineEntries.add(new LineBreakpointEntry(
+                e.getKey(), pb.getClassName(), pb.getLineNumber(),
+                pb.getSuspendPolicy(), pb.getSuspendPolicyLabel()
+            ));
+        }
+
+        final List<ExceptionBreakpointEntry> exceptionEntries = new ArrayList<>();
+        for (Map.Entry<Integer, ExceptionBreakpointInfo> e : exceptionBreakpointsById.entrySet()) {
+            exceptionEntries.add(new ExceptionBreakpointEntry(e.getKey(), e.getValue().getSpec()));
+        }
+        for (Map.Entry<Integer, PendingExceptionBreakpoint> e : pendingExceptionBreakpointsById.entrySet()) {
+            exceptionEntries.add(new ExceptionBreakpointEntry(e.getKey(), e.getValue().getSpec()));
+        }
+
+        final List<FieldBreakpointEntry> fieldEntries = new ArrayList<>();
+        for (Map.Entry<Integer, FieldBreakpointInfo> e : fieldBreakpointsById.entrySet()) {
+            fieldEntries.add(new FieldBreakpointEntry(e.getKey(), e.getValue().getSpec()));
+        }
+        for (Map.Entry<Integer, PendingFieldBreakpoint> e : pendingFieldBreakpointsById.entrySet()) {
+            fieldEntries.add(new FieldBreakpointEntry(e.getKey(), e.getValue().getSpec()));
+        }
+
+        final Map<Integer, MetadataSnapshot> metadataSnapshot = new HashMap<>();
+        for (Map.Entry<Integer, BreakpointMetadata> e : breakpointMetadata.entrySet()) {
+            metadataSnapshot.put(e.getKey(),
+                new MetadataSnapshot(e.getValue().condition, e.getValue().logpointExpression));
+        }
+
+        return new ReconnectSnapshot(
+            List.copyOf(lineEntries),
+            List.copyOf(exceptionEntries),
+            List.copyOf(fieldEntries),
+            Map.copyOf(metadataSnapshot),
+            Map.copyOf(dependencyByDependent),
+            Set.copyOf(triggersFiredAtLeastOnce)
+        );
+    }
+
+    /**
+     * Wipes every map (as {@link #reset()} does) and replays the snapshot as pending entries. The
+     * synthetic IDs from the original session are preserved verbatim so watchers and chain edges
+     * keyed by ID survive the reconnect.
+     *
+     * <p>The {@link #idCounter} is reset to {@code max(restored ids) + 1} so any subsequent
+     * register-* call mints an ID that does not collide with a restored one.
+     *
+     * <p>This method establishes the "everything is pending" baseline; the caller is responsible
+     * for the JDI side — registering {@link ClassPrepareRequest}s for the pending class names and
+     * calling {@link #tryPromotePending} so classes already loaded by the fresh VM bind
+     * immediately.
+     *
+     * @param snapshot  the immutable capture returned by {@link #snapshotForReconnect()}; the
+     *                  tracker mutates only its own internal state during replay — the snapshot
+     *                  itself is untouched
+     */
+    public synchronized void restoreFromSnapshotAsPending(ReconnectSnapshot snapshot) {
+        clearAllInMemoryStateLocked();
+
+        int maxId = 0;
+        for (LineBreakpointEntry entry : snapshot.lineBreakpoints()) {
+            pendingBreakpointsById.put(entry.id(),
+                new PendingBreakpoint(entry.className(), entry.lineNumber(),
+                    entry.suspendPolicy(), entry.suspendPolicyLabel()));
+            maxId = Math.max(maxId, entry.id());
+        }
+        for (ExceptionBreakpointEntry entry : snapshot.exceptionBreakpoints()) {
+            pendingExceptionBreakpointsById.put(entry.id(), new PendingExceptionBreakpoint(entry.spec()));
+            maxId = Math.max(maxId, entry.id());
+        }
+        for (FieldBreakpointEntry entry : snapshot.fieldBreakpoints()) {
+            pendingFieldBreakpointsById.put(entry.id(), new PendingFieldBreakpoint(entry.spec()));
+            maxId = Math.max(maxId, entry.id());
+        }
+
+        for (Map.Entry<Integer, MetadataSnapshot> e : snapshot.metadata().entrySet()) {
+            final BreakpointMetadata meta = getOrCreateMetadata(e.getKey());
+            meta.condition = e.getValue().condition();
+            meta.logpointExpression = e.getValue().logpointExpression();
+        }
+
+        for (Map.Entry<Integer, TriggerLink> e : snapshot.dependencies().entrySet()) {
+            dependencyByDependent.put(e.getKey(), e.getValue());
+            dependentsByTrigger
+                .computeIfAbsent(e.getValue().triggerId(), k -> ConcurrentHashMap.newKeySet())
+                .add(e.getKey());
+        }
+
+        triggersFiredAtLeastOnce.addAll(snapshot.triggersFiredAtLeastOnce());
+
+        idCounter.set(maxId + 1);
+    }
+
+    /**
+     * Translates a JDI {@link EventRequest#suspendPolicy()} constant back to the human-readable
+     * label used by {@code jdwp_set_breakpoint}. Inverse of the label-parsing logic in the tool
+     * layer, lifted into the tracker because the snapshot path needs to round-trip the label
+     * through a fresh {@link PendingBreakpoint} without re-deriving it elsewhere.
+     */
+    private static String suspendPolicyLabel(int policy) {
+        return switch (policy) {
+            case EventRequest.SUSPEND_ALL -> "all";
+            case EventRequest.SUSPEND_EVENT_THREAD -> "thread";
+            case EventRequest.SUSPEND_NONE -> "none";
+            default -> "all";
+        };
+    }
+
     // ── Pending breakpoint operations ──
 
     /**
@@ -1784,6 +1924,72 @@ public class BreakpointTracker {
             return cyclePath;
         }
     }
+
+    /**
+     * Immutable snapshot of every breakpoint spec, metadata row, chain edge, and trigger-fire
+     * memory currently held by the tracker. Returned by {@link #snapshotForReconnect()} and
+     * replayed via {@link #restoreFromSnapshotAsPending(ReconnectSnapshot)}.
+     *
+     * <p>Lists / maps / sets are deep-copied via {@code List.copyOf} / {@code Map.copyOf} /
+     * {@code Set.copyOf} so callers cannot mutate the snapshot after capture.
+     *
+     * @param lineBreakpoints            every line BP (active and pending), in capture order
+     * @param exceptionBreakpoints       every exception BP (active and pending), in capture order
+     * @param fieldBreakpoints           every field watchpoint (active and pending), in capture order
+     * @param metadata                   per-BP condition / logpoint metadata, keyed by synthetic ID
+     * @param dependencies               chain edges — dependent ID → {@link TriggerLink}
+     * @param triggersFiredAtLeastOnce   set of trigger IDs that have already fired at least once
+     */
+    public record ReconnectSnapshot(
+        List<LineBreakpointEntry> lineBreakpoints,
+        List<ExceptionBreakpointEntry> exceptionBreakpoints,
+        List<FieldBreakpointEntry> fieldBreakpoints,
+        Map<Integer, MetadataSnapshot> metadata,
+        Map<Integer, TriggerLink> dependencies,
+        Set<Integer> triggersFiredAtLeastOnce
+    ) {}
+
+    /**
+     * Captured line breakpoint spec. Used by {@link ReconnectSnapshot} so the reconnect path can
+     * replay an active OR pending line BP under its original synthetic ID without losing the
+     * suspend policy.
+     *
+     * @param id                  synthetic BP id from the previous session — restored verbatim
+     * @param className           fully qualified class name the BP is set in
+     * @param lineNumber          source line number where the BP is set
+     * @param suspendPolicy       JDI {@link EventRequest} {@code SUSPEND_*} constant
+     * @param suspendPolicyLabel  human-readable label ("all" / "thread" / "none") round-tripped
+     *                            by {@code suspendPolicyLabel(int)}
+     */
+    public record LineBreakpointEntry(
+        int id, String className, int lineNumber, int suspendPolicy, String suspendPolicyLabel
+    ) {}
+
+    /**
+     * Captured exception breakpoint spec — wraps the existing {@link ExceptionBreakpointSpec}.
+     *
+     * @param id    synthetic BP id from the previous session — restored verbatim
+     * @param spec  the immutable exception BP spec, replayed against the fresh VM as-is
+     */
+    public record ExceptionBreakpointEntry(int id, ExceptionBreakpointSpec spec) {}
+
+    /**
+     * Captured field watchpoint spec — wraps the existing {@link FieldBreakpointSpec}.
+     *
+     * @param id    synthetic BP id from the previous session — restored verbatim
+     * @param spec  the immutable field watchpoint spec, replayed against the fresh VM as-is
+     */
+    public record FieldBreakpointEntry(int id, FieldBreakpointSpec spec) {}
+
+    /**
+     * Captured metadata row from {@link BreakpointMetadata}. Both fields nullable because each is
+     * independently set: a BP can have a condition without a logpoint expression and vice versa.
+     *
+     * @param condition           user-supplied conditional expression, or {@code null} when none
+     * @param logpointExpression  user-supplied logpoint expression, or {@code null} when the BP is
+     *                            not a logpoint
+     */
+    public record MetadataSnapshot(@Nullable String condition, @Nullable String logpointExpression) {}
 
     /**
      * Chain edge metadata: which trigger BP must fire before the dependent is armed, plus the

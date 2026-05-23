@@ -81,6 +81,14 @@ public class JdiEventListener {
     @Nullable
     private volatile Runnable vmDeathHook;
     /**
+     * Optional callback invoked every time the listener drains an {@link EventSet} from the JDI
+     * queue. Used by {@link JdiHealthMonitor} to advance its last-traffic timestamp without
+     * coupling the listener to the monitor's API surface (or its lifecycle in tests, which inject
+     * the listener directly and leave the observer null).
+     */
+    @Nullable
+    private volatile Runnable trafficObserver;
+    /**
      * Idempotence gate so concurrent death observers (graceful in-loop event, disconnect exception,
      * external {@code stop()}) collapse into at most one {@link #vmDeathHook} invocation per session.
      */
@@ -194,6 +202,16 @@ public class JdiEventListener {
     }
 
     /**
+     * Registers (or clears, when {@code observer} is null) the callback invoked every time the
+     * listener drains an {@link EventSet} from the JDI queue. Used by {@link JdiHealthMonitor}
+     * to advance its last-traffic timestamp; tests that drive the listener directly leave this
+     * null, so the observer call site is null-guarded.
+     */
+    public void setTrafficObserver(@Nullable Runnable observer) {
+        this.trafficObserver = observer;
+    }
+
+    /**
      * Spawns a fresh daemon listener thread for `vm`. Calls {@link #stop()} first so there is at
      * most one listener active at any time. The thread is a daemon — it does not block JVM shutdown.
      */
@@ -281,6 +299,17 @@ public class JdiEventListener {
         while (running) {
             try {
                 final EventSet eventSet = queue.remove();
+                // Inbound JDWP packet observed — refresh the health watchdog's last-traffic
+                // timestamp before any handler runs so a slow logpoint / condition evaluation
+                // does not have to wait for the next event to clear an UNRESPONSIVE classification.
+                final Runnable observer = trafficObserver;
+                if (observer != null) {
+                    try {
+                        observer.run();
+                    } catch (Exception e) {
+                        log.debug("[JDI] traffic observer threw: {}", e.getMessage());
+                    }
+                }
                 boolean shouldSuspend = false;
 
                 for (Event event : eventSet) {

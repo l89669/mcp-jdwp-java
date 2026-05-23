@@ -66,7 +66,11 @@ class JDWPToolsWaitForAttachTest {
 
 		final String result = tools.jdwp_wait_for_attach("localhost", 5005, 100);
 
-		assertThat(result).contains("[TIMEOUT]");
+		// Timeout returns the structured soft-wait envelope instead of [TIMEOUT].
+		// The actionable Local-JVM block is still appended so the agent can see candidate targets.
+		assertThat(result).contains("Status: still_waiting");
+		assertThat(result).contains("Tool: jdwp_wait_for_attach");
+		assertThat(result).contains("JDI Health:");
 		assertThat(result).contains("Local JVMs visible to user");
 		assertThat(result).contains("54321");
 		assertThat(result).contains("com.example.Other");
