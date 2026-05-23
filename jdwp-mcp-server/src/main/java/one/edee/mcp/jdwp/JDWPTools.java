@@ -2071,7 +2071,8 @@ public class JDWPTools {
             // BP opens a window where the BP can fire once before its trigger ever does. JDI
             // request creation already returns a disabled request; postpone the enable to the very
             // last step (and only when no chain edge applies).
-            final BreakpointRequest bpRequest = erm.createBreakpointRequest(locations.get(0));
+            final Location boundLocation = locations.get(0);
+            final BreakpointRequest bpRequest = erm.createBreakpointRequest(boundLocation);
             bpRequest.setSuspendPolicy(jdiPolicy);
 
             final int breakpointId = breakpointTracker.registerBreakpoint(bpRequest);
@@ -2086,8 +2087,15 @@ public class JDWPTools {
                 bpRequest.setEnabled(true);
             }
 
-            return String.format("Breakpoint set at %s:%d (ID: %d, suspend: %s%s%s)",
-                className, lineNumber, breakpointId, policyLabel, conditionInfo, chainInfo);
+            // Diagnostic — see JdiEventListener.handleClassPrepareEvent for the rationale. A
+            // line with multiple Locations (typical for lambdas) only gets a BP at the first
+            // one; the other code paths through the same line silently miss.
+            final String multiLocSuffix = locations.size() > 1
+                ? String.format(", WARNING: line has %d Locations; bound only to %s — other paths will MISS this BP",
+                    locations.size(), JdiEventListener.describeLocation(boundLocation))
+                : "";
+            return String.format("Breakpoint set at %s:%d (ID: %d, suspend: %s%s%s%s)",
+                className, lineNumber, breakpointId, policyLabel, conditionInfo, chainInfo, multiLocSuffix);
         } catch (AbsentInformationException e) {
             cleanupOrphanPendingBreakpoint(pendingIdForCleanup);
             return "Error: No line number information available for this class. Compile with debug info (-g).";
@@ -2172,7 +2180,8 @@ public class JDWPTools {
                 return String.format("Error: No executable code at line %d in class %s", lineNumber, className);
             }
 
-            final BreakpointRequest bpRequest = erm.createBreakpointRequest(locations.get(0));
+            final Location boundLocation = locations.get(0);
+            final BreakpointRequest bpRequest = erm.createBreakpointRequest(boundLocation);
             bpRequest.setSuspendPolicy(jdiPolicy);
             bpRequest.enable();
 
@@ -2182,8 +2191,13 @@ public class JDWPTools {
                 breakpointTracker.setCondition(breakpointId, condition);
             }
 
-            return String.format("Logpoint set at %s:%d (ID: %d, expression: %s%s)",
-                className, lineNumber, breakpointId, expression, conditionInfo);
+            // Diagnostic — see jdwp_set_breakpoint for the rationale.
+            final String multiLocSuffix = locations.size() > 1
+                ? String.format(", WARNING: line has %d Locations; bound only to %s — other paths will MISS this LP",
+                    locations.size(), JdiEventListener.describeLocation(boundLocation))
+                : "";
+            return String.format("Logpoint set at %s:%d (ID: %d, expression: %s%s%s)",
+                className, lineNumber, breakpointId, expression, conditionInfo, multiLocSuffix);
         } catch (AbsentInformationException e) {
             cleanupOrphanPendingBreakpoint(pendingIdForCleanup);
             return "Error: No line number information available. Compile with debug info (-g).";

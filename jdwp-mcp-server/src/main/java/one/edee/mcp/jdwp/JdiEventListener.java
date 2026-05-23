@@ -169,6 +169,24 @@ public class JdiEventListener {
     }
 
     /**
+     * Formats a JDI {@link Location} as a diagnostic string of the form
+     * {@code <method>@bci=<index>}. Used by BP-install paths to log exactly which bytecode
+     * Location we bound a breakpoint to — important for lambda-bearing lines where the same
+     * source line maps to multiple Locations (one in the enclosing method, one inside the
+     * synthetic {@code lambda$...$N} method) and {@code locationsOfLine(line).get(0)} only
+     * binds the first.
+     */
+    static String describeLocation(Location location) {
+        try {
+            return location.method().name() + "@bci=" + location.codeIndex();
+        } catch (Exception e) {
+            // Defensive — method() / codeIndex() can throw on certain pathological synthetic
+            // methods; fall back to the toString() form so the diagnostic still produces output.
+            return location.toString();
+        }
+    }
+
+    /**
      * Formats a JDI value for the human-readable logpoint output. Mirrors the format used by
      * {@link JDIConnectionService#formatFieldValue} but without its side effects (no object cache
      * insertion, no primitive unboxing) — logpoint output only needs to be a string for the event
@@ -1024,6 +1042,18 @@ public class JdiEventListener {
             log.info("[JDI] ClassPrepareEvent for '{}', activating {} deferred breakpoint(s), {} deferred exception breakpoint(s), {} deferred field BP(s)",
                 className, pendingList.size(), pendingExList.size(), pendingFieldList.size());
 
+            // Surface the CPE to agents via jdwp_get_events. Without this, an agent that sets a
+            // deferred BP and waits on jdwp_resume_until_event sees only [VM_START, VM_DEATH] and
+            // cannot tell whether the class ever loaded — making it impossible to distinguish
+            // "class never loaded" from "class loaded but BP did not fire".
+            eventHistory.record(new EventHistory.DebugEvent("CLASS_PREPARE",
+                String.format("ClassPrepareEvent for %s, activating %d line BP(s), %d exception BP(s), %d field BP(s)",
+                    className, pendingList.size(), pendingExList.size(), pendingFieldList.size()),
+                Map.of("class", className,
+                    "lineBpCount", String.valueOf(pendingList.size()),
+                    "exceptionBpCount", String.valueOf(pendingExList.size()),
+                    "fieldBpCount", String.valueOf(pendingFieldList.size()))));
+
             final VirtualMachine vm = event.virtualMachine();
             final EventRequestManager erm = vm.eventRequestManager();
 
@@ -1060,7 +1090,27 @@ public class JdiEventListener {
                         log.debug("[JDI] Deferred breakpoint {} promotion lost the race to the opportunistic path; orphan request deleted", id);
                         continue;
                     }
-                    log.info("[JDI] Deferred breakpoint {} activated at {}:{}", id, className, pending.getLineNumber());
+                    // Diagnostic — log how many Locations were available at this line and which one
+                    // we bound to. A line with multiple Locations (typical for lambdas: one in the
+                    // enclosing method, one in the synthetic `lambda$...$N`) means `.get(0)` only
+                    // covers ONE of the code paths; if the user's code runs through the OTHER
+                    // location, the BP silently misses. The bound-Location detail also helps
+                    // confirm we bound where the user expected vs. an off-by-one source-map slip.
+                    if (locations.size() > 1) {
+                        log.warn("[JDI] Deferred breakpoint {} activated at {}:{} — line has {} Locations; bound only to {} (other paths will MISS this BP)",
+                            id, className, pending.getLineNumber(), locations.size(), describeLocation(location));
+                        eventHistory.record(new EventHistory.DebugEvent("BP_MULTI_LOCATION",
+                            String.format("BP #%d at %s:%d — line has %d bytecode locations; bound only to %s (other paths will MISS)",
+                                id, className, pending.getLineNumber(), locations.size(), describeLocation(location)),
+                            Map.of("breakpointId", String.valueOf(id),
+                                "class", className,
+                                "line", String.valueOf(pending.getLineNumber()),
+                                "locationCount", String.valueOf(locations.size()),
+                                "boundLocation", describeLocation(location))));
+                    } else {
+                        log.info("[JDI] Deferred breakpoint {} activated at {}:{} ({})",
+                            id, className, pending.getLineNumber(), describeLocation(location));
+                    }
 
                 } catch (AbsentInformationException e) {
                     recordPromotionFailure(id, className, pending.getLineNumber(),
