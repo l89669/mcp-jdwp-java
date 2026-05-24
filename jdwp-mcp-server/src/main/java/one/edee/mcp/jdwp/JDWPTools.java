@@ -2041,19 +2041,27 @@ public class JDWPTools {
                         final BreakpointRequest bpRequest = erm.createBreakpointRequest(boundLocation);
                         bpRequest.setSuspendPolicy(jdiPolicy);
                         if (!breakpointTracker.promotePendingToActive(pendingId, bpRequest)) {
-                            // Another path (listener or safety-net) won the promotion race; tear
-                            // down the loser request so no duplicate fires on the target VM.
+                            // Another path (the ClassPrepare listener or the safety-net promoter) won
+                            // the promotion race; tear down the loser request so no duplicate fires on
+                            // the target VM. Crucially, do NOT emit the multi-location diagnostic here:
+                            // the winning path owns the binding and (for the listener) already recorded
+                            // its own BP_MULTI_LOCATION — emitting again would double-count.
                             try {
                                 erm.deleteEventRequest(bpRequest);
                             } catch (Exception ignored) {
                                 // VM may already be disconnected — best-effort cleanup.
                             }
-                        } else if (triggerBreakpointId == null) {
+                            return String.format("Breakpoint set at %s:%d (ID: %d, suspend: %s%s%s) " +
+                                    "(bound by a concurrent activation path)",
+                                className, lineNumber, pendingId, policyLabel, conditionInfo, chainInfo);
+                        }
+                        if (triggerBreakpointId == null) {
                             bpRequest.setEnabled(true);
                         }
-                        // Multi-location diagnostic — must apply to the race-guard path too, not
-                        // just the eager path, otherwise lambda-bearing lines silently miss
-                        // depending on whether the class loaded before or after BP registration.
+                        // Won the promotion — emit the multi-location diagnostic for THIS bind. It must
+                        // apply to the race-guard path too, not just the eager path, otherwise
+                        // lambda-bearing lines silently miss depending on whether the class loaded
+                        // before or after BP registration.
                         return String.format("Breakpoint set at %s:%d (ID: %d, suspend: %s%s%s%s)",
                             className, lineNumber, pendingId, policyLabel, conditionInfo, chainInfo,
                             multiLocationDiagnostic(pendingId, className, lineNumber, locations, boundLocation, "BP"));
@@ -2159,15 +2167,21 @@ public class JDWPTools {
                         bpRequest.setSuspendPolicy(jdiPolicy);
                         bpRequest.enable();
                         if (!breakpointTracker.promotePendingToActive(pendingId, bpRequest)) {
-                            // Another path (listener or safety-net) won the promotion race; tear
-                            // down the loser request so no duplicate fires on the target VM.
+                            // Another path (the ClassPrepare listener or the safety-net promoter) won
+                            // the promotion race; tear down the loser request so no duplicate fires on
+                            // the target VM. Do NOT emit the multi-location diagnostic here — the
+                            // winning path owns the binding and its diagnostics.
                             try {
                                 erm.deleteEventRequest(bpRequest);
                             } catch (Exception ignored) {
                                 // VM may already be disconnected — best-effort cleanup.
                             }
+                            return String.format("Logpoint set at %s:%d (ID: %d, expression: %s%s) " +
+                                    "(bound by a concurrent activation path)",
+                                className, lineNumber, pendingId, expression, conditionInfo);
                         }
-                        // Multi-location diagnostic — same rationale as jdwp_set_breakpoint.
+                        // Won the promotion — emit the multi-location diagnostic for THIS bind. Same
+                        // rationale as jdwp_set_breakpoint.
                         return String.format("Logpoint set at %s:%d (ID: %d, expression: %s%s%s)",
                             className, lineNumber, pendingId, expression, conditionInfo,
                             multiLocationDiagnostic(pendingId, className, lineNumber, locations, boundLocation, "LP"));

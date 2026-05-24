@@ -10,13 +10,17 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentLinkedDeque;
 
 /**
- * Bounded ring buffer of debug events captured from the JDI event queue. Records every interesting
- * event for post-mortem inspection via the `jdwp_get_events` tool.
+ * Bounded ring buffer of debug events for post-mortem inspection via the `jdwp_get_events` tool.
+ * Most events originate from the JDI event queue drained by {@link JdiEventListener}, but it is NOT
+ * the sole producer: synchronous install-time diagnostics are recorded from MCP worker threads too
+ * (e.g. {@code BP_MULTI_LOCATION} from {@link JDWPTools}, {@code RECONNECT} from
+ * {@link JDIConnectionService}).
  * <p>
  * Behaviour:
  * - FIFO ring buffer with a fixed cap of {@link #MAX_EVENTS} entries; oldest entries are dropped first.
- * - Thread-safe via {@link ConcurrentLinkedDeque}; the producer ({@link JdiEventListener}) and consumers
- * (MCP tool calls on worker threads) never block each other.
+ * - Thread-safe via {@link ConcurrentLinkedDeque}: the listener thread and the MCP worker threads may
+ * record concurrently, and concurrent readers never block writers. Because there are multiple
+ * producers, no global ordering is guaranteed beyond each individual {@code record} call.
  * - Cleared on `jdwp_reset`, `jdwp_clear_events`, and {@link JDIConnectionService#cleanupSessionState}.
  * <p>
  * Documented event type strings (exhaustive — keep in sync with every {@code DebugEvent} type
