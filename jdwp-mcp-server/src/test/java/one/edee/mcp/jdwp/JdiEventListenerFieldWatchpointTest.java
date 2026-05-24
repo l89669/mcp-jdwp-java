@@ -428,6 +428,80 @@ class JdiEventListenerFieldWatchpointTest {
 		assertThat(captured.get("$object")).as("$object must be present with null value").isNull();
 	}
 
+	@Test
+	@DisplayName("excludeConstructors=true silently drops <init> writes — no event, no suspend, no chain")
+	void shouldSkipConstructorWritesWhenExcludeConstructorsSet() throws Exception {
+		ModificationWatchpointRequest req = mock(ModificationWatchpointRequest.class);
+		int triggerId = tracker.registerFieldBreakpoint(
+			BreakpointTracker.FieldBreakpointSpec.suspending(
+				"com.Bank", "balance", BreakpointTracker.FieldWatchMode.MODIFICATION,
+				null, null, null, /* excludeConstructors */ true),
+			null, req);
+		// Wire a chain so we can also assert the trigger does NOT propagate when filtered.
+		com.sun.jdi.request.BreakpointRequest dependentReq = mock(com.sun.jdi.request.BreakpointRequest.class);
+		int dependentId = tracker.registerBreakpoint(dependentReq);
+		tracker.registerDependency(dependentId, triggerId, false);
+
+		ThreadReference thread = mockThread("worker-ctor", 4020L);
+		ModificationWatchpointEvent event = mockModificationEvent(thread, req, "com.Bank", "balance",
+			mockIntValue(0), mockIntValue(500));
+		wireFiringMethod(event, "<init>", /* isConstructor */ true, /* isStaticInitializer */ false);
+		EventSet eventSet = mockEventSet(event);
+
+		runListenerWith(listener, eventSet);
+
+		verify(eventSet).resume();
+		assertThat(hasEventOfType("FIELD_MODIFICATION")).isFalse();
+		// Chain side-effects MUST be suppressed too — a skipped write is not a hit.
+		verify(dependentReq, never()).setEnabled(true);
+		assertThat(hasEventOfType("CHAIN_ARMED")).isFalse();
+		assertThat(dependentId).isPositive();
+	}
+
+	@Test
+	@DisplayName("excludeConstructors=true still fires on post-construction writes from regular methods")
+	void shouldStillFireOnPostConstructionWritesWhenExcludeConstructorsSet() throws Exception {
+		ModificationWatchpointRequest req = mock(ModificationWatchpointRequest.class);
+		int bpId = tracker.registerFieldBreakpoint(
+			BreakpointTracker.FieldBreakpointSpec.suspending(
+				"com.Bank", "balance", BreakpointTracker.FieldWatchMode.MODIFICATION,
+				null, null, null, /* excludeConstructors */ true),
+			null, req);
+
+		ThreadReference thread = mockThread("worker-deposit", 4021L);
+		ModificationWatchpointEvent event = mockModificationEvent(thread, req, "com.Bank", "balance",
+			mockIntValue(500), mockIntValue(750));
+		wireFiringMethod(event, "deposit", /* isConstructor */ false, /* isStaticInitializer */ false);
+		EventSet eventSet = mockEventSet(event);
+
+		runListenerWith(listener, eventSet);
+
+		verify(eventSet, never()).resume();
+		assertLatestFieldEvent("FIELD_MODIFICATION", bpId, "balance", "modification");
+	}
+
+	@Test
+	@DisplayName("excludeConstructors=true also drops <clinit> writes")
+	void shouldSkipStaticInitializerWritesWhenExcludeConstructorsSet() throws Exception {
+		ModificationWatchpointRequest req = mock(ModificationWatchpointRequest.class);
+		tracker.registerFieldBreakpoint(
+			BreakpointTracker.FieldBreakpointSpec.suspending(
+				"com.Bank", "DEFAULTS", BreakpointTracker.FieldWatchMode.MODIFICATION,
+				null, null, null, /* excludeConstructors */ true),
+			null, req);
+
+		ThreadReference thread = mockThread("worker-clinit", 4022L);
+		ModificationWatchpointEvent event = mockModificationEvent(thread, req, "com.Bank", "DEFAULTS",
+			null, mockIntValue(42));
+		wireFiringMethod(event, "<clinit>", /* isConstructor */ false, /* isStaticInitializer */ true);
+		EventSet eventSet = mockEventSet(event);
+
+		runListenerWith(listener, eventSet);
+
+		verify(eventSet).resume();
+		assertThat(hasEventOfType("FIELD_MODIFICATION")).isFalse();
+	}
+
 	// ── Helpers ──────────────────────────────────────────────────────────────
 
 	private boolean hasEventOfType(String type) {
@@ -497,6 +571,23 @@ class JdiEventListenerFieldWatchpointTest {
 		when(vm.mirrorOf("access")).thenReturn(modeAccessMirror);
 		when(vm.mirrorOf("modification")).thenReturn(modeModMirror);
 		when(event.virtualMachine()).thenReturn(vm);
+	}
+
+	/**
+	 * Wires {@code event.location().method()} so the {@code excludeConstructors} branch in
+	 * {@link JdiEventListener#handleWatchpointEvent} can tell whether the firing frame is
+	 * an {@code <init>} / {@code <clinit>}. Only the {@code excludeConstructors} tests reach
+	 * this code path — every other test leaves {@code event.location()} unmocked.
+	 */
+	private static void wireFiringMethod(WatchpointEvent event, String methodName,
+			boolean isConstructor, boolean isStaticInitializer) {
+		com.sun.jdi.Method method = mock(com.sun.jdi.Method.class);
+		when(method.name()).thenReturn(methodName);
+		when(method.isConstructor()).thenReturn(isConstructor);
+		when(method.isStaticInitializer()).thenReturn(isStaticInitializer);
+		com.sun.jdi.Location location = mock(com.sun.jdi.Location.class);
+		when(location.method()).thenReturn(method);
+		when(event.location()).thenReturn(location);
 	}
 
 	private static IntegerValue mockIntValue(int value) {

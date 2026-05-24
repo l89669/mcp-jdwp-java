@@ -2228,7 +2228,8 @@ public class BreakpointTracker {
         boolean logOnly,
         @Nullable String expression,
         @Nullable Long threadFilterId,
-        @Nullable Long objectFilterId
+        @Nullable Long objectFilterId,
+        boolean excludeConstructors
     ) {
         /**
          * Default suspending behaviour: the firing thread is parked at the field access / modification
@@ -2239,8 +2240,21 @@ public class BreakpointTracker {
         public static FieldBreakpointSpec suspending(String className, String fieldName, FieldWatchMode mode,
                                                      @Nullable Long threadFilterId, @Nullable Long objectFilterId,
                                                      @Nullable String condition) {
+            return suspending(className, fieldName, mode, threadFilterId, objectFilterId, condition, false);
+        }
+
+        /**
+         * Suspending variant with {@code excludeConstructors}: when {@code true}, writes that happen
+         * inside the declaring class's {@code <init>} / {@code <clinit>} are filtered out by the
+         * listener (no event recorded, no chain trigger, no suspend) so the BP only fires on
+         * post-construction writes. Useful when a field is set by many constructors and you only care
+         * about later mutations.
+         */
+        public static FieldBreakpointSpec suspending(String className, String fieldName, FieldWatchMode mode,
+                                                     @Nullable Long threadFilterId, @Nullable Long objectFilterId,
+                                                     @Nullable String condition, boolean excludeConstructors) {
             return new FieldBreakpointSpec(className, fieldName, mode, condition, false, null,
-                threadFilterId, objectFilterId);
+                threadFilterId, objectFilterId, excludeConstructors);
         }
 
         /**
@@ -2252,8 +2266,20 @@ public class BreakpointTracker {
         public static FieldBreakpointSpec logOnly(String className, String fieldName, FieldWatchMode mode,
                                                   String expression, @Nullable Long threadFilterId,
                                                   @Nullable Long objectFilterId, @Nullable String condition) {
+            return logOnly(className, fieldName, mode, expression, threadFilterId, objectFilterId, condition, false);
+        }
+
+        /**
+         * Log-only variant with {@code excludeConstructors}: identical to {@link #logOnly} but
+         * suppresses logpoint hits that happen inside the declaring class's {@code <init>} /
+         * {@code <clinit>}.
+         */
+        public static FieldBreakpointSpec logOnly(String className, String fieldName, FieldWatchMode mode,
+                                                  String expression, @Nullable Long threadFilterId,
+                                                  @Nullable Long objectFilterId, @Nullable String condition,
+                                                  boolean excludeConstructors) {
             return new FieldBreakpointSpec(className, fieldName, mode, condition, true, expression,
-                threadFilterId, objectFilterId);
+                threadFilterId, objectFilterId, excludeConstructors);
         }
     }
 

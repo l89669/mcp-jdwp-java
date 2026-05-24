@@ -128,6 +128,7 @@ A field has the wrong value at read time and you can't tell which of many code p
 3. `jdwp_get_stack` — the caller frame is the culprit.
 4. **Want to know the value AND keep going?** Use `jdwp_set_field_logpoint(..., expression="$oldValue + \" -> \" + $newValue")` instead — every write records a `FIELD_LOGPOINT` event with the transition, no suspends. `jdwp_get_events(50)` shows the full history.
 5. **Need only one instance?** Pass `objectFilterId=<instance-id from jdwp_get_locals or jdwp_get_fields>` to filter to that one object. Pass `threadFilterId=<thread uniqueID>` to restrict by thread.
+6. **Drowning in constructor-storm writes before the interesting mutation?** Pass `excludeConstructors=true` — writes inside the declaring class's `<init>` / `<clinit>` are silently dropped (no event, no chain trigger, no suspend), so the BP only fires on post-construction mutations. Use when a field is set by many constructors and you only care about later changes.
 
 ### "Field is mutated during `<clinit>` but my BP misses the first write"
 
@@ -217,6 +218,28 @@ Several values are interesting at one BP and you don't want to issue N separate 
 2. At each BP hit: `jdwp_evaluate_watchers(threadId, scope="current_frame", breakpointId=1)` — returns every watcher's value (and an inline `[ERROR: ...]` per watcher that fails — others continue). The total line splits succeeded vs errored so partial failures are explicit.
 3. `jdwp_list_watchers_for_breakpoint(1)` / `jdwp_overview(types="watcher", filter="...")` to list, `jdwp_detach_watcher(<short-id>)` to remove.
 
+### "The target JVM died / I need to re-run with new breakpoints"
+
+Test ended (VM_DEATH), the surefire JVM was killed for a new run, or the target JVM was relaunched on the same port. You want to continue debugging with **all current breakpoints preserved** — no need to re-set them by hand.
+
+1. Relaunch the target on the same `address=<port>` (e.g. `mvn test -Dmaven.surefire.debug ...`).
+2. `jdwp_reconnect()` — disposes the dead VM handle and reattaches to the last known host:port. **Breakpoint specs (line / exception / field), conditions, logpoint expressions, chain edges, watchers, and synthetic BP IDs are preserved** — BP `#7` is still `#7` after.
+3. Resume normally: `jdwp_resume_until_event`.
+
+**What's lost on reconnect** — marked instances (`jdwp_mark_instance` labels), the object cache, the last-suspended-thread context, and the classpath-discovery cache. The first `jdwp_evaluate_expression` after reconnect is slow again. Object IDs from the previous session are invalid — re-fetch via `jdwp_get_locals` / `jdwp_get_fields`.
+
+**Don't** `jdwp_disconnect` + `jdwp_wait_for_attach` for this — it works but you lose every BP. Reserve `jdwp_connect` / `jdwp_wait_for_attach` for attaching to a **different** target.
+
+### "Where exactly did the assertion fail?"
+
+A test fails with an unhelpful `AssertionError` message and tears down before you can inspect state. Pin the JVM at the throw site.
+
+1. `jdwp_set_exception_breakpoint("java.lang.AssertionError", caught=true, uncaught=true)` — fires on the assertion itself, before JUnit's reporter wraps it and before the VM tears down.
+2. `jdwp_resume_until_event` — lands at the throw frame with the thread suspended.
+3. `jdwp_get_breakpoint_context` — full state at the failure point: locals, `this` fields, stack. From here you can `jdwp_evaluate_expression` to test invariants or `jdwp_set_local` / `jdwp_set_field` to try fixes in place.
+
+This is the safest default for "I want to see what the test saw when it gave up." Set it as part of the attach prologue when launching a failing test.
+
 ### "Same method runs 1000× but I only care about the call after login"
 
 A noisy method fires repeatedly throughout the run; you only want to stop on it within a specific context (after a particular trigger).
@@ -234,7 +257,16 @@ Chains can be retrofitted to existing BPs via `jdwp_set_breakpoint_dependency(de
 
 ## Critical Gotchas
 
-- **Expression eval auto-rewrites bare field references** to `_this.field` when the enclosing class and field are both public. For PACKAGE-PRIVATE enclosing classes this is skipped — the error message will tell you to use `jdwp_get_fields(<thisObjectId>)` instead.
+- **Expression eval auto-rewrites bare field references** to `_this.field` when the enclosing class and field are both public. For PACKAGE-PRIVATE enclosing classes this is skipped — the error message will tell you to use `jdwp_get_fields(<thisObjectId>)` instead. **If you need to call a method on a non-public peer field** (e.g. `eventBus.getErrorSummary()` where `eventBus` is package-private on `this`), `jdwp_get_fields` only reads — use a block-mode reflection snippet:
+  ```
+  jdwp_evaluate_expression(expression="{
+      java.lang.reflect.Field f = _this.getClass().getDeclaredField(\"eventBus\");
+      f.setAccessible(true);
+      Object bus = f.get(_this);
+      return bus.getClass().getMethod(\"getErrorSummary\").invoke(bus);
+  }")
+  ```
+  Block mode (`{ ...; return X; }`) is supported by `jdwp_evaluate_expression` and `jdwp_assert_expression`, and by every condition / logpoint expression field.
 - **`set_local` / `set_field` only support** primitives, `String`, and `null`. To mutate a complex object, mutate its individual fields.
 - **Exception breakpoints on bootstrap classes** (`NullPointerException`, `IllegalStateException`, etc.) start as `[PENDING]`. They auto-promote when any tool runs while a thread is suspended at a breakpoint. Pair with a regular line BP upstream — see the "Exception buried under wrappers" recipe.
 - **VMStart suspension is special.** When connected to a JVM with `suspend=y`, all threads are suspended but no thread is at a breakpoint yet. `evaluate_expression`, `to_string`, and `set_exception_breakpoint` cannot work until at least one BP has been hit. Set breakpoints first, then resume.

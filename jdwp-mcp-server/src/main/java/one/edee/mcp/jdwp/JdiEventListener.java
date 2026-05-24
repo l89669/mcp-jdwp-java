@@ -768,6 +768,19 @@ public class JdiEventListener {
                 return true;
             }
 
+            // excludeConstructors: drop the write entirely (no event, no chain trigger, no suspend)
+            // if it originates from the declaring class's <init> / <clinit>. Direct frame check —
+            // we deliberately do NOT follow the call stack: a method *called by* a constructor is
+            // still an interesting hit (it's a user-written collaborator, not init-storm noise).
+            if (info.getSpec().excludeConstructors()) {
+                final Method firingMethod = event.location().method();
+                if (firingMethod.isConstructor() || firingMethod.isStaticInitializer()) {
+                    log.debug("[JDI] Field BP {} skipping {} write from {} (excludeConstructors)",
+                        bpId, event.field().name(), firingMethod.name());
+                    return false;
+                }
+            }
+
             final boolean isModification = event instanceof ModificationWatchpointEvent;
             final String modeStr = isModification ? "modification" : "access";
             final String className = event.field().declaringType().name();
