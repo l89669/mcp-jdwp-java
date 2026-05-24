@@ -822,7 +822,7 @@ public class JdiEventListener {
      * watchpoint hit. {@code $oldValue} (always — null for the first write to an uninitialised
      * reference field), {@code $newValue} (always for {@link ModificationWatchpointEvent}, otherwise
      * absent), and {@code $object} (null for static-field events) are bound. Null values are bound
-     * as the typed-null literal by {@link JdiExpressionEvaluator#inferDeclaredType(Value)} ({@code
+     * as the typed-null literal by {@code JdiExpressionEvaluator#inferDeclaredType} ({@code
      * java.lang.Object}), so string-concatenation expressions like {@code "$oldValue + \" -> \" +
      * $newValue"} render the literal {@code "null"} instead of failing at compile time.
      * <p>
