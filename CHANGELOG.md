@@ -5,6 +5,38 @@ All notable changes to the `jdwp-debugging` plugin are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.4.0] — 2026-05-24
+
+### New — block-mode multi-statement expressions
+
+Every place that takes a Java expression — `jdwp_evaluate_expression`,
+`jdwp_assert_expression`, breakpoint conditions, logpoint expressions and
+conditions, exception logpoints, field-watchpoint conditions/expressions, and
+watchers — now also accepts a brace-wrapped statement body. Previously each
+input had to be a single expression, so anything that needed an intermediate
+local, a `try/catch`, or an early return could not be evaluated at a
+breakpoint. Resolves #8.
+
+- **`{ …; return X; }` block syntax** — when the trimmed input starts with `{`
+  and ends with the matching `}`, it is spliced into the wrapper method body
+  verbatim instead of being wrapped as a single expression. You write your own
+  `return X;` to yield a value; a trailing `return null;` fallthrough guard
+  keeps the wrapper type-correct if the block doesn't return on every path.
+  Intermediate locals, `try/catch`, early returns, and loops are all available.
+- **Literal-aware mode detection** — the brace match is tokenizer-aware and
+  ignores braces inside string, char, and text-block literals, so `"{x}".length()`
+  still routes through expression mode while
+  `{ try { return foo(); } catch (Exception e) { return null; } }` routes
+  through block mode.
+- **Discoverable from any eval param** — all eight eval-bearing tool
+  methods/params carry a "supports `{ …; return X; }` block syntax" suffix in
+  their descriptions, so the feature surfaces wherever an eval-shaped parameter
+  appears.
+- **Auto-rewrite interaction** — the bare-field `this.field` auto-rewrite is
+  skipped in block mode (an identifier-level rewriter cannot tell a field
+  reference from a local declaration); block-mode users write explicit
+  `this.field` / `_this.field`, which the keyword rewrite still handles.
+
 ## [2.3.0] — 2026-05-24
 
 ### New — deferred breakpoint/logpoint install diagnostics
