@@ -2056,7 +2056,7 @@ public class JDWPTools {
                         // depending on whether the class loaded before or after BP registration.
                         return String.format("Breakpoint set at %s:%d (ID: %d, suspend: %s%s%s%s)",
                             className, lineNumber, pendingId, policyLabel, conditionInfo, chainInfo,
-                            multiLocationSuffix(locations, boundLocation, "BP"));
+                            multiLocationDiagnostic(pendingId, className, lineNumber, locations, boundLocation, "BP"));
                     }
                 }
 
@@ -2097,7 +2097,7 @@ public class JDWPTools {
             // one; the other code paths through the same line silently miss.
             return String.format("Breakpoint set at %s:%d (ID: %d, suspend: %s%s%s%s)",
                 className, lineNumber, breakpointId, policyLabel, conditionInfo, chainInfo,
-                multiLocationSuffix(locations, boundLocation, "BP"));
+                multiLocationDiagnostic(breakpointId, className, lineNumber, locations, boundLocation, "BP"));
         } catch (AbsentInformationException e) {
             cleanupOrphanPendingBreakpoint(pendingIdForCleanup);
             return "Error: No line number information available for this class. Compile with debug info (-g).";
@@ -2170,7 +2170,7 @@ public class JDWPTools {
                         // Multi-location diagnostic — same rationale as jdwp_set_breakpoint.
                         return String.format("Logpoint set at %s:%d (ID: %d, expression: %s%s%s)",
                             className, lineNumber, pendingId, expression, conditionInfo,
-                            multiLocationSuffix(locations, boundLocation, "LP"));
+                            multiLocationDiagnostic(pendingId, className, lineNumber, locations, boundLocation, "LP"));
                     }
                 }
 
@@ -2199,7 +2199,7 @@ public class JDWPTools {
             // Diagnostic — see jdwp_set_breakpoint for the rationale.
             return String.format("Logpoint set at %s:%d (ID: %d, expression: %s%s%s)",
                 className, lineNumber, breakpointId, expression, conditionInfo,
-                multiLocationSuffix(locations, boundLocation, "LP"));
+                multiLocationDiagnostic(breakpointId, className, lineNumber, locations, boundLocation, "LP"));
         } catch (AbsentInformationException e) {
             cleanupOrphanPendingBreakpoint(pendingIdForCleanup);
             return "Error: No line number information available. Compile with debug info (-g).";
@@ -2222,22 +2222,39 @@ public class JDWPTools {
     }
 
     /**
-     * Formats the multi-location WARNING suffix appended to BP / LP install responses when a
-     * source line maps to more than one bytecode {@link Location}. Returns an empty string when
-     * there is only one Location, so the caller can splat the value into a format string
-     * unconditionally. {@code kind} is the short label ("BP" / "LP") used in the warning text.
-     * <p>
-     * Shared by both {@code jdwp_set_breakpoint} / {@code jdwp_set_logpoint} AND their race-guard
-     * paths (where the class loaded between the initial {@code classesByName} check and the
-     * ClassPrepareRequest registration) so the diagnostic surfaces uniformly regardless of which
-     * activation path the install took.
+     * Emits the multi-location diagnostic for an eager (or race-guard) BP / LP bind and returns the
+     * WARNING suffix appended to the install response. When the source line maps to more than one
+     * bytecode {@link Location}, this:
+     * <ul>
+     *   <li>logs a WARN line, and</li>
+     *   <li>records a {@code BP_MULTI_LOCATION} {@link EventHistory.DebugEvent} (same type and detail
+     *       keys as the deferred path in {@link JdiEventListener#handleClassPrepareEvent}),</li>
+     * </ul>
+     * so {@code jdwp_get_events} surfaces the diagnostic uniformly whether the bind happened
+     * immediately or on a later ClassPrepare. Returns an empty string when there is only one
+     * Location, so the caller can splat the value into a format string unconditionally. {@code kind}
+     * is the short label ("BP" / "LP") used in the warning text.
      */
-    private static String multiLocationSuffix(List<Location> locations, Location boundLocation, String kind) {
+    private String multiLocationDiagnostic(int id, String className, int lineNumber,
+                                           List<Location> locations, Location boundLocation, String kind) {
         if (locations.size() <= 1) {
             return "";
         }
+        final String kindLower = "LP".equals(kind) ? "logpoint" : "breakpoint";
+        final String boundDesc = JdiEventListener.describeLocation(boundLocation);
+        log.warn("[JDI] {} {} bound at {}:{} — line has {} Locations; bound only to {} (other paths will MISS this {})",
+            kindLower, id, className, lineNumber, locations.size(), boundDesc, kind);
+        eventHistory.record(new EventHistory.DebugEvent("BP_MULTI_LOCATION",
+            String.format("%s #%d at %s:%d — line has %d bytecode locations; bound only to %s (other paths will MISS)",
+                kind, id, className, lineNumber, locations.size(), boundDesc),
+            Map.of("breakpointId", String.valueOf(id),
+                "kind", kindLower,
+                "class", className,
+                "line", String.valueOf(lineNumber),
+                "locationCount", String.valueOf(locations.size()),
+                "boundLocation", boundDesc)));
         return String.format(", WARNING: line has %d Locations; bound only to %s — other paths will MISS this %s",
-            locations.size(), JdiEventListener.describeLocation(boundLocation), kind);
+            locations.size(), boundDesc, kind);
     }
 
     @McpTool(description = "Clear a breakpoint by its synthetic ID (from jdwp_overview). Routes by kind: line, exception, and field breakpoints share one ID space.")

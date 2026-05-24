@@ -19,12 +19,13 @@ import java.util.concurrent.ConcurrentLinkedDeque;
  * (MCP tool calls on worker threads) never block each other.
  * - Cleared on `jdwp_reset`, `jdwp_clear_events`, and {@link JDIConnectionService#cleanupSessionState}.
  * <p>
- * Documented event type strings: `BREAKPOINT`, `STEP`, `EXCEPTION`, `EXCEPTION_LOG`,
- * `EXCEPTION_LOG_ERROR`, `LOGPOINT`, `LOGPOINT_ERROR`, `FIELD_ACCESS`, `FIELD_MODIFICATION`,
- * `FIELD_LOGPOINT`, `FIELD_LOGPOINT_ERROR`, `BREAKPOINT_SUPPRESSED`, `EXCEPTION_SUPPRESSED`,
- * `FIELD_BREAKPOINT_SUPPRESSED`, `CHAIN_ARMED`, `CHAIN_DISARMED`, `CHAIN_BROKEN`, `VM_START`,
- * `VM_DEATH`, `CLASS_PREPARE`, `BP_MULTI_LOCATION`, `BP_PROMOTION_FAILED`. These are the keys
- * clients can grep on or filter by.
+ * Documented event type strings (exhaustive — keep in sync with every {@code DebugEvent} type
+ * recorded across the codebase): `BREAKPOINT`, `BREAKPOINT_SUPPRESSED`, `STEP`, `STEP_SUPPRESSED`,
+ * `EXCEPTION`, `EXCEPTION_SUPPRESSED`, `EXCEPTION_LOG`, `EXCEPTION_LOG_ERROR`, `LOGPOINT`,
+ * `LOGPOINT_ERROR`, `FIELD_ACCESS`, `FIELD_MODIFICATION`, `FIELD_BREAKPOINT_SUPPRESSED`,
+ * `FIELD_LOGPOINT`, `FIELD_LOGPOINT_ERROR`, `CHAIN_ARMED`, `CHAIN_DISARMED`, `CHAIN_BROKEN`,
+ * `CLASS_PREPARE`, `BP_MULTI_LOCATION`, `BP_PROMOTION_FAILED`, `RECONNECT`, `VM_START`, `VM_DEATH`.
+ * These are the keys clients can grep on or filter by.
  */
 @Service
 public class EventHistory {

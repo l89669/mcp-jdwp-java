@@ -36,6 +36,7 @@ class JDWPToolsSetBreakpointTest {
 	private JDWPTools tools;
 	private VirtualMachine vm;
 	private EventRequestManager erm;
+	private EventHistory eventHistory;
 
 	@BeforeEach
 	void setUp() throws Exception {
@@ -43,7 +44,7 @@ class JDWPToolsSetBreakpointTest {
 		tracker = new BreakpointTracker();
 		final WatcherManager watcherManager = new WatcherManager();
 		final JdiExpressionEvaluator evaluator = mock(JdiExpressionEvaluator.class);
-		final EventHistory eventHistory = new EventHistory();
+		eventHistory = new EventHistory();
 		tools = JDWPToolsTestSupport.newTools(
 			jdiService, tracker, watcherManager, evaluator,
 			eventHistory, new EvaluationGuard(), new JvmDiscoveryService());
@@ -228,6 +229,56 @@ class JDWPToolsSetBreakpointTest {
 			final String result = tools.jdwp_set_breakpoint("com.example.Foo", 10, "all", "i > 0", null, null, null);
 
 			assertThat(result).contains("condition: i > 0");
+		}
+	}
+
+	@Nested
+	@DisplayName("multi-location diagnostic")
+	class MultiLocationDiagnostic {
+
+		@Test
+		@DisplayName("eager bind to a line with >1 Location warns in the response AND records BP_MULTI_LOCATION")
+		void shouldWarnAndRecordEventForMultiLocationEagerBind() throws Exception {
+			final ReferenceType refType = mock(ReferenceType.class);
+			final Location bound = mock(Location.class);
+			final Location lambda = mock(Location.class);
+			// describeLocation reads method().name() + codeIndex() off the bound Location.
+			final com.sun.jdi.Method method = mock(com.sun.jdi.Method.class);
+			when(method.name()).thenReturn("doWork");
+			when(bound.method()).thenReturn(method);
+			when(bound.codeIndex()).thenReturn(7L);
+			when(jdiService.findLoadedClass("com.example.WithLambda")).thenReturn(refType);
+			when(refType.locationsOfLine(99)).thenReturn(List.of(bound, lambda));
+			when(erm.createBreakpointRequest(bound)).thenReturn(mock(BreakpointRequest.class));
+
+			final String result = tools.jdwp_set_breakpoint("com.example.WithLambda", 99, "all", null, null, null, null);
+
+			assertThat(result)
+				.startsWith("Breakpoint set at com.example.WithLambda:99")
+				.contains("WARNING: line has 2 Locations")
+				.contains("other paths will MISS this BP");
+
+			assertThat(eventHistory.getRecent(10))
+				.anySatisfy(e -> {
+					assertThat(e.type()).isEqualTo("BP_MULTI_LOCATION");
+					assertThat(e.summary()).startsWith("BP ");
+					assertThat(e.summary()).contains("com.example.WithLambda:99");
+					assertThat(e.summary()).contains("2 bytecode locations");
+					assertThat(e.details()).containsEntry("kind", "breakpoint");
+					assertThat(e.details()).containsEntry("locationCount", "2");
+				});
+		}
+
+		@Test
+		@DisplayName("single-Location bind records NO BP_MULTI_LOCATION event and adds no warning")
+		void shouldNotWarnOrRecordForSingleLocationBind() throws Exception {
+			wireEagerSet("com.example.Foo", 10);
+
+			final String result = tools.jdwp_set_breakpoint("com.example.Foo", 10, "all", null, null, null, null);
+
+			assertThat(result).doesNotContain("WARNING");
+			assertThat(eventHistory.getRecent(10))
+				.noneSatisfy(e -> assertThat(e.type()).isEqualTo("BP_MULTI_LOCATION"));
 		}
 	}
 }
