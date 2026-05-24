@@ -806,10 +806,10 @@ public class JDWPTools {
     }
 
 
-    @McpTool(description = "Evaluate a Java expression in the context of a suspended thread's stack frame. Returns '[VM_DEATH] ...' if the target VM disconnects mid-call.")
+    @McpTool(description = "Evaluate a Java expression in the context of a suspended thread's stack frame. Two input modes: (1) single expression — `order.getTotal()`, `x + y`. (2) block mode — wrap the input in `{ ... }` to send a statement body with try/catch, intermediate locals, or early `return`; the user writes explicit `return X;` statements to yield a value. Returns '[VM_DEATH] ...' if the target VM disconnects mid-call.")
     public String jdwp_evaluate_expression(
         @McpToolParam(description = "Thread unique ID") long threadId,
-        @McpToolParam(description = "Java expression to evaluate (e.g., 'order.getTotal()', 'x + y', 'name.length()')") String expression,
+        @McpToolParam(description = "Java expression OR `{ ... }` block to evaluate. Examples: `order.getTotal()`, `x + y`, `{ try { return risky(); } catch (Exception e) { return e.getMessage(); } }`") String expression,
         @McpToolParam(required = false, description = "Frame index (0 = current frame, default: 0)") @Nullable Integer frameIndex) {
         try {
             final VirtualMachine vm = jdiService.getVM();
@@ -839,9 +839,9 @@ public class JDWPTools {
         }
     }
 
-    @McpTool(description = "Evaluate a Java expression and compare its result against an expected value. Returns 'OK' on match, 'MISMATCH' with actual vs expected on failure, or '[VM_DEATH] ...' if the target VM disconnects mid-call. Comparison is string-based against the same formatting jdwp_evaluate_expression uses (so primitives auto-unbox, strings strip surrounding quotes).")
+    @McpTool(description = "Evaluate a Java expression and compare its result against an expected value. Returns 'OK' on match, 'MISMATCH' with actual vs expected on failure, or '[VM_DEATH] ...' if the target VM disconnects mid-call. Comparison is string-based against the same formatting jdwp_evaluate_expression uses (so primitives auto-unbox, strings strip surrounding quotes). Supports `{ block }` syntax for multi-statement.")
     public String jdwp_assert_expression(
-        @McpToolParam(description = "Java expression (e.g., 'order.getTotal()', 'session.getRole()', 'list.size() == 5')") String expression,
+        @McpToolParam(description = "Java expression (e.g., 'order.getTotal()', 'session.getRole()', 'list.size() == 5') — supports `{ ...; return X; }` block syntax") String expression,
         @McpToolParam(description = "Expected value (string-compared against the formatted expression result)") String expected,
         @McpToolParam(required = false, description = "Thread ID — defaults to the last breakpoint thread") @Nullable Long threadId,
         @McpToolParam(required = false, description = "Frame index (default: 0)") @Nullable Integer frameIndex) {
@@ -1956,12 +1956,12 @@ public class JDWPTools {
         }
     }
 
-    @McpTool(description = "Set a breakpoint at a specific line in a class. Supports conditional breakpoints. By default the breakpoint is registered passively: if the class is not yet loaded, the BP is deferred via a ClassPrepareRequest and activates when the JVM loads the class on its own — same behaviour as IntelliJ / Eclipse / jdb. Pass forceLoad=true only when you need the breakpoint to bind immediately and accept that loading the class will run its `<clinit>` (early static init, eager dependency loads, masked lazy-load diagnostics).")
+    @McpTool(description = "Set a breakpoint at a specific line in a class. Supports conditional breakpoints — conditions support `{ block }` syntax for multi-statement. By default the breakpoint is registered passively: if the class is not yet loaded, the BP is deferred via a ClassPrepareRequest and activates when the JVM loads the class on its own — same behaviour as IntelliJ / Eclipse / jdb. Pass forceLoad=true only when you need the breakpoint to bind immediately and accept that loading the class will run its `<clinit>` (early static init, eager dependency loads, masked lazy-load diagnostics).")
     public String jdwp_set_breakpoint(
         @McpToolParam(description = "Fully qualified class name (e.g. 'com.example.MyClass')") String className,
         @McpToolParam(description = "Line number") int lineNumber,
         @McpToolParam(required = false, description = "Suspend policy: 'all' (default), 'thread', 'none'") @Nullable String suspendPolicy,
-        @McpToolParam(required = false, description = "Optional condition — only suspend when this evaluates to true (e.g., 'i > 100')") @Nullable String condition,
+        @McpToolParam(required = false, description = "Optional condition — only suspend when this evaluates to true (e.g., 'i > 100') — supports `{ ...; return X; }` block syntax") @Nullable String condition,
         @McpToolParam(required = false, description = "Optional ID of a trigger breakpoint — this BP stays disarmed until the trigger fires. Sticky by default: once armed it stays so unless re-disarmed via jdwp_disarm_until_trigger or oneShot=true.") @Nullable Integer triggerBreakpointId,
         @McpToolParam(required = false, description = "If true, re-disarm this BP after each hit so the next trigger fire re-arms it (IntelliJ-style). Default: false (sticky).") @Nullable Boolean oneShot,
         @McpToolParam(required = false, description = "If true, force-load the class via Class.forName in the target VM when it isn't already loaded. Default: false (passive — defer via ClassPrepareRequest). Force-load triggers `<clinit>`, cascades dependent loads, and can mask lazy-init / classloader-leak diagnostics — use sparingly.") @Nullable Boolean forceLoad) {
@@ -2115,12 +2115,12 @@ public class JDWPTools {
         }
     }
 
-    @McpTool(description = "Set a logpoint (non-stopping breakpoint) that evaluates an expression and logs the result without pausing execution. Supports an optional condition — the expression is only logged when the condition evaluates to true. By default the logpoint is registered passively: if the class is not yet loaded, it is deferred via a ClassPrepareRequest and activates on natural load. Pass forceLoad=true to force the class load (runs `<clinit>`, may mask lazy-init diagnostics).")
+    @McpTool(description = "Set a logpoint (non-stopping breakpoint) that evaluates an expression and logs the result without pausing execution. Supports an optional condition — the expression is only logged when the condition evaluates to true. Both expression and condition support `{ block }` syntax for multi-statement. By default the logpoint is registered passively: if the class is not yet loaded, it is deferred via a ClassPrepareRequest and activates on natural load. Pass forceLoad=true to force the class load (runs `<clinit>`, may mask lazy-init diagnostics).")
     public String jdwp_set_logpoint(
         @McpToolParam(description = "Fully qualified class name") String className,
         @McpToolParam(description = "Line number") int lineNumber,
-        @McpToolParam(description = "Java expression to evaluate and log (e.g., '\"x=\" + x', 'order.getTotal()')") String expression,
-        @McpToolParam(required = false, description = "Optional condition — only log when this evaluates to true (e.g., 'i > 100')") @Nullable String condition,
+        @McpToolParam(description = "Java expression to evaluate and log (e.g., '\"x=\" + x', 'order.getTotal()') — supports `{ ...; return X; }` block syntax") String expression,
+        @McpToolParam(required = false, description = "Optional condition — only log when this evaluates to true (e.g., 'i > 100') — supports `{ ...; return X; }` block syntax") @Nullable String condition,
         @McpToolParam(required = false, description = "If true, force-load the class via Class.forName in the target VM when it isn't already loaded. Default: false (passive — defer via ClassPrepareRequest). Force-load triggers `<clinit>` and can mask lazy-init / classloader-leak diagnostics — use sparingly.") @Nullable Boolean forceLoad) {
         // Track the pending ID outside the try so the catch can clean it up if locationsOfLine
         // (or any later step) throws after the pending entry has already been registered.
@@ -2530,7 +2530,8 @@ public class JDWPTools {
         "throw of the given exception type. The expression is evaluated against the throwing frame with " +
         "$exception bound to the thrown object (e.g., \"$exception.getMessage()\"); its result is attached " +
         "to the event. The optional condition is evaluated with the same $exception binding — the log is " +
-        "recorded only when the condition is true. Use this for tracing exception flows in long-running " +
+        "recorded only when the condition is true. Both expression and condition support `{ block }` syntax " +
+        "for multi-statement. Use this for tracing exception flows in long-running " +
         "services without halting traffic. By default the logpoint is registered passively: if the exception " +
         "class is not yet loaded the logpoint is deferred via a ClassPrepareRequest and activates on natural " +
         "load. Pass forceLoad=true when targeting an exception class the application hasn't referenced yet " +
@@ -2538,8 +2539,8 @@ public class JDWPTools {
         "running `<clinit>` in the target VM.")
     public String jdwp_set_exception_logpoint(
         @McpToolParam(description = "Exception class name (e.g., 'java.sql.SQLException')") String exceptionClass,
-        @McpToolParam(description = "Java expression evaluated on each hit; $exception is bound to the thrown object") String expression,
-        @McpToolParam(required = false, description = "Optional condition with $exception bound — only log when this evaluates to true") @Nullable String condition,
+        @McpToolParam(description = "Java expression evaluated on each hit; $exception is bound to the thrown object — supports `{ ...; return X; }` block syntax") String expression,
+        @McpToolParam(required = false, description = "Optional condition with $exception bound — only log when this evaluates to true — supports `{ ...; return X; }` block syntax") @Nullable String condition,
         @McpToolParam(required = false, description = "Log caught exceptions (default: true)") @Nullable Boolean caught,
         @McpToolParam(required = false, description = "Log uncaught exceptions (default: true)") @Nullable Boolean uncaught,
         @McpToolParam(required = false, description = "Optional ID of a trigger breakpoint — this logpoint stays disarmed until the trigger fires. Sticky by default.") @Nullable Integer triggerBreakpointId,
@@ -2666,15 +2667,16 @@ public class JDWPTools {
     @McpTool(description = "Set a field watchpoint that suspends the firing thread when the field is read " +
         "(mode='access'), written (mode='modification'), or both. Conditions are evaluated against the firing " +
         "frame with $oldValue, $newValue (modification only), $object (null for static), $fieldName, and $mode " +
-        "bound. By default the BP is registered passively: if the class is not yet loaded it is deferred via " +
-        "a ClassPrepareRequest and activates on natural load. Pass forceLoad=true to bind immediately and " +
-        "accept the side effects of running `<clinit>` in the target VM. ERROR if the field is ambiguous on the " +
-        "class, missing, or static when objectFilterId is supplied.")
+        "bound; conditions support `{ block }` syntax for multi-statement. By default the BP is registered " +
+        "passively: if the class is not yet loaded it is deferred via a ClassPrepareRequest and activates on " +
+        "natural load. Pass forceLoad=true to bind immediately and accept the side effects of running " +
+        "`<clinit>` in the target VM. ERROR if the field is ambiguous on the class, missing, or static when " +
+        "objectFilterId is supplied.")
     public String jdwp_set_field_breakpoint(
         @McpToolParam(description = "Fully-qualified class declaring the field (e.g., 'com.example.Order')") String className,
         @McpToolParam(description = "Field name (must be unambiguous on the class)") String fieldName,
         @McpToolParam(description = "Watch mode: 'access', 'modification', or 'both' (case-insensitive)") String mode,
-        @McpToolParam(required = false, description = "Optional condition with $oldValue, $newValue, $object, $fieldName, $mode bound — fire only when this evaluates to true") @Nullable String condition,
+        @McpToolParam(required = false, description = "Optional condition with $oldValue, $newValue, $object, $fieldName, $mode bound — fire only when this evaluates to true — supports `{ ...; return X; }` block syntax") @Nullable String condition,
         @McpToolParam(required = false, description = "Optional thread filter — only fire when this thread (uniqueID) hits the field") @Nullable Long threadFilterId,
         @McpToolParam(required = false, description = "Optional object filter — only fire on the given instance (object ID from jdwp_get_locals/jdwp_get_fields). Must be omitted for static fields.") @Nullable Long objectFilterId,
         @McpToolParam(required = false, description = "Optional ID of a trigger breakpoint — this field BP stays disarmed until the trigger fires. Sticky by default.") @Nullable Integer triggerBreakpointId,
@@ -2691,6 +2693,7 @@ public class JDWPTools {
         "access or modification of the field. The expression is evaluated against the firing frame with " +
         "$oldValue, $newValue (modification only), $object (null for static), $fieldName, and $mode bound; " +
         "its result is attached to the event. Optional condition gates whether the log is recorded. " +
+        "Both expression and condition support `{ block }` syntax for multi-statement. " +
         "Use this to trace state transitions in long-running services without halting traffic. By default the " +
         "logpoint is registered passively: if the class is not yet loaded it is deferred via a " +
         "ClassPrepareRequest and activates on natural load. Pass forceLoad=true to bind immediately and " +
@@ -2699,8 +2702,8 @@ public class JDWPTools {
         @McpToolParam(description = "Fully-qualified class declaring the field") String className,
         @McpToolParam(description = "Field name (must be unambiguous on the class)") String fieldName,
         @McpToolParam(description = "Watch mode: 'access', 'modification', or 'both' (case-insensitive)") String mode,
-        @McpToolParam(description = "Java expression evaluated on each hit (e.g., '$oldValue + \" -> \" + $newValue')") String expression,
-        @McpToolParam(required = false, description = "Optional condition with the same synthetic bindings — log only when true") @Nullable String condition,
+        @McpToolParam(description = "Java expression evaluated on each hit (e.g., '$oldValue + \" -> \" + $newValue') — supports `{ ...; return X; }` block syntax") String expression,
+        @McpToolParam(required = false, description = "Optional condition with the same synthetic bindings — log only when true — supports `{ ...; return X; }` block syntax") @Nullable String condition,
         @McpToolParam(required = false, description = "Optional thread filter — only fire when this thread (uniqueID) hits the field") @Nullable Long threadFilterId,
         @McpToolParam(required = false, description = "Optional object filter — only fire on the given instance. Must be omitted for static fields.") @Nullable Long objectFilterId,
         @McpToolParam(required = false, description = "Optional ID of a trigger breakpoint — this logpoint stays disarmed until the trigger fires. Sticky by default.") @Nullable Integer triggerBreakpointId,
@@ -3748,11 +3751,11 @@ public class JDWPTools {
         }
     }
 
-    @McpTool(description = "Attach a watcher to a breakpoint to evaluate a Java expression when hit. Returns the watcher ID.")
+    @McpTool(description = "Attach a watcher to a breakpoint to evaluate a Java expression when hit. Returns the watcher ID. Supports `{ block }` syntax for multi-statement.")
     public String jdwp_attach_watcher(
         @McpToolParam(description = "Breakpoint request ID (from jdwp_overview)") int breakpointId,
         @McpToolParam(description = "Descriptive label for this watcher (e.g., 'Trace entity ID', 'Check user name')") String label,
-        @McpToolParam(description = "Java expression to evaluate (e.g., 'entity.id', 'user.name', 'items.size()')") String expression) {
+        @McpToolParam(description = "Java expression to evaluate (e.g., 'entity.id', 'user.name', 'items.size()') — supports `{ ...; return X; }` block syntax") String expression) {
         try {
             if (expression.trim().isEmpty()) {
                 return "Error: No expression provided";
