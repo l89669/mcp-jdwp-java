@@ -322,14 +322,15 @@ public class JDWPTools {
         final int port = JVM_JDWP_PORT;
 
         try {
-            return jdiService.connect(host, port);
+            return jdiService.connect(host, port) + " Next: set breakpoints, then jdwp_resume_until_event.";
         } catch (Exception e) {
             return String.format("""
                     [ERROR] Connection failed to %s:%d
-                    
+
                     Make sure your JVM is running with JDWP enabled:
                       -agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:%d
-                    
+                    Run jdwp_diagnose to list local JVMs and their JDWP ports.
+
                     Original error: %s""",
                 host, port, port, e.getMessage()
             );
@@ -497,6 +498,7 @@ public class JDWPTools {
                 renderThreadsCompact(result, threads);
             }
 
+            result.append("\n→ jdwp_get_stack(id) for a suspended thread.");
             return result.toString();
         } catch (Exception e) {
             return "Error: " + e.getMessage();
@@ -595,6 +597,7 @@ public class JDWPTools {
 
             appendUserFrames(result, frames, limit, includeNoiseFrames, "");
 
+            result.append("\n→ jdwp_get_locals(threadId, frameIndex) for a frame's variables.");
             return result.toString();
         } catch (Exception e) {
             return "Error: " + e.getMessage();
@@ -683,7 +686,11 @@ public class JDWPTools {
             if (staleVmHint != null) {
                 return staleVmHint;
             }
-            return jdiService.getObjectFields(objectId);
+            final String fields = jdiService.getObjectFields(objectId);
+            if (fields.startsWith("[ERROR]") || fields.startsWith("Error:")) {
+                return fields;
+            }
+            return fields + "\n→ drill Object#N with jdwp_get_fields(N) or jdwp_to_string(N).";
         } catch (Exception e) {
             return "Error: " + e.getMessage();
         }
@@ -991,7 +998,7 @@ public class JDWPTools {
         try {
             final VirtualMachine vm = jdiService.getVM();
             vm.resume();
-            return "All threads resumed";
+            return "All threads resumed. To wait for the next event, use jdwp_resume_until_event.";
         } catch (Exception e) {
             return "Error: " + e.getMessage();
         }
@@ -1823,7 +1830,7 @@ public class JDWPTools {
             }
 
             thread.suspend();
-            return String.format("Thread %d (%s) suspended", threadId, thread.name());
+            return String.format("Thread %d (%s) suspended. Inspect with jdwp_get_stack.", threadId, thread.name());
         } catch (Exception e) {
             return "Error: " + e.getMessage();
         }
@@ -1843,7 +1850,7 @@ public class JDWPTools {
             }
 
             thread.resume();
-            return String.format("Thread %d (%s) resumed", threadId, thread.name());
+            return String.format("Thread %d (%s) resumed. Use jdwp_resume_until_event to wait for the next event.", threadId, thread.name());
         } catch (Exception e) {
             return "Error: " + e.getMessage();
         }
@@ -1901,7 +1908,7 @@ public class JDWPTools {
             final Value newValue = createJdiValue(vm, parsedValue, localVar.type());
             frame.setValue(localVar, newValue);
 
-            return String.format("Variable '%s' set to %s in frame %d of thread %d", varName, value, frameIndex, threadId);
+            return String.format("Variable '%s' set to %s in frame %d of thread %d. Next: jdwp_step_over or jdwp_resume to continue.", varName, value, frameIndex, threadId);
         } catch (ClassNotLoadedException notLoaded) {
             return String.format(
                 "Error setting variable: type '%s' is not yet loaded in the target VM, so JDI cannot validate the assignment. "
@@ -1939,7 +1946,7 @@ public class JDWPTools {
             final Value newValue = createJdiValue(vm, parsedValue, field.type());
             obj.setValue(field, newValue);
 
-            return String.format("Field '%s.%s' set to %s", obj.referenceType().name(), fieldName, value);
+            return String.format("Field '%s.%s' set to %s. Next: jdwp_step_over or jdwp_resume to continue.", obj.referenceType().name(), fieldName, value);
         } catch (Exception e) {
             return "Error setting field: " + e.getMessage();
         }
@@ -2343,7 +2350,7 @@ public class JDWPTools {
             locations.size(), boundDesc, kind);
     }
 
-    @McpTool(description = "Clear a breakpoint by its synthetic ID (from jdwp_overview). Routes by kind: line, exception, and field breakpoints share one ID space.")
+    @McpTool(description = "Clear a breakpoint by its synthetic ID (from jdwp_overview). Routes by kind: line, exception, and field breakpoints share one ID space. After clearing mid-session, continue with jdwp_resume_until_event.")
     public String jdwp_clear_breakpoint(@McpToolParam(description = "Breakpoint ID to clear") int breakpointId) {
         try {
             // Distinguish "unknown" from "wrong kind" up-front. Cascade BEFORE removal so
@@ -2566,6 +2573,7 @@ public class JDWPTools {
                     event.timestamp().toString().substring(11, 23)));
             }
 
+            result.append("\n→ jdwp_get_breakpoint_context for BREAKPOINT entries; logpoint/exception results are inline above.");
             return result.toString();
         } catch (Exception e) {
             return "Error: " + e.getMessage();
@@ -3057,7 +3065,7 @@ public class JDWPTools {
         final int total = activeBp + pendingBp + activeExBp + pendingExBp
             + activeFieldBp + pendingFieldBp + watchers + events;
         if (total == 0) {
-            return header + " Nothing was set.";
+            return header + " Nothing was set. Next: set breakpoints, then jdwp_resume_until_event.";
         }
         return String.format("""
                 %s
@@ -3068,7 +3076,8 @@ public class JDWPTools {
                   Event history cleared:         %d entries
                   Object cache cleared.""",
             header, activeBp, pendingBp, activeExBp, pendingExBp,
-            activeFieldBp, pendingFieldBp, watchers, events);
+            activeFieldBp, pendingFieldBp, watchers, events)
+            + " Next: set breakpoints, then jdwp_resume_until_event.";
     }
 
     // ========================================
@@ -3133,7 +3142,7 @@ public class JDWPTools {
                 return String.format("[ERROR] No mark named '%s'. "
                     + "Use jdwp_overview(types=\"mark\") to list current marks.", label);
             }
-            return String.format("✓ Removed mark $%s", label);
+            return String.format("✓ Removed mark $%s — jdwp_overview(types=\"mark\") for remaining marks.", label);
         } catch (Exception e) {
             return "Error: " + e.getMessage();
         }
@@ -3145,7 +3154,7 @@ public class JDWPTools {
         @McpToolParam(description = "New label (Java identifier, no $ sigil)") String newLabel) {
         try {
             markedInstances.rename(oldLabel, newLabel);
-            return String.format("✓ Renamed $%s -> $%s", oldLabel, newLabel);
+            return String.format("✓ Renamed $%s -> $%s — reference the new label as $%s in expressions, BPs, logpoints, watchers.", oldLabel, newLabel, newLabel);
         } catch (IllegalArgumentException notFound) {
             return "[ERROR] " + notFound.getMessage();
         } catch (IllegalStateException collision) {
@@ -3812,7 +3821,7 @@ public class JDWPTools {
         }
     }
 
-    @McpTool(description = "Get the thread ID of the current breakpoint")
+    @McpTool(description = "Get the thread ID of the current breakpoint. Prefer jdwp_get_breakpoint_context (thread+stack+locals+fields in one call).")
     public String jdwp_get_current_thread() {
         try {
             final BreakpointTracker.LastBreakpoint snapshot = breakpointTracker.getLastBreakpoint();
@@ -3916,6 +3925,7 @@ public class JDWPTools {
                 result.append(String.format("   Expression: %s\n\n", w.getExpression()));
             }
 
+            result.append("\n→ jdwp_evaluate_watchers(threadId, \"current_frame\", bpId) when the BP fires.");
             return result.toString();
 
         } catch (Exception e) {
