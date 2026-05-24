@@ -18,7 +18,9 @@ import java.util.stream.Collectors;
  * <p>
  * Pipeline (per call to {@link #evaluate}):
  * 1. Build evaluation context from the frame (locals + `this`).
- * 2. Auto-rewrite bare `this.field` references via {@link #rewriteThisFieldReferences} when safe.
+ * 2. Auto-rewrite bare field identifiers (`field` → `_this.field`) via
+ * {@link #rewriteThisFieldReferences} when safe; explicit `this`/`this.field` is handled
+ * separately by {@link #rewriteThisKeyword}.
  * 3. Cache lookup keyed on `signature + "###" + expression`; on miss, generate a wrapper class
  * with a UUID-suffixed name, compile via {@link InMemoryJavaCompiler}, and cache the bytecode.
  * 4. Inject the bytecode into the target VM and execute via {@link RemoteCodeExecutor}.
@@ -414,9 +416,14 @@ public class JdiExpressionEvaluator {
      *   <li><b>Non-public types in {@code wrapperPackage}</b> — exposed by their actual binary name
      *       (with nested-class {@code $} → {@code .} so the compiler accepts the source form). The
      *       wrapper lives in the same package, so package-private types and members are reachable.</li>
-     *   <li><b>Non-public types in other packages</b> — walk up the superclass chain until a type
-     *       the wrapper CAN reference is found (public, or sharing {@code wrapperPackage}), falling
-     *       back to {@code java.lang.Object}.</li>
+     *   <li><b>Non-public class types in other packages</b> — walk up the superclass chain until a
+     *       type the wrapper CAN reference is found (public, or sharing {@code wrapperPackage}),
+     *       falling back to {@code java.lang.Object}.</li>
+     *   <li><b>Non-public interface types in other packages</b> — a local declared as a non-public
+     *       interface (e.g. a package-private interface) reaches here via {@link #resolveLocalVarType}.
+     *       Walk the {@code superinterfaces()} graph for a reachable interface, falling back to
+     *       {@code java.lang.Object}. Without this the raw interface name would be emitted and the
+     *       wrapper would fail to compile.</li>
      * </ul>
      *
      * @param wrapperPackage the package the wrapper class lives in; types in this package are
@@ -458,20 +465,51 @@ public class JdiExpressionEvaluator {
                 return "java.lang.Object";
             }
 
+            // A non-public interface (typically a package-private interface used as a local's
+            // declared type) cannot be named from the wrapper. Walk its superinterface graph for
+            // one that can, else fall back to Object — the value is always assignable to it.
+            if (type instanceof InterfaceType interfaceType) {
+                final InterfaceType reachable = findReachableInterface(interfaceType, wrapperPackage, new HashSet<>());
+                return reachable != null ? toSourceTypeName(reachable.name()) : "java.lang.Object";
+            }
+
             return toSourceTypeName(typeName);
         }
     }
 
     /**
-     * Whether {@code type} can be referenced by name from a wrapper class living in
-     * {@code wrapperPackage}. True if the type is public, or if it lives in the same package and
-     * is neither {@code private} nor a local/anonymous class. Private nested classes are
+     * Depth-first search of {@code type}'s superinterface graph for an interface the wrapper class
+     * can reference (public, or non-public but sharing {@code wrapperPackage}). Returns {@code null}
+     * when none is reachable, so the caller falls back to {@code java.lang.Object}. The
+     * {@code visited} set guards against the diamond inheritance interfaces routinely exhibit.
+     */
+    @Nullable
+    private static InterfaceType findReachableInterface(InterfaceType type, String wrapperPackage, Set<String> visited) {
+        if (!visited.add(type.name())) {
+            return null;
+        }
+        if (isReachableFromWrapper(type, wrapperPackage)) {
+            return type;
+        }
+        for (InterfaceType parent : type.superinterfaces()) {
+            final InterfaceType found = findReachableInterface(parent, wrapperPackage, visited);
+            if (found != null) {
+                return found;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Whether {@code type} (a class or interface) can be referenced by name from a wrapper class
+     * living in {@code wrapperPackage}. True if the type is public, or if it lives in the same
+     * package and is neither {@code private} nor a local/anonymous class. Private nested types are
      * accessible only from inside their enclosing class — even another top-level class in the
      * same package can't reach them — so they walk to a public supertype like any other
      * unreachable case. Local/anonymous classes ({@code $<digit>} in the binary name) are
      * unaddressable from source anywhere.
      */
-    private static boolean isReachableFromWrapper(ClassType type, String wrapperPackage) {
+    private static boolean isReachableFromWrapper(ReferenceType type, String wrapperPackage) {
         if (type.isPublic()) {
             return true;
         }
