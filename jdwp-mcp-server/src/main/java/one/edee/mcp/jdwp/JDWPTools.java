@@ -282,6 +282,40 @@ public class JDWPTools {
             .orElse(null);
     }
 
+    /**
+     * Pre-flight check before any JDI {@code invokeMethod} call: a thread that is JDI-suspended on
+     * top of a Java-level monitor block ({@link ThreadReference#THREAD_STATUS_MONITOR}) or inside
+     * {@code Object.wait()} ({@link ThreadReference#THREAD_STATUS_WAIT}) cannot make progress when
+     * single-threaded resumed for an invocation — the lock it needs is held by another suspended
+     * thread, or the {@code notify()} that would wake it can never fire. JDI's {@code invokeMethod}
+     * has no timeout, so an invocation on such a thread hangs the MCP server indefinitely.
+     * <p>
+     * Returns an error message naming the contending state and recommending the safe alternative
+     * ({@code jdwp_get_stack} / {@code jdwp_get_threads}) when the thread is unsafe to invoke on;
+     * returns {@code null} when invocation is safe to proceed.
+     */
+    @Nullable
+    private static String checkSafeToInvoke(ThreadReference thread) {
+        final int status = thread.status();
+        if (status == ThreadReference.THREAD_STATUS_MONITOR) {
+            return String.format(
+                "Error: Thread '%s' (#%d) is BLOCKED waiting on a Java monitor — invokeMethod would "
+                + "hang indefinitely because the lock it needs is held by another suspended thread. "
+                + "Use jdwp_get_stack(%d) to see what it's waiting on, and jdwp_get_threads to find "
+                + "the thread that owns the contended lock. This is the deadlock-diagnosis path.",
+                thread.name(), thread.uniqueID(), thread.uniqueID());
+        }
+        if (status == ThreadReference.THREAD_STATUS_WAIT) {
+            return String.format(
+                "Error: Thread '%s' (#%d) is inside Object.wait() — invokeMethod would hang because "
+                + "the notify() that would wake it cannot fire while all threads are suspended. "
+                + "Use jdwp_get_stack(%d) to inspect, or pick a different thread (any RUNNING-then-"
+                + "suspended thread is safe to invoke on).",
+                thread.name(), thread.uniqueID(), thread.uniqueID());
+        }
+        return null;
+    }
+
     @McpTool(description = "Connect to the JDWP server using configuration from .mcp.json")
     public String jdwp_connect() {
         final String host = "localhost";
@@ -750,6 +784,10 @@ public class JDWPTools {
             if (!thread.isSuspended()) {
                 return "Error: Thread is not suspended.";
             }
+            final String invokeGuard = checkSafeToInvoke(thread);
+            if (invokeGuard != null) {
+                return invokeGuard;
+            }
 
             final Method toStringMethod = obj.referenceType()
                 .methodsByName("toString", "()Ljava/lang/String;")
@@ -820,6 +858,10 @@ public class JDWPTools {
             if (!thread.isSuspended()) {
                 return "Error: Thread is not suspended.";
             }
+            final String invokeGuard = checkSafeToInvoke(thread);
+            if (invokeGuard != null) {
+                return invokeGuard;
+            }
 
             expressionEvaluator.configureCompilerClasspath(thread);
 
@@ -861,6 +903,10 @@ public class JDWPTools {
             }
             if (!thread.isSuspended()) {
                 return "Error: Thread is not suspended.";
+            }
+            final String invokeGuard = checkSafeToInvoke(thread);
+            if (invokeGuard != null) {
+                return invokeGuard;
             }
 
             expressionEvaluator.configureCompilerClasspath(thread);
@@ -2681,12 +2727,13 @@ public class JDWPTools {
         @McpToolParam(required = false, description = "Optional object filter — only fire on the given instance (object ID from jdwp_get_locals/jdwp_get_fields). Must be omitted for static fields.") @Nullable Long objectFilterId,
         @McpToolParam(required = false, description = "Optional ID of a trigger breakpoint — this field BP stays disarmed until the trigger fires. Sticky by default.") @Nullable Integer triggerBreakpointId,
         @McpToolParam(required = false, description = "If true, re-disarm this BP after each hit so the next trigger fire re-arms it. Default: false (sticky).") @Nullable Boolean oneShot,
-        @McpToolParam(required = false, description = "If true, force-load the declaring class via Class.forName when it isn't already loaded. Default: false (passive — defer via ClassPrepareRequest). Force-load triggers `<clinit>` and may mask lazy-init / classloader-leak diagnostics — use sparingly.") @Nullable Boolean forceLoad) {
+        @McpToolParam(required = false, description = "If true, force-load the declaring class via Class.forName when it isn't already loaded. Default: false (passive — defer via ClassPrepareRequest). Force-load triggers `<clinit>` and may mask lazy-init / classloader-leak diagnostics — use sparingly.") @Nullable Boolean forceLoad,
+        @McpToolParam(required = false, description = "If true, suppress writes that happen inside the declaring class's `<init>` / `<clinit>` so the BP only fires on post-construction mutations. Skips the event, the condition, the suspend, and chain triggers. Use when constructor-storm noise drowns the interesting later writes. Default: false.") @Nullable Boolean excludeConstructors) {
         return registerFieldBreakpointInternal(
             className, fieldName, mode,
             /* expression */ null, condition,
             threadFilterId, objectFilterId,
-            triggerBreakpointId, oneShot, forceLoad);
+            triggerBreakpointId, oneShot, forceLoad, excludeConstructors);
     }
 
     @McpTool(description = "Set a non-stopping field watchpoint that records a FIELD_LOGPOINT event for each " +
@@ -2708,7 +2755,8 @@ public class JDWPTools {
         @McpToolParam(required = false, description = "Optional object filter — only fire on the given instance. Must be omitted for static fields.") @Nullable Long objectFilterId,
         @McpToolParam(required = false, description = "Optional ID of a trigger breakpoint — this logpoint stays disarmed until the trigger fires. Sticky by default.") @Nullable Integer triggerBreakpointId,
         @McpToolParam(required = false, description = "If true, re-disarm after each hit so the next trigger fire re-arms it. Default: false (sticky).") @Nullable Boolean oneShot,
-        @McpToolParam(required = false, description = "If true, force-load the declaring class via Class.forName when it isn't already loaded. Default: false (passive — defer via ClassPrepareRequest). Force-load triggers `<clinit>` and may mask lazy-init diagnostics — use sparingly.") @Nullable Boolean forceLoad) {
+        @McpToolParam(required = false, description = "If true, force-load the declaring class via Class.forName when it isn't already loaded. Default: false (passive — defer via ClassPrepareRequest). Force-load triggers `<clinit>` and may mask lazy-init diagnostics — use sparingly.") @Nullable Boolean forceLoad,
+        @McpToolParam(required = false, description = "If true, suppress writes that happen inside the declaring class's `<init>` / `<clinit>` so the logpoint only records post-construction mutations. Default: false.") @Nullable Boolean excludeConstructors) {
         if (expression == null || expression.isBlank()) {
             return "Error: expression is required for jdwp_set_field_logpoint. "
                 + "Use jdwp_set_field_breakpoint for a suspending field BP without expression evaluation.";
@@ -2717,7 +2765,7 @@ public class JDWPTools {
             className, fieldName, mode,
             expression, condition,
             threadFilterId, objectFilterId,
-            triggerBreakpointId, oneShot, forceLoad);
+            triggerBreakpointId, oneShot, forceLoad, excludeConstructors);
     }
 
     /**
@@ -2735,7 +2783,7 @@ public class JDWPTools {
         @Nullable String expression, @Nullable String condition,
         @Nullable Long threadFilterId, @Nullable Long objectFilterId,
         @Nullable Integer triggerBreakpointId, @Nullable Boolean oneShot,
-        @Nullable Boolean forceLoad) {
+        @Nullable Boolean forceLoad, @Nullable Boolean excludeConstructors) {
         try {
             if (className == null || className.isBlank()) {
                 return "Error: className is required";
@@ -2760,6 +2808,7 @@ public class JDWPTools {
                 return String.format("Error: Trigger breakpoint #%d does not exist", triggerBreakpointId);
             }
             final boolean effectiveOneShot = oneShot != null && oneShot;
+            final boolean effectiveExcludeConstructors = excludeConstructors != null && excludeConstructors;
             final String normalisedCondition = (condition == null || condition.isBlank()) ? null : condition;
             // Capture the non-null expression in a local so NullAway can track the narrowing
             // across the ternary that picks suspending vs log-only.
@@ -2768,9 +2817,11 @@ public class JDWPTools {
 
             final BreakpointTracker.FieldBreakpointSpec spec = logpointExpression != null
                 ? BreakpointTracker.FieldBreakpointSpec.logOnly(className, fieldName, watchMode,
-                    logpointExpression, threadFilterId, objectFilterId, normalisedCondition)
+                    logpointExpression, threadFilterId, objectFilterId, normalisedCondition,
+                    effectiveExcludeConstructors)
                 : BreakpointTracker.FieldBreakpointSpec.suspending(className, fieldName, watchMode,
-                    threadFilterId, objectFilterId, normalisedCondition);
+                    threadFilterId, objectFilterId, normalisedCondition,
+                    effectiveExcludeConstructors);
 
             final VirtualMachine vm = jdiService.getVM();
             final EventRequestManager erm = vm.eventRequestManager();
@@ -2784,6 +2835,8 @@ public class JDWPTools {
                     triggerBreakpointId, effectiveOneShot ? " (one-shot)" : " (sticky)") : "";
             final String expressionLine = isLogpoint ? "\n  Expression: " + expression : "";
             final String conditionLine = normalisedCondition != null ? "\n  Condition: " + normalisedCondition : "";
+            final String excludeLine = effectiveExcludeConstructors
+                ? "\n  Skip: <init> / <clinit> writes on " + className : "";
             final String filterLine =
                 (threadFilterId != null || objectFilterId != null)
                     ? "\n  Filters:"
@@ -2819,11 +2872,11 @@ public class JDWPTools {
                         Field breakpoint deferred (ID: %d)
                           Class: %s
                           Field: %s
-                          Mode: %s (%s)%s%s%s%s%s
+                          Mode: %s (%s)%s%s%s%s%s%s
                         Class not yet loaded — will activate automatically when the JVM loads it.""",
                     pendingId, className, fieldName, watchMode.name().toLowerCase(Locale.ROOT),
                     isLogpoint ? "log-only" : "suspend",
-                    expressionLine, conditionLine, filterLine, chainInfo, objectFilterWarning);
+                    expressionLine, conditionLine, filterLine, chainInfo, excludeLine, objectFilterWarning);
             }
 
             // Resolve the field on the eagerly-loaded class. Ambiguous (declared on multiple types
@@ -2896,10 +2949,10 @@ public class JDWPTools {
                     Field breakpoint set (ID: %d)
                       Class: %s
                       Field: %s
-                      Mode: %s (%s)%s%s%s%s""",
+                      Mode: %s (%s)%s%s%s%s%s""",
                 id, className, fieldName, watchMode.name().toLowerCase(Locale.ROOT),
                 isLogpoint ? "log-only" : "suspend",
-                expressionLine, conditionLine, filterLine, chainInfo);
+                expressionLine, conditionLine, filterLine, chainInfo, excludeLine);
         } catch (Exception e) {
             return "Error: " + e.getMessage();
         }
@@ -3868,8 +3921,12 @@ public class JDWPTools {
             if (!thread.isSuspended()) {
                 return String.format("""
                     [ERROR] Thread %d is NOT suspended
-                    
+
                     Thread must be stopped at a breakpoint to evaluate watchers.""", threadId);
+            }
+            final String invokeGuard = checkSafeToInvoke(thread);
+            if (invokeGuard != null) {
+                return invokeGuard;
             }
 
             // Configure classpath here, not inside evaluate(), to avoid nested JDI calls.

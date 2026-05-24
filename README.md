@@ -122,9 +122,11 @@ Starts the JVM with JDWP on port 5005, suspended until a debugger connects.
 
 ## Find the Bug — test flights
 
-The `jdwp-sandbox` module ships 6 deliberately broken Java classes. Each one compiles fine, looks reasonable at first glance, and **fails its test with a confusing message**. Your job: attach with the JDWP MCP server and find the root cause.
+The `jdwp-sandbox` module ships 9 deliberately broken Java classes. Each one compiles fine, looks reasonable at first glance, and **fails its test with a confusing message**. Your job: attach with the JDWP MCP server and find the root cause.
 
 This doubles as a setup verification — if you can solve these, everything works.
+
+Each flight is built so that one tool group is the path of least resistance, and lists a **par** — the minimum tool calls that cleanly reveal the root cause. Hitting par is the elegant solve; the suite as a whole exercises the full tool surface (expression eval, exception breakpoints, field watchpoints, event history, marks, logpoints, runtime mutation, and multi-thread inspection).
 
 ### Just installed the plugin? Grab the sandbox zip
 
@@ -148,28 +150,9 @@ Use JDWP to debug <TestClass> in the jdwp-sandbox module — the test is failing
 
 ---
 
-### #1 The Vanishing Pennies
+### #1 The Phantom Session
 
-**Difficulty:** Warm-up | **Test:** `OrderProcessorTest` | **Package:** `order`
-
-**Symptom:** `expected 71.982 but was 71.0` — the order total loses its decimal part somewhere between calculation and return.
-
-**Hint:** The calculation is correct. Something *after* it changes the total. Who would mutate an order during logging?
-
-<details>
-<summary><strong>Reveal root cause</strong></summary>
-
-`AuditLogger.log(order)` calls `cacheFormattedTotal(order)`, which silently mutates the order: `order.setTotal((double)(int)(order.getTotal()))` — truncating 71.982 to 71.0. The caller assumes `log()` is read-only, but it isn't.
-
-**Debug path:** Set a breakpoint in `OrderProcessor.process()`, step over the `log()` call, and eval `order.getTotal()` before and after. The value changes across what should be a side-effect-free call.
-
-</details>
-
----
-
-### #2 The Phantom Session
-
-**Difficulty:** Moderate | **Test:** `SessionStoreTest` | **Package:** `session`
+**Difficulty:** Moderate | **Test:** `SessionStoreTest` | **Package:** `session` | **Par:** 4 | **Exercises:** expression eval
 
 **Symptom:** `retrieve() returned null` — a session was stored, upgraded, and then... vanished from the map.
 
@@ -186,49 +169,47 @@ Use JDWP to debug <TestClass> in the jdwp-sandbox module — the test is failing
 
 ---
 
-### #3 The Swallowed Exception
+### #2 The Swallowed Exception
 
-**Difficulty:** Moderate | **Test:** `EventBusTest` | **Package:** `events`
+**Difficulty:** Hard | **Test:** `EventBusTest` | **Package:** `events` | **Par:** 4 | **Exercises:** exception breakpoint + trigger gate
 
-**Symptom:** `expected stock < 100 but was 100` and no error summary — the order was supposed to reserve inventory, but nothing happened and nobody complained.
+**Symptom:** `expected stock < 100 but was 100` and an empty error summary — the order was supposed to reserve inventory, but nothing happened and nobody complained.
 
-**Hint:** There are actually *two* bugs. One is hiding the other. Start with the exception — why isn't the error summary showing anything?
+**Hint:** The handler runs on a background thread. Nothing in your code catches its failure — so there's no catch block to break on. Catch the throw itself.
 
 <details>
 <summary><strong>Reveal root cause</strong></summary>
 
-**Bug 1 (hidden):** `OrderEvent` casts the raw quantity through `byte`: a quantity of 200 overflows to -56. `Inventory.reserve()` throws `IllegalStateException("Cannot reserve negative quantity: -56")`.
+`OrderEvent` narrows the raw quantity through `byte` (200 → -56), so `Inventory.reserve()` throws `IllegalStateException`. `EventBus.dispatch()` runs each handler on a single-thread executor as a fire-and-forget task — the `Future` is never inspected, so the exception is captured inside `java.util.concurrent.FutureTask.run` (a JDK frame) and discarded. No sandbox frame ever holds the throwable, so a breakpoint-context dump has nothing to show, and `getErrorSummary()` stays empty.
 
-**Bug 2 (hiding bug 1):** `EventBus.dispatch()` catches the exception and wraps it in `CompletionException` -> `EventHandlerException` -> original cause. But `getErrorSummary()` only reports top-level messages ("Async task failed"), losing the root cause entirely.
-
-**Debug path:** Set an exception breakpoint on `IllegalStateException`. The throw site reveals the -56 quantity. Then inspect the `OrderEvent` construction to see the byte cast.
+**Debug path:** Because the exception *is* caught (by FutureTask), an `uncaught`-only breakpoint never fires. Set a line BP at the test/dispatch entry as a trigger, then `jdwp_set_exception_breakpoint("java.lang.IllegalStateException", caught=true, triggerBreakpointId=<trigger>)` so bootstrap exceptions don't drown the signal. The throw site suspends with `qty = -56` in the frame's locals.
 
 </details>
 
 ---
 
-### #4 The Time Traveler's Config
+### #3 The Time Traveler's Config
 
-**Difficulty:** Hard | **Test:** `ConfigurationProviderTest` | **Package:** `config`
+**Difficulty:** Hard | **Test:** `ConfigurationProviderTest` | **Package:** `config` | **Par:** 4 | **Exercises:** field watchpoint + event history
 
-**Symptom:** `expected timeout=5000 but was 0` — the configuration exists but its timeout field is still at the default value.
+**Symptom:** `expected timeout=5000 but was 0` — the timeout was set during construction, yet it reads back as the default.
 
-**Hint:** The config object is assigned to the shared field *before* it's fully initialized. A reader thread sees the reference but reads a half-constructed object.
+**Hint:** The value *was* set correctly. Something wrote over it afterward. There's no half-built object to inspect — the damage is in the order of writes.
 
 <details>
 <summary><strong>Reveal root cause</strong></summary>
 
-`ConfigurationProvider.getConfig()` assigns `instance = new Configuration(...)` and then signals a latch — but calls `instance.init()` (which sets `timeout=5000`) *after* the latch release. A reader thread waiting on that latch sees `instance != null` and returns the un-initialized object with `timeout=0`.
+`ConfigurationProvider`'s constructor calls `init(5000)`, so the timeout is correct. Then `runMaintenanceSweep()` starts a background `config-reaper` thread that wrongly treats the live instance as stale and calls `resetToDefaults()`, writing the timeout back to 0. By the time the test reads it, the heap shows 0 and no local holds 5000 — a single context dump looks like the value was never set.
 
-**Debug path:** Set breakpoints in both the initializer and reader paths of `getConfig()`. Use `jdwp_get_threads()` to see both threads, then inspect the `Configuration` object from each thread's perspective. The initializer hasn't called `init()` yet when the reader returns.
+**Debug path:** `jdwp_set_field_breakpoint(className="…config.Configuration", fieldName="timeout", mode="modification")`, then `jdwp_get_events` shows the two stores in order — 0→5000 on the main thread, then 5000→0 on `config-reaper`. `jdwp_get_stack` on the second event names the reaper as the clobberer.
 
 </details>
 
 ---
 
-### #5 The Audit That Lies
+### #4 The Audit That Lies
 
-**Difficulty:** Hard | **Test:** `TransferServiceTest` | **Package:** `bank`
+**Difficulty:** Hard | **Test:** `TransferServiceTest` | **Package:** `bank` | **Par:** 4 | **Exercises:** field watchpoint + stack narration
 
 **Symptom:** `expected discrepancy=0 but was non-zero` — money is neither created nor destroyed, yet the audit says the books don't balance.
 
@@ -239,15 +220,15 @@ Use JDWP to debug <TestClass> in the jdwp-sandbox module — the test is failing
 
 `TransferService.transfer()` is not atomic: it calls `source.withdraw()`, then `auditService.snapshotBalances()`, then `destination.deposit()`. The snapshot captures the intermediate state where money has left the source but hasn't arrived at the destination — showing a total of 1500 instead of 2000.
 
-**Debug path:** Set breakpoints on `withdraw()`, `snapshotBalances()`, and `deposit()`. Step through and eval `source.getBalance() + destination.getBalance()` at each stop. The total drops after withdraw and recovers after deposit — the snapshot catches the dip.
+**Debug path:** `jdwp_set_field_breakpoint` on `AuditService.lastTotalSnapshot` (modification). It fires mid-transfer with the stack at `TransferService.transfer` between the debit and the credit; `jdwp_get_stack` plus a live balance read confirm the captured dip.
 
 </details>
 
 ---
 
-### #6 The Field That Lies
+### #5 The Field That Lies
 
-**Difficulty:** Hard | **Test:** `UserProfileTest` | **Package:** `userprofile`
+**Difficulty:** Hard | **Test:** `UserProfileTest` | **Package:** `userprofile` | **Par:** 3 | **Exercises:** event history as evidence
 
 **Symptom:** `expected: <Alice> but was: <alice>` — the welcome message rendered correctly, yet the user's stored display name has silently changed casing.
 
@@ -264,14 +245,94 @@ Use JDWP to debug <TestClass> in the jdwp-sandbox module — the test is failing
 
 ---
 
+### #6 The Doppelgänger Cart
+
+**Difficulty:** Moderate | **Test:** `CheckoutTest` | **Package:** `cart` | **Par:** 6 | **Exercises:** marked instances (`$label`)
+
+**Symptom:** `expected 45.0 but was 0.0` — the cart goes through pricing and discounting, yet its total never changes.
+
+**Hint:** The object you get back from the pipeline is not the object you passed in. Prove it.
+
+<details>
+<summary><strong>Reveal root cause</strong></summary>
+
+`Checkout.process` runs the cart through `validate → price → discount`. `validate` was changed to return a defensive snapshot — `return new Cart(cart)` — so every later stage mutates the *copy*. `process` reassigns its local to the copy as it threads the stages, so no single frame holds both the caller's cart and the copy at once. The test ignores the return value (assuming in-place mutation), so its cart stays at total 0. The copy's fields are identical to the original — only identity differs.
+
+**Debug path:** Break in the test once the cart exists, `jdwp_mark_instance(label="input", objectId=<id>)` to pin it, then set a breakpoint in `price` (or `applyDiscount`) with condition `cart != $input`. It fires — the stage is working on a doppelgänger, not the caller's cart.
+
+</details>
+
+---
+
+### #7 The Heisenbug Race
+
+**Difficulty:** Hard | **Test:** `RaceCounterTest` | **Package:** `race` | **Par:** 3 | **Exercises:** logpoints (non-stopping)
+
+**Symptom:** `expected 2 but was 1` — two threads each increment a counter once, but one increment vanishes.
+
+**Hint:** Two threads, one lost update. Suspending a thread to look changes the timing — watch the reads without stopping anything.
+
+<details>
+<summary><strong>Reveal root cause</strong></summary>
+
+`RaceCounter.increment` reads the count, waits at a `CyclicBarrier` so both threads have read before either writes, then writes back `read + 1`. Both threads read 0 and both write 1 — one increment is lost. A suspending breakpoint serializes the threads and makes you juggle two parked threads to reconstruct what happened.
+
+**Debug path:** Set a non-suspending `jdwp_set_logpoint` at the read site logging the thread name and `count` (or a field logpoint on `count`). Let the test run, then `jdwp_get_events` — both `racer-1` and `racer-2` are recorded reading 0 before either writes, which is the lost update laid out in order.
+
+</details>
+
+---
+
+### #8 The Magic Patch
+
+**Difficulty:** Warm-up | **Test:** `DateParserTest` | **Package:** `parser` | **Par:** 3 | **Exercises:** runtime mutation (`set_local`)
+
+**Symptom:** `NumberFormatException: For input string: "15 "` — a date string that looks right fails to parse.
+
+**Hint:** The input looks *almost* right. Rather than rebuild with a fix, patch the value in place and see if the test goes green.
+
+<details>
+<summary><strong>Reveal root cause</strong></summary>
+
+`DateParser.parse` splits `YYYY-MM-DD` and `Integer.parseInt`s each part. The feed delivers `"2026-05-15 "` with a trailing space, so `parseInt("15 ")` throws. The parser never trims its input.
+
+**Debug path:** Break at the top of `parse`, observe `input = "2026-05-15 "`, then `jdwp_set_local("input", "2026-05-15")` and resume. The parse now succeeds and the test passes — confirming the trailing space is the whole story, with no rebuild.
+
+</details>
+
+---
+
+### #9 The Polite Standoff
+
+**Difficulty:** Hard | **Test:** `TransferDeadlockTest` | **Package:** `deadlock` | **Par:** 4 | **Exercises:** multi-thread inspection (no breakpoints)
+
+**Symptom:** The test hangs and then fails its join — both transfers never complete.
+
+**Hint:** Nothing is executing. No exception is thrown. Find out what each thread is waiting for.
+
+<details>
+<summary><strong>Reveal root cause</strong></summary>
+
+`Account.transfer` locks the source account, pauses, then locks the destination. Two transfers in opposite directions (`A→B` and `B→A`) each grab their first lock and then wait forever for the other's — a classic lock-ordering deadlock.
+
+**Debug path:** No breakpoint can fire — the threads execute nothing. `jdwp_get_threads` shows `transfer-A-to-B` and `transfer-B-to-A` in `MONITOR` state; `jdwp_get_stack` on each shows the inverse lock order. (Trying `jdwp_evaluate_expression` / `jdwp_to_string` on these threads is refused — invoking a method on a monitor-blocked thread would hang the debugger, which is itself the tell.)
+
+</details>
+
+---
+
 ### Scorecard
+
+**Flights solved** — did you find the root cause?
 
 | Solved | Rating                                                               |
 |--------|----------------------------------------------------------------------|
-| 0-1    | The JVM is winning. Check your setup.                                |
-| 2-3    | Solid start. You're getting the hang of breakpoint-driven debugging. |
-| 4-5    | Impressive. You found bugs that would take hours with println.       |
-| 6      | Bug terminator. Nothing survives your debugger.                      |
+| 0-2    | The JVM is winning. Check your setup.                                |
+| 3-5    | Solid start. You're getting the hang of breakpoint-driven debugging. |
+| 6-8    | Impressive. You found bugs that would take hours with println.       |
+| 9      | Bug terminator. Nothing survives your debugger.                      |
+
+**Style** — how close to par? Award ⭐⭐⭐ for a flight solved at its par tool count, ⭐⭐ within 2× par, ⭐ solved at all. A flawless run is 27 stars across the nine flights.
 
 ## Features beyond standard JDWP
 

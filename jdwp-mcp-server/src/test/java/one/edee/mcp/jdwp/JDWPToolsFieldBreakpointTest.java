@@ -65,7 +65,7 @@ class JDWPToolsFieldBreakpointTest {
 		when(erm.createAccessWatchpointRequest(refType.allFields().get(0))).thenReturn(req);
 
 		final String result = tools.jdwp_set_field_breakpoint(
-			"com.Foo", "counter", "access", null, null, null, null, null, null);
+			"com.Foo", "counter", "access", null, null, null, null, null, null, null);
 
 		assertThat(result).startsWith("Field breakpoint set");
 		assertThat(result).contains("com.Foo").contains("counter")
@@ -84,7 +84,7 @@ class JDWPToolsFieldBreakpointTest {
 		when(erm.createModificationWatchpointRequest(field)).thenReturn(modReq);
 
 		final String result = tools.jdwp_set_field_breakpoint(
-			"com.Foo", "counter", "BOTH", null, null, null, null, null, null);
+			"com.Foo", "counter", "BOTH", null, null, null, null, null, null, null);
 
 		assertThat(result).startsWith("Field breakpoint set").contains("Mode: both");
 		verify(erm).createAccessWatchpointRequest(field);
@@ -101,7 +101,7 @@ class JDWPToolsFieldBreakpointTest {
 		when(erm.createClassPrepareRequest()).thenReturn(cpr);
 
 		final String result = tools.jdwp_set_field_breakpoint(
-			"com.NotLoaded", "value", "modification", null, null, null, null, null, null);
+			"com.NotLoaded", "value", "modification", null, null, null, null, null, null, null);
 
 		assertThat(result).startsWith("Field breakpoint deferred")
 			.contains("com.NotLoaded").contains("value")
@@ -122,7 +122,7 @@ class JDWPToolsFieldBreakpointTest {
 		when(jdiService.findLoadedClass("com.Ambig")).thenReturn(refType);
 
 		final String result = tools.jdwp_set_field_breakpoint(
-			"com.Ambig", "counter", "access", null, null, null, null, null, null);
+			"com.Ambig", "counter", "access", null, null, null, null, null, null, null);
 
 		assertThat(result).startsWith("Error:").contains("ambiguous");
 	}
@@ -135,7 +135,7 @@ class JDWPToolsFieldBreakpointTest {
 		when(jdiService.findLoadedClass("com.Foo")).thenReturn(refType);
 
 		final String result = tools.jdwp_set_field_breakpoint(
-			"com.Foo", "missing", "access", null, null, null, null, null, null);
+			"com.Foo", "missing", "access", null, null, null, null, null, null, null);
 
 		assertThat(result).startsWith("Error:").contains("not found");
 	}
@@ -146,7 +146,7 @@ class JDWPToolsFieldBreakpointTest {
 		mockClassWithField("com.Foo", "instances", /* isStatic */ true);
 
 		final String result = tools.jdwp_set_field_breakpoint(
-			"com.Foo", "instances", "modification", null, null, 42L, null, null, null);
+			"com.Foo", "instances", "modification", null, null, 42L, null, null, null, null);
 
 		assertThat(result).startsWith("Error:").contains("static").contains("objectFilterId");
 	}
@@ -155,7 +155,7 @@ class JDWPToolsFieldBreakpointTest {
 	@DisplayName("invalid mode — hard error")
 	void shouldRejectInvalidMode() {
 		final String result = tools.jdwp_set_field_breakpoint(
-			"com.Foo", "counter", "sideways", null, null, null, null, null, null);
+			"com.Foo", "counter", "sideways", null, null, null, null, null, null, null);
 
 		assertThat(result).startsWith("Error:").contains("invalid mode").contains("sideways");
 	}
@@ -164,7 +164,7 @@ class JDWPToolsFieldBreakpointTest {
 	@DisplayName("unknown trigger BP id — hard error before touching the VM")
 	void shouldRejectUnknownTrigger() {
 		final String result = tools.jdwp_set_field_breakpoint(
-			"com.Foo", "counter", "access", null, null, null, 999, null, null);
+			"com.Foo", "counter", "access", null, null, null, 999, null, null, null);
 
 		assertThat(result).startsWith("Error:").contains("Trigger breakpoint #999");
 	}
@@ -178,7 +178,7 @@ class JDWPToolsFieldBreakpointTest {
 		final int triggerId = tracker.registerBreakpoint(mock(BreakpointRequest.class));
 
 		final String result = tools.jdwp_set_field_breakpoint(
-			"com.Foo", "counter", "access", null, null, null, triggerId, true, null);
+			"com.Foo", "counter", "access", null, null, null, triggerId, true, null, null);
 
 		assertThat(result).contains("Chain: trigger=#" + triggerId).contains("one-shot");
 		// Chained BPs stay disarmed until the trigger fires — must NOT have been enabled.
@@ -189,7 +189,7 @@ class JDWPToolsFieldBreakpointTest {
 	@DisplayName("jdwp_set_field_logpoint without expression — hard error")
 	void shouldRejectFieldLogpointWithoutExpression() {
 		final String result = tools.jdwp_set_field_logpoint(
-			"com.Foo", "counter", "access", "", null, null, null, null, null, null);
+			"com.Foo", "counter", "access", "", null, null, null, null, null, null, null);
 
 		assertThat(result).startsWith("Error:").contains("expression is required");
 	}
@@ -203,7 +203,7 @@ class JDWPToolsFieldBreakpointTest {
 
 		final String result = tools.jdwp_set_field_logpoint(
 			"com.Foo", "ttl", "modification", "$oldValue + \" -> \" + $newValue",
-			null, null, null, null, null, null);
+			null, null, null, null, null, null, null);
 
 		assertThat(result).startsWith("Field breakpoint set")
 			.contains("log-only")
@@ -278,7 +278,7 @@ class JDWPToolsFieldBreakpointTest {
 		when(vm.allThreads()).thenReturn(List.of(thread));
 
 		final String result = tools.jdwp_set_field_breakpoint(
-			"com.Foo", "counter", "access", null, 7L, null, null, null, null);
+			"com.Foo", "counter", "access", null, 7L, null, null, null, null, null);
 
 		assertThat(result).startsWith("Field breakpoint set").contains("Filters: thread=7");
 		verify(req).addThreadFilter(thread);
@@ -293,7 +293,7 @@ class JDWPToolsFieldBreakpointTest {
 		when(vm.allThreads()).thenReturn(List.of()); // no live threads → thread #999 cannot be found
 
 		final String result = tools.jdwp_set_field_breakpoint(
-			"com.Foo", "counter", "access", null, 999L, null, null, null, null);
+			"com.Foo", "counter", "access", null, 999L, null, null, null, null, null);
 
 		assertThat(result).startsWith("Error: failed to create field watchpoint")
 			.contains("Thread #999 no longer alive");
@@ -311,7 +311,7 @@ class JDWPToolsFieldBreakpointTest {
 		when(jdiService.getCachedObject(42L)).thenReturn(instance);
 
 		final String result = tools.jdwp_set_field_breakpoint(
-			"com.Foo", "balance", "modification", null, null, 42L, null, null, null);
+			"com.Foo", "balance", "modification", null, null, 42L, null, null, null, null);
 
 		assertThat(result).startsWith("Field breakpoint set").contains("object=42");
 		verify(req).addInstanceFilter(instance);
@@ -326,7 +326,7 @@ class JDWPToolsFieldBreakpointTest {
 		when(jdiService.getCachedObject(999L)).thenReturn(null);
 
 		final String result = tools.jdwp_set_field_breakpoint(
-			"com.Foo", "balance", "modification", null, null, 999L, null, null, null);
+			"com.Foo", "balance", "modification", null, null, 999L, null, null, null, null);
 
 		assertThat(result).startsWith("Error: failed to create field watchpoint")
 			.contains("Object #999 no longer in cache");
@@ -343,7 +343,7 @@ class JDWPToolsFieldBreakpointTest {
 			.thenThrow(new RuntimeException("vm capacity exceeded"));
 
 		final String result = tools.jdwp_set_field_breakpoint(
-			"com.Foo", "counter", "both", null, null, null, null, null, null);
+			"com.Foo", "counter", "both", null, null, null, null, null, null, null);
 
 		assertThat(result).startsWith("Error: failed to create field watchpoint")
 			.contains("vm capacity exceeded");
@@ -371,7 +371,7 @@ class JDWPToolsFieldBreakpointTest {
 			.thenReturn(mock(ModificationWatchpointRequest.class));
 
 		final String result = tools.jdwp_set_field_breakpoint(
-			"com.Foo", "counter", input, null, null, null, null, null, null);
+			"com.Foo", "counter", input, null, null, null, null, null, null, null);
 
 		assertThat(result).startsWith("Field breakpoint set").contains("Mode: " + canonical);
 	}
@@ -453,7 +453,7 @@ class JDWPToolsFieldBreakpointTest {
 		when(erm.createClassPrepareRequest()).thenReturn(cpr);
 
 		final String result = tools.jdwp_set_field_breakpoint(
-			"com.Later", "balance", "modification", null, null, 42L, null, null, null);
+			"com.Later", "balance", "modification", null, null, 42L, null, null, null, null);
 
 		assertThat(result).startsWith("Field breakpoint deferred")
 			.contains("Note: objectFilterId is set")

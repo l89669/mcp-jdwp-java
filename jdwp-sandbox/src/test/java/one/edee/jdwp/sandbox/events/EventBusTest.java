@@ -24,14 +24,15 @@ class EventBusTest {
 
 		eventBus.dispatch(event);
 
-		// Expect stock to be reduced
+		// Fails: stock is still 100. The handler threw on the dispatch thread and the failure
+		// was swallowed by the executor — no exception ever reached this thread.
 		assertThat(inventory.getStock("WIDGET"))
-			.describedAs("Stock should be 100 - 200 = -100... or should it?")
-			.isLessThan(100); // Fails: stock is still 100 (handler threw, silently)
+			.describedAs("Stock should have been reduced by the reservation")
+			.isLessThan(100);
 
-		// Even checking errors doesn't help much
+		// Also fails to help: the bus recorded nothing, because nothing caught the failure.
 		assertThat(eventBus.getErrorSummary())
-			.describedAs("No errors should have occurred")
-			.isEmpty(); // Also fails: there IS an error, but message is useless
+			.describedAs("No error was recorded — yet the reservation clearly did not happen")
+			.isEmpty();
 	}
 }

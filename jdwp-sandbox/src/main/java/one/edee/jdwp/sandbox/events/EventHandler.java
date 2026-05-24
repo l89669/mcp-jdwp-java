@@ -5,5 +5,5 @@ package one.edee.jdwp.sandbox.events;
  */
 public interface EventHandler {
 
-	void handle(OrderEvent event) throws EventHandlerException;
+	void handle(OrderEvent event);
 }

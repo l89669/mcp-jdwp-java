@@ -5,6 +5,76 @@ All notable changes to the `jdwp-debugging` plugin are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.5.0] — 2026-05-24
+
+### New — `excludeConstructors` flag on field watchpoints
+
+A field watched for modification fires on every write, including the storm of
+writes that happen inside the declaring class's constructors before any
+interesting state exists — debugging a balance field meant stepping past three
+`BankAccount` constructor writes before reaching the first real mutation. Both
+`jdwp_set_field_breakpoint` and `jdwp_set_field_logpoint` now take an optional
+`excludeConstructors` flag that filters those out.
+
+- **`excludeConstructors=true`** — writes originating inside the declaring
+  class's `<init>` / `<clinit>` are dropped at the listener: no event recorded,
+  no chain trigger, no suspend. The watchpoint fires only on post-construction
+  mutations. The check is a direct frame test — a method *called by* a
+  constructor still counts as a real hit, so collaborators invoked during
+  construction are not silently swallowed.
+
+### New — invocation refused on `MONITOR` / `WAIT` threads
+
+A thread that is JDI-suspended on top of a Java-monitor block or inside
+`Object.wait()` reports `isSuspended() == true`, so the existing guards let it
+through — but JDI's `invokeMethod` then resumes only that one thread, which
+cannot make progress because the lock it needs is held by another suspended
+thread (or the `notify()` that would wake it can never fire). With no
+JDI-level timeout, the MCP server blocked indefinitely. This was the failure
+mode anyone debugging a deadlock would hit.
+
+- **Pre-flight guard** — `jdwp_evaluate_expression`, `jdwp_assert_expression`,
+  `jdwp_to_string`, and `jdwp_evaluate_watchers` now refuse a thread in
+  `THREAD_STATUS_MONITOR` / `THREAD_STATUS_WAIT` with an explicit error that
+  points at `jdwp_get_stack` + `jdwp_get_threads` instead. The refusal turns a
+  silent hang into a useful diagnostic — when you see it, you've usually found
+  a deadlock or a missing notify.
+
+### Docs
+
+- **Skill prologue tightening** — the `java-debug` skill gained recipes for
+  reconnecting after a target restart (`jdwp_reconnect` preserves breakpoints,
+  watchers, and chain edges across the cycle), catching the failure point of an
+  asserting test (`AssertionError` exception breakpoint), and calling a method
+  on a non-public peer field via a block-mode reflection snippet. Two new
+  gotchas cover the `MONITOR`/`WAIT` guard and the kill-and-reconnect recovery
+  for the residual hang case.
+- **Test-flight assignment prompt** — the sandbox README now ships a
+  copy-pasteable prompt that briefs the agent on the game's house rules and a
+  par-based scoring scheme (⭐⭐⭐ at par tool count, ⭐⭐ within 2×, ⭐ solved).
+
+### Test flights — rebalanced to nine flights covering the full tool surface
+
+The sandbox flight suite leaned heavily on field watchpoints (four of six
+flights), so a strong score didn't prove the agent could wield the rest of the
+toolset. The suite is now nine flights, each built so a *different* tool group
+is the path of least resistance, and each carries a **par** — the minimum tool
+calls that cleanly reveal the root cause — for style scoring.
+
+- **Dropped** "The Vanishing Pennies" (mechanically a subset of "The Audit That
+  Lies"). **Reshaped** two flights so a single breakpoint-context dump can no
+  longer shortcut them: "The Swallowed Exception" now throws on a background
+  executor task with no user-code catch frame (forcing a `caught=true` exception
+  breakpoint + trigger gate), and "The Time Traveler's Config" now overwrites a
+  correctly-set field from a reaper thread (forcing a field watchpoint + event
+  history to read the write order).
+- **Added** four flights for the under-exercised groups: *The Doppelgänger Cart*
+  (marked instances — a copy-constructor swaps the object mid-pipeline),
+  *The Heisenbug Race* (logpoints — a lost update you watch without suspending),
+  *The Magic Patch* (`set_local` — confirm a fix by mutating live state), and
+  *The Polite Standoff* (multi-thread inspection — a lock-ordering deadlock
+  diagnosed with `jdwp_get_threads` + `jdwp_get_stack`, no breakpoints).
+
 ## [2.4.0] — 2026-05-24
 
 ### New — block-mode multi-statement expressions
