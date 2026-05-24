@@ -5,6 +5,61 @@ All notable changes to the `jdwp-debugging` plugin are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.6.0] — 2026-05-24
+
+### New — tool responses now navigate to the next step
+
+Every tool used to confirm what it did and stop; the calling agent had to
+already know which tool to reach for next, and a logpoint gave no hint that its
+output lands in the event log. An audit of the full tool surface drove a pass
+that makes responses self-navigating — each one now points to the sensible next
+tool (or says what to expect), so the set → run → read chain is visible in the
+output instead of being carried only by the skill.
+
+- **Logpoint confirmations point to the event log** — `jdwp_set_logpoint`,
+  `jdwp_set_field_logpoint`, and `jdwp_set_exception_logpoint` now state that
+  hits are recorded as they fire and read on demand with `jdwp_get_events`
+  (logpoints never suspend and never push, so there is no "event fired" to react
+  to).
+- **Next-step pointers across the surface** — `jdwp_resume` points to the
+  blocking `jdwp_resume_until_event`; `connect` / `reset` say to set breakpoints
+  then resume; `set_local` / `set_field` point to step/resume; the inspectors and
+  watcher / mark tools point to their natural follow-ups. Hints are terse footers
+  added only where a next step is genuinely useful — tool descriptions were left
+  untouched to avoid a per-turn token cost.
+- **Failure paths navigate too** — a failed `jdwp_connect` now points to
+  `jdwp_diagnose` to list local JVMs and their JDWP ports.
+
+### Fixed
+
+- **`$newValue` on field-access events** — a `mode="both"` field logpoint or
+  condition that referenced `$newValue` failed to compile on every *access* hit
+  (one `[FIELD_LOGPOINT_ERROR]` per read), because the binding was populated only
+  for modification events. `$newValue` is now bound as a typed-null on access
+  events, so the same expression compiles on both halves and renders `… -> null`
+  on reads. (resolves #14)
+- **Actionable `[NO_EVENT]` from `jdwp_resume_until_event`** — when the wait was
+  released without a real stop (a concurrent `jdwp_reset` / `jdwp_disconnect`
+  freeing the waiter, then nulling the snapshot), the tool returned a dead-end
+  "this should not happen" message. It now returns an actionable `[NO_EVENT]`
+  naming the likely cause and the recovery path. (resolves #15)
+
+### Docs
+
+- **`java-debug` skill guidance** — set a line breakpoint at the assertion as a
+  safety net before a field watchpoint on short-running tests (avoids the
+  `VM_DEATH` race where the write lands but the suspend never does); set the
+  breakpoint at the `join()` / assertion line for concurrency flights, not right
+  after `Thread.start()`; don't pipe the launch command through `tail` / `head`
+  in a background shell. (resolves #16)
+
+### CI
+
+- **Test gate on push and PR** — a new GitHub Actions workflow runs the full
+  `./mvnw test` suite (including the NullAway / Error Prone gate) on every push to
+  `main` and every pull request, so regressions are caught on the server rather
+  than only at release time. (resolves #18)
+
 ## [2.5.0] — 2026-05-24
 
 ### New — `excludeConstructors` flag on field watchpoints
