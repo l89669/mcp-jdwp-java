@@ -8,11 +8,11 @@
 ```
 
 - Claude Code **clones the source repo** under `~/.claude/plugins/`
-- First session runs **Maven on your machine** → builds the JAR locally
+- First session runs the **bundled `./mvnw`** on your machine
 - No prebuilt binaries, no opaque download
 - Sources are public — read, diff, or **ask Claude Code itself to audit them**
 
-<small class="muted">Prerequisites: JDK 17+ on PATH (must be a JDK, not JRE — JDI lives in <code>jdk.jdi</code>) and Maven 3.8+.</small>
+<small class="muted">Prerequisite: a <strong>JDK</strong> 17+ on PATH (not a JRE — JDI lives in <code>jdk.jdi</code>).<br/>No Maven install needed — the repo ships the <code>./mvnw</code> wrapper, which fetches a pinned Maven.</small>
 
 Note:
 - Plugin model = "git clone + run" — marketplaces are Git repos

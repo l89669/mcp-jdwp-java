@@ -1,4 +1,4 @@
-<!-- .slide: data-background-image="images/bg-content.png" data-background-size="cover" -->
+<!-- .slide: class="scenarios-slide" data-background-image="images/bg-content.png" data-background-size="cover" -->
 
 ## Designed for two scenarios
 
@@ -23,9 +23,9 @@
 <pre><code class="nohighlight">-agentlib:jdwp=…,suspend=n,address=*:5005</code></pre>
 
 - Attach **while it's running**
+- No restart, no extra logging, no print-and-redeploy loop
 - **Logpoints** + field watchpoints trace without stopping traffic
 - **Conditional breakpoints** fire only on the bad request
-- No restart, no extra logging, no print-and-redeploy loop
 
 </div>
 </div>

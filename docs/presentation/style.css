@@ -32,6 +32,19 @@
 	border-bottom-color: rgba(255, 255, 255, 0.4);
 	text-align: left;
 }
+/* vs-IntelliJ slide (05-vs-idea): col 1 never wraps; cols 2 & 3 share equal width */
+.reveal section.vs-table table { width: 100%; }
+.reveal section.vs-table th:first-child,
+.reveal section.vs-table td:first-child {
+	white-space: nowrap;
+	width: 1%;
+}
+.reveal section.vs-table th:nth-child(2),
+.reveal section.vs-table td:nth-child(2),
+.reveal section.vs-table th:nth-child(3),
+.reveal section.vs-table td:nth-child(3) {
+	width: 50%;
+}
 
 /* ---- code blocks ---- */
 .reveal pre {
@@ -89,6 +102,10 @@
 	padding: 0.4em 0.6em;
 	white-space: pre-wrap;
 	word-break: break-all;
+}
+/* scenarios slide (03-why): green code examples a touch larger than the bullets */
+.reveal section.scenarios-slide .cols pre code {
+	font-size: 1.2em;
 }
 
 /* ---- title slide flourish ---- */

@@ -1,114 +1,55 @@
 <!-- .slide: data-background-image="images/bg-content.png" data-background-size="cover" -->
 
-## What this gives an agent
+## What an agent needs
 
-Stock JDWP is enough for a human in IntelliJ. Agents need different leverage.
+A human in IntelliJ has eyes, a mouse, and patience. An agent has none of those — so the debugger is reshaped around how it actually works.
 
-- **Stop guessing** — observe runtime state at the failure
-- **Trace without stopping** — logpoints, not `println`
-- **Catch rogue writers** — field watchpoints see what line BPs miss
-- **Narrow to one bad path** — chains + conditions cut noise
-- **Test hypotheses live** — eval Java, mutate locals, no restart
-- **Save tokens** — `resume_until_event`, one-shot context, smart filtering
-- **Teach the workflow** — skill recipes turn tools into a script
+- **Tools shaped to the task** — not raw JDWP; one call returns the whole picture
+- **Context & hints in the response** — named args, "do this next" pointers
+- **Token-economical I/O** — right-sized payloads, no resume→poll loops
+- **No blind hangs** — soft-waits return health + options; wait indefinitely, never frozen
+- **Guard rails** — recursion guards, deferred BPs, stuck-state detection
+- **A skill that teaches** — worked recipes turn a tool pile into a workflow
 
 <small class="muted">↓ press Down for the deep dives</small>
 
 Note:
-- Hub slide for the back half — each bullet is one vertical
-- Framing: every capability is paired with "why an agent needs it differently from a human"
+- Hub slide for the back half — each bullet expands into one vertical deep-dive
+- Framing throughout: every capability answers "why an agent needs this differently from a human"
 
 --
 
 <!-- .slide: data-background-image="images/bg-content.png" data-background-size="cover" -->
 
-### Stop guessing — observe the failure
+### Bootstrap, redesigned for agents
 
-- Maven launches with `suspend=y`; agent attaches before any code runs
-- Stops on the failing assertion; reads locals, fields, walks the graph
-- `jdwp_get_breakpoint_context` = thread + frames + locals + `this`-fields in **1 call** (vs 4)
-- IntelliJ doesn't need that — a human eye does the merging
+- **One attach verb** — `wait_for_attach` polls every 200 ms and connects in the background; optional `port`, default 5005
+- **No port guessing** — `jdwp://diagnose` / `jdwp://jvms` report which local JVMs are up and on which JDWP port (no `jps` / `lsof`)
+- **Deferred breakpoints** — arm BPs on not-yet-loaded classes; they bind via class-prepare when the JVM loads them on its own
+- **`reconnect` keeps the session** — re-attach to the last target; BP specs, conditions, logpoints, chains, watchers + their IDs survive (BP #7 stays #7)
 
-**Anchor: test flights #1–#5.** Five deliberately broken classes; each fails with a confusing message. Agent finds root cause via stepping, eval, conditional BP, exception BP, per-thread inspection.
+Deferred BPs are the unlock under `mvn test`: the agent is too slow to race the classloader, so it arms everything *before* code runs.
 
 Note:
-- Token-economy lever: 1 call instead of 4, multiplied across a session
-- IntelliJ's UI merges this visually — humans don't pay round-trip cost
+- wait_for_attach lands at VM_START suspended and tells the agent "set BPs, then resume_until_event" — eval needs a real BP first
+- forceLoad=true binds a BP immediately but runs `<clinit>` (early static init, masked lazy-load) — off by default
+- Soft-wait: at the 30s ceiling, wait_for_attach / resume_until_event return `still_waiting` + JDI health + {wait_more, reconnect, abort} — unlimited waiting, never a blind freeze
+- reconnect LOSES marks, object cache, last-thread, classpath cache (can't survive vm.dispose); target VM resumes after
 
 --
 
 <!-- .slide: data-background-image="images/bg-content.png" data-background-size="cover" -->
 
-### Trace without stopping
-
-- **Logpoints** — line / exception / field — evaluate, log, never suspend
-- All three share the in-target Java compiler (any classpath method, lambdas, streams)
-- Field logpoints are unique here — `$oldValue` / `$newValue` synthetic bindings
-
-```java
-jdwp_set_logpoint(className="OrderService", lineNumber=42,
-  expression="order.getId() + \" total=\" + order.getTotal()",
-  condition="order.getTotal() > 1000")
-```
-
-Stopping a thread to peek at concurrency state hides the bug. Observe without perturbing timing.
-
-Note:
-- Race-condition debugging — stopping perturbs timing, logpoints don't
-- Field logpoints unique to us; IntelliJ has line logpoints only
-
---
-
-<!-- .slide: data-background-image="images/bg-content.png" data-background-size="cover" -->
-
-### Catch the rogue writer — field watchpoints
-
-- Watch a field for **access · modification · both**
-- Fires on every JVM-level store — incl. reflection (`Field.set`) and `Unsafe`
-- Synthetic bindings: `$oldValue`, `$newValue`, `$object`, `$fieldName`, `$mode`
-- A line BP on the setter misses every reflective write — ORMs, DI, JSON mappers do this all the time
-
-**Anchor: test flight #6.** `displayName` is mutated via `Field.setAccessible(true) + Field.set(...)`. Line BP never fires; one field watchpoint catches it on the first hit.
-
-<small class="warn">Perf: hot fields can dominate target-VM CPU — filter narrowly or use short sessions.</small>
-
-Note:
-- Marquee capability — the one with the clearest test-flight payoff
-- Bypass mirrors real ORM / JSON-mapper patterns
-
---
-
-<!-- .slide: data-background-image="images/bg-content.png" data-background-size="cover" -->
-
-### Narrow to one bad path — chains + conditions
-
-- BP-B disabled until BP-A fires (**sticky** stays armed · **one-shot** self-disarms)
-- Mix line · exception · field BPs freely as triggers or dependents
-- Cycles rejected at registration
-- `jdwp_diagnose` recognises the "armed but waiting on a non-fired trigger" stuck state
-
-A BP in a hot loop floods the agent. Chain so it only arms once another BP has fired in the same request.
-
-Note:
-- IntelliJ has dependent BPs but no log-only chains
-- Diagnose-time stuck detection saves agents from staring at a dead session
-
---
-
-<!-- .slide: data-background-image="images/bg-content.png" data-background-size="cover" -->
-
-### Test a hypothesis — eval + mutate
+### Expressions — compiled, not interpreted
 
 <div class="cols">
 <div>
 
-- Arbitrary Java at any suspended BP
-- In-target compile (Eclipse JDT) → `defineClass` → invoke
-- Classpath discovered from the target VM (Tomcat-aware)
-- `set_local` / `set_field` test "what if?" without a rebuild
-- **Recursive eval guard** — eval that re-enters the BPed method won't deadlock
-
-`assert_expression` returns OK / "MISMATCH" — saves a round trip.
+- **Real Java → real bytecode** — Eclipse JDT (ECJ) compiles your expression in the **MCP server's** memory, then `defineClass` + invokes it in the target over JDI
+- **Self-configuring** — discovers the target's classpath (Tomcat-aware) and a local JDK matching its Java version to compile against
+- **Two modes** — a bare expression (`order.getTotal()`) or a `{ … return X; }` block with try/catch, locals, early return
+- **Full scope** — reaches non-public `this` and package-private members
+- **Recursion guard** — an eval that re-enters the breakpointed method won't deadlock
 
 </div>
 <div>
@@ -119,27 +60,70 @@ Note:
 </div>
 
 Note:
-- Mutation is the IJ feature most underused by humans; agents love it
-- Recursive guard is the cleverest piece in the codebase — sells engineering depth
+- Only the final defineClass + invoke executes inside the target JVM; compilation and orchestration are MCP-server-side
+- JdkDiscoveryService finds a local JDK matching the target's major version (used as `--system` so JDT resolves `java.*`)
+- Block mode works in every eval slot: conditions, logpoints, watchers, assertions
 
 --
 
 <!-- .slide: data-background-image="images/bg-content.png" data-background-size="cover" -->
 
-### Save tokens — agent ergonomics
+### Stop guessing — observe the failure
 
-- **`resume_until_event`** — server-side block until next event; kills the resume→poll loop
-- **`get_breakpoint_context`** — thread + frames + locals + `this`-fields, one call
-- **Smart filtering** — junit / surefire / reflection noise hidden by default
-- **Marks** — name an object as `$label`, pin past GC, address across hits
-- **Watchers** — persistent labelled expressions auto-evaluated on every hit
-- **Unified `overview` / `clear`** — one mental model for "show / wipe"
-- **Deferred BPs** — auto-promote when the class loads; "class not prepared" never reaches the agent
+- **`assert_expression`** — checks a hypothesis in-VM, returns `OK` / `MISMATCH` (actual vs expected) in one round trip
+- **Watchers** — labelled expressions that auto-evaluate on every hit of a BP; stop re-typing the same probes
+- **Conditional BPs** — full Java conditions (incl. `{ block }`) so it stops only on the bad request
+- **Chained BPs** — arm BP-B only after BP-A fires; tame hot-loop floods (sticky stays armed · one-shot self-disarms)
+- **Marks** — pin an object as `$label` past GC, then write conditions against it across hits
 
-None of this exists in IntelliJ. A human staring at a debugger doesn't need it.
+The agent stops reasoning from stack traces and reads the actual runtime state.
 
 Note:
-- Individually small, cumulatively the difference between a usable session and a burned context window
+- assert_expression comparison is string-based against the same formatting evaluate_expression uses
+- Chains: cycles rejected at registration; diagnose flags the "armed but waiting on a non-fired trigger" stuck state
+- IntelliJ has dependent BPs but no log-only chains; marks-as-conditions has no IJ equivalent
+
+--
+
+<!-- .slide: data-background-image="images/bg-content.png" data-background-size="cover" -->
+
+### Logpoints & watchpoints
+
+Observe without a single `println` or redeploy.
+
+- **Logpoints** — line / exception / field — evaluate an expression, log it, **never suspend** the thread
+- **Field watchpoints** — fire on every JVM-level store, incl. reflection (`Field.set`) and `Unsafe`; a line BP on the setter misses every reflective write (ORMs, DI, JSON mappers)
+- Synthetic bindings: `$oldValue`, `$newValue`, `$object`, `$fieldName`, `$mode`
+- All share the in-target compiler — any classpath method, lambdas, streams
+
+**Anchor: test flight #6.** `displayName` is mutated via `Field.setAccessible(true) + Field.set(...)`; a line BP never fires, one field watchpoint catches it on the first write.
+
+<small class="warn">Perf: hot fields can dominate target-VM CPU — filter narrowly or keep sessions short.</small>
+
+Note:
+- Logpoints replace println; race-condition debugging — stopping perturbs timing, logpoints don't
+- Field logpoints are unique here (`$oldValue` / `$newValue`); IntelliJ has line logpoints only
+- Field watchpoints CAN suspend or just log — the rogue-writer story is the clearest test-flight payoff
+
+--
+
+<!-- .slide: data-background-image="images/bg-content.png" data-background-size="cover" -->
+
+### Token economy
+
+- **`resume_until_event`** — server-side block until the next event; kills the resume→poll→poll loop
+- **`get_breakpoint_context`** — thread + frames + locals + `this`-fields in **one** call (vs four)
+- **`overview` / `clear`** — one read verb, one delete verb for all BP / watcher / mark state
+- **Smart filtering** — junit / surefire / reflection frames collapsed by default
+- **Deferred BPs + warning flags** — a BP that can't fire is flagged, not silently dead
+- **`reconnect`** — recover a wedged session without re-arming everything
+
+Individually small; together, the difference between a usable session and a burned context window.
+
+Note:
+- Smart filtering: a 200-thread Tomcat renders in ~25 lines vs ~1000 verbose; stacks collapse junit/maven/reflection unless includeNoise=true
+- clear requires an explicit `types` arg so an empty call can't wipe everything by accident
+- None of this exists in IntelliJ — a human staring at a debugger UI doesn't pay the round-trip cost
 
 --
 
