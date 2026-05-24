@@ -1,0 +1,37 @@
+# Maven
+target/
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+
+# IntelliJ IDEA
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# Eclipse
+.project
+.classpath
+.factorypath
+.settings/
+.apt_generated/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code per-user settings (but keep shared content like skills)
+.claude/*
+!.claude/skills/
+
+# Runtime logs
+mcp-jdwp-inspector.log
+*.log
+
+# Sandbox release artifacts (produced by release/sandbox/assemble.sh)
+release/sandbox/dist/
+
+# Core dumps (e.g. from a crashing CLI proxy dropping `core` into the tree)
+core
+core.*

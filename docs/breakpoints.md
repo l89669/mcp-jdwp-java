@@ -1,0 +1,290 @@
+# Breakpoint system
+
+`BreakpointTracker` is the registry. It owns every active breakpoint, every deferred (pending) breakpoint, every chain-dependency edge, and every piece of metadata (conditions, logpoint expressions) that does not fit in a JDI `EventRequest`. The class is 2,025 lines because there are six different breakpoint kinds and the matrix of `{active, pending} × {line, exception, field}` is most of them. This chapter is the map.
+
+> **Background — what a breakpoint is, from the JVM's point of view**
+>
+> JDI's `BreakpointRequest` is not a special data structure inside the JVM; it is a JDWP command (`EventRequest/Set`) that registers a *location filter* with the JVM's debug agent. A location in JDWP is a `(class ID, method ID, code index)` triple — class, method, and an offset into that method's bytecode. The agent rewrites the bytecode (or uses the JVMTI breakpoint API, depending on the implementation) so that when the program counter reaches that location, the JVM emits a JDWP composite event packet containing a `BreakpointEvent`.
+>
+> The same shape applies to other kinds. An `ExceptionRequest` registers a *type filter* (an exception class and the `caught` / `uncaught` switches) — the JVM emits an event whenever a matching `Throwable` is thrown. A `ClassPrepareRequest` registers a *class-name filter* and fires whenever the JVM finishes preparing a matching class. An `AccessWatchpointRequest` / `ModificationWatchpointRequest` registers a *field* and fires on every read or write of that field's storage slot, regardless of how the read or write was issued (bytecode, reflection, `Unsafe`).
+>
+> Crucially, all of these are *requests* — the debugger creates them, configures them, calls `setEnabled(true)`, and remembers the returned `EventRequest` handle. The handle is what gets disabled or deleted later. This codebase wraps the JDI handle plus metadata (condition expressions, logpoint expressions, chain links) in its own info classes, but the underlying JDWP-registered request is always the JDI `EventRequest`.
+
+## 1. Breakpoint kinds
+
+| Kind | Active model | Pending model | Backing JDI request |
+|---|---|---|---|
+| Line BP | raw `BreakpointRequest` | `PendingBreakpoint` (`BreakpointTracker.java:1701-1743`) | `BreakpointRequest` |
+| Exception BP / exception logpoint | `ExceptionBreakpointInfo` wrapping `ExceptionRequest` + `ExceptionBreakpointSpec` (lines 1769-1892) | `PendingExceptionBreakpoint` (lines 1812-1857) | `ExceptionRequest` |
+| Field BP / field logpoint | `FieldBreakpointInfo` wrapping 0/1 `AccessWatchpointRequest` + 0/1 `ModificationWatchpointRequest` + `FieldBreakpointSpec` (lines 1903-1986) | `PendingFieldBreakpoint` (lines 1992-2024) | `AccessWatchpointRequest`, `ModificationWatchpointRequest`, or both |
+
+Line and exception "logpoint" variants are not separate models — they piggyback on the same active class with `BreakpointMetadata.logpointExpression` set (`BreakpointTracker.java:1748-1759`; setter at `setLogpointExpression`, lines 517-521). Field logpoints set `FieldBreakpointSpec.logOnly = true` (lines 1911-1946). Conditions live in the same `BreakpointMetadata`, set via `setCondition` (lines 495-499).
+
+### MCP entry points
+
+| Tool | Method | Lines |
+|---|---|---|
+| `jdwp_set_breakpoint` | `JDWPTools.jdwp_set_breakpoint` | 1811-1935 |
+| `jdwp_set_logpoint` | `JDWPTools.jdwp_set_logpoint` | 1938-2019 |
+| `jdwp_set_exception_breakpoint` | `JDWPTools.jdwp_set_exception_breakpoint` → `registerExceptionBreakpointInternal` | 2272-2282 / 2319-2409 |
+| `jdwp_set_exception_logpoint` | `JDWPTools.jdwp_set_exception_logpoint` → same internal | 2291-2307 / 2319-2409 |
+| `jdwp_set_field_breakpoint` | `JDWPTools.jdwp_set_field_breakpoint` → `registerFieldBreakpointInternal` | 2416-2430 |
+| `jdwp_set_field_logpoint` | `JDWPTools.jdwp_set_field_logpoint` → `registerFieldBreakpointInternal` | 2437-2456 |
+| `jdwp_clear_breakpoint` | routes by kind across all six | 2038-2059 |
+
+The funnel pattern is deliberate: every breakpoint kind has one tool method per direction (set / log), and both directions delegate to a single internal registration method. New variants (e.g. a "method-entry" breakpoint) should follow the same shape.
+
+## 2. Synthetic integer IDs
+
+`BreakpointTracker.java:45`:
+
+```java
+private final AtomicInteger idCounter = new AtomicInteger(1);
+```
+
+Every register-* path calls `idCounter.getAndIncrement()` (lines 195, 372, 553, 629, 696, 739). **Line, exception, and field breakpoints share one monotonic ID space** — there is exactly one `idCounter` per tracker instance.
+
+Stability properties:
+
+- **Never recycled within a session.** Removals leave gaps; `idCounter` is only reset to 1 by `clearAllInMemoryStateLocked` (line 357), which runs in `clearAll` / `reset`.
+- **Stable across the lifetime of a breakpoint.** An ID assigned at registration is the same ID the agent uses to clear it, attach a watcher to it, depend on it in a chain, or read it from `lastBreakpoint`.
+- **Per-ID stickiness defended on removal.** `triggersFiredAtLeastOnce.remove(id)` and `breakpointMetadata.remove(id)` are called whenever an ID goes away (lines 230, 240, 602, 609, 811, 819). If the int counter ever did wrap (it would take 2 billion registrations), reused IDs cannot inherit ghost state.
+
+### `jdwp_clear_breakpoint` — routing by kind
+
+The clear tool tries each registry in priority order (`JDWPTools.java:2038-2059`):
+
+1. Line BP — `getBreakpoint` / `getPendingBreakpoint`.
+2. Exception BP — `getAllExceptionBreakpoints` / `getAllPendingExceptionBreakpoints`.
+3. Field BP — analogous accessors.
+
+Only one match is possible because IDs are globally unique. Cascade-breaking of dependents (see § 6) runs **before** removal so `CHAIN_BROKEN` history entries appear in the right order.
+
+## 3. Active versus pending — deferred breakpoints
+
+> **Background — the JVM class lifecycle and why `ClassPrepareRequest` fires when it does**
+>
+> The JLS (§ 12.2–12.4) defines four phases a class goes through: **loading** (bytecode read), **linking** (which itself decomposes into *verification*, *preparation*, and *resolution*), and **initialization** (running `<clinit>`, the static initializer). The JVM is allowed to do these phases lazily — preparation can happen any time between loading and the first use; initialization happens just before the first instance, first static-field write, etc.
+>
+> JDI's `ClassPrepareRequest` fires at the boundary between linking and initialization — once the class is fully linked (verified and prepared) but before `<clinit>` runs. That is the earliest moment the JVM has settled the class enough to install breakpoints on it: methods have bytecode offsets, fields have storage slots, the constant pool is resolved. From the debugger's perspective, the class "becomes addressable" here.
+>
+> The timing matters for one specific case: field watchpoints. The very next thing the JVM does after delivering the `ClassPrepareEvent` is run `<clinit>`. Any static-field write inside `<clinit>` happens *immediately* after preparation. If the watchpoint is installed asynchronously, the static-init writes are lost. The synchronous-promotion path documented in § 3 below is what catches them.
+
+A breakpoint is *pending* when the agent set it on a class that hasn't loaded yet. The tracker keeps two separate registries (active and pending) for each kind so the two states don't get confused, and so `jdwp_overview` can render them differently.
+
+### Pending registration
+
+The line-BP path is canonical; the others follow the same shape. `JDWPTools.java:1856-1898`:
+
+1. Tool tries to resolve the class via `findOrForceLoadClass`.
+2. If the class is not loaded and cannot be force-loaded, the tool calls `registerPendingBreakpoint` and attaches condition / logpoint / chain metadata.
+3. The tool creates a `ClassPrepareRequest` filtered by the class name with policy `SUSPEND_EVENT_THREAD`. Only one CPR per class (`hasClassPrepareRequest` check at line 1866; registry on `BreakpointTracker.java:66, 445-462`).
+4. Race guard: re-check `classesByName` after CPR registration, in case the class loaded between the original lookup and the CPR enable.
+
+### Promotion path 1 — `ClassPrepareEvent`
+
+The primary driver. `JdiEventListener.handleClassPrepareEvent` (`JdiEventListener.java:979-1072`):
+
+- Line BPs — lines 1001-1030.
+- Exception BPs — lines 1032-1049.
+- Field BPs — lines 1056-1058, delegating to `BreakpointTracker.promotePendingFieldsForClass` (`BreakpointTracker.java:966-989`).
+
+**Field-BP promotion is synchronous inside the CPR handler.** This is load-bearing: the loading thread auto-resumes right after the handler returns and runs `<clinit>`. A static-initializer write would be lost if the watchpoint were installed asynchronously. The synchronous path uses `setSuspendPolicy(SUSPEND_EVENT_THREAD)` on the CPR so the loading thread is parked until promotion completes.
+
+After promoting, the CPR is deleted if no pending entries still reference the class (lines 1060-1067) — to keep the CPR registry from growing forever.
+
+### Promotion path 2 — `tryPromotePending` safety net
+
+Called from `JDIConnectionService.getVM()` on every MCP tool call (`BreakpointTracker.java:843-955`). Catches bootstrap classes that loaded before any debugger event was delivered — for example, classes preloaded by the JVM during VM-start, where the CPR was set after they were already prepared.
+
+Idempotent: a class already promoted via path 1 is a no-op here.
+
+### Promotion failures
+
+When a pending entry cannot be promoted (e.g. the line number doesn't exist in the loaded class, the field is missing or the wrong kind, the exception class is not a `Throwable`), `recordPromotionFailure` (`JdiEventListener.java:957-968`):
+
+- Records a `BP_PROMOTION_FAILED` event with the reason.
+- Sets `PendingBreakpoint.failureReason` so the failed entry stays visible in `jdwp_overview` with the explanation.
+
+Pending entries are not auto-removed on failure — the agent gets to see why the deferred BP didn't take. Removal is explicit via `jdwp_clear_breakpoint`.
+
+### Deferred state does not survive reconnect
+
+`JDIConnectionService.cleanupSessionState` (called from both `connect` and `disconnect`) runs `breakpointTracker.reset()`, which clears every map including pending ones. Each session starts fresh — by design, because the target VM may have changed and the pending classnames may resolve to different code.
+
+## 4. Conditions
+
+`BreakpointMetadata.condition` is a Java expression string. When the BP fires, the listener evaluates it via `evaluateConditionWithBindings` (`JdiEventListener.java:919-949`). Three outcomes:
+
+- **`true`** — proceed with the suspending path (logpoint or normal BP).
+- **`false`** — auto-resume. No history entry, no chain effect (the BP didn't meaningfully hit). Documented inline at `JdiEventListener.java:428`.
+- **Exception during evaluation** — return `true` (suspend). Fail-safe.
+
+The fail-safe rule deserves emphasis: a broken condition does **not** silently swallow breakpoint hits. The agent gets the stop, with the error in the event details, and can call `jdwp_evaluate_expression` to see why. The alternative — silent resume on a broken expression — is one of the most-feared failure modes in interactive debugging, so we explicitly avoid it.
+
+Conditions accept either primitive `BooleanValue` or boxed `java.lang.Boolean` (lines 927-941). Convenient when the expression calls a Java API that boxes.
+
+## 5. Logpoints — the auto-resume mechanic
+
+A logpoint is a breakpoint that records an evaluated expression to the event history and does not suspend the thread. The JDI request is still created with `SUSPEND_EVENT_THREAD` because expression evaluation needs `invokeMethod`, which needs a suspended thread at an invocation event. The listener evaluates, records `LOGPOINT`, and returns `false`. The loop's `eventSet.resume()` undoes the JDI-level suspension. From the agent's view, the thread never paused.
+
+The flow inside `handleBreakpointEvent`:
+
+```
+1. Reentrancy guard (suppress if recursive).
+2. setLastBreakpointThread — but only because some handler paths
+   still snapshot for chain effects.
+3. logpointExpr = metadata.getLogpointExpression()
+   condition  = metadata.getCondition()
+4. If logpointExpr != null:
+     if condition != null && !evaluateCondition() → return false (no log)
+     evaluateLogpoint() → records LOGPOINT entry
+     applyChainEffectsAfterHit()
+     return false
+5. (otherwise the plain BP path)
+```
+
+Same pattern in:
+
+- Exception logpoint — `handleExceptionEvent` lines 566-582, evaluator at `evaluateExceptionLogpoint` (lines 617-658).
+- Field logpoint — `handleWatchpointEvent` lines 737-742, evaluator at `evaluateFieldLogpoint` (lines 799-837).
+
+All three respect the same fail-safe rule: if the log expression fails to evaluate, record a `*_ERROR` entry (e.g. `LOGPOINT_ERROR`) with the failure reason and continue. The thread still auto-resumes.
+
+## 6. Breakpoint chains
+
+The chain mechanism lets one breakpoint stay disabled until another fires. The data model:
+
+- `TriggerLink(int triggerId, boolean oneShot)` — record at `BreakpointTracker.java:1692-1693`.
+- `dependencyByDependent: Map<Integer, TriggerLink>` (line 160) — dependent → its trigger.
+- `dependentsByTrigger: Map<Integer, Set<Integer>>` (line 167) — reverse index for fast cascade.
+- `triggersFiredAtLeastOnce: Set<Integer>` (line 176) — memory of "this trigger has fired at least once in this session".
+
+### Sticky versus one-shot
+
+- **`oneShot = false`** (default, "sticky") — once the trigger fires, the dependent stays armed for the rest of the session. Use when you want to filter "only count hits after the gate", but observe every hit thereafter.
+- **`oneShot = true`** — the dependent self-disarms after firing. Matches IntelliJ's "Remove once hit" behaviour. After it fires, the trigger has to fire again before the dependent re-arms.
+
+To manually re-disarm a sticky chain that already fired, the agent uses `jdwp_disarm_until_trigger` (`JDWPTools.java:2206-2223`), which just calls `setBreakpointEnabledById(false)`.
+
+### Cycle detection
+
+`registerDependency` (`BreakpointTracker.java:1163-1176`) walks the existing graph from `triggerId` toward chain roots up to `dependencyByDependent.size() + 1` steps via `findCyclePath` (lines 1188-1207). A cycle is rejected with `ChainRegistrationException.cycle(path)` (lines 1655-1666) — the exception carries the cycle path so the error message can name the offending IDs.
+
+The same call validates that the trigger ID is still live (closes a TOCTOU window with the boundary check in `JDWPTools.java:2148`).
+
+### Trigger memory across pending → active
+
+The interesting case: a dependent was registered as **pending** (its class wasn't loaded). The trigger fires while the dependent is still pending. The trigger fact is remembered in `triggersFiredAtLeastOnce` (added by `markTriggerFired` at line 1420-1422, called from `applyChainEffectsAfterHit` at `JdiEventListener.java:120`). When the dependent finally promotes, `disarmIfChained` (`BreakpointTracker.java:1394-1407`) checks the set and **leaves the dependent armed** instead of disabling it. The deferred dependent is not penalised for arriving late.
+
+The opposite case is also handled: a brand-new dependent registered via `jdwp_set_breakpoint_dependency` after the trigger has fired does **not** auto-arm (documented at `BreakpointTracker.java:1415-1418`). Explicit user intent overrides the historical fire — if the agent links a chain after the fact, the agent gets the chain it asked for, not whatever the history would imply.
+
+### Chain effects after a hit
+
+`applyChainEffectsAfterHit` (`JdiEventListener.java:116-161`) is what runs after a real, suspending hit (not a logpoint, not a condition-false skip):
+
+- Emit `CHAIN_DISARMED` for any one-shot dependent that just self-disarmed (lines 131-135).
+- Emit `CHAIN_ARMED` for any dependent that just got armed for the first time (lines 152-155).
+- Mark `triggersFiredAtLeastOnce`.
+
+### Cascade on removal
+
+When a trigger BP is removed, every dependent loses its guard. `cascadeChainBreak` (`JDWPTools.java:2105-2133`) runs **before** the removal so `CHAIN_BROKEN` events appear in the timeline before the removal confirmation. Detached dependents are re-armed via `setBreakpointEnabledById(true)` — they collapse back to plain BPs. The summary distinguishes:
+
+- "Armed unconditionally" — an active dependent, now firing on every hit.
+- "Still pending; will come up armed when its class loads" — a pending dependent.
+
+## 7. Field breakpoints — single ID, two halves
+
+> **Background — what a watchpoint catches**
+>
+> A field watchpoint is installed via JDI's `AccessWatchpointRequest` (for reads) and `ModificationWatchpointRequest` (for writes). At the JVM level, these hook into the field's storage slot — the JVM emits an event on every `GETFIELD` / `GETSTATIC` bytecode for the read variant, and on every `PUTFIELD` / `PUTSTATIC` for the write variant. The hook is at the level of the actual memory access, *not* at the Java-source level.
+>
+> Consequence: a watchpoint catches every write to the field, no matter how the write is issued. The public setter, an internal package-private mutator, `Field.set(obj, value)` via reflection, even `Unsafe.putObject(obj, offset, value)` — all of them ultimately execute the same `PUTFIELD` (or `PUTSTATIC`) operation that triggers the event. The test-flight #6 in the README ("The Field That Lies") exploits exactly this: a reflective write through `Field.setAccessible` + `Field.set` is invisible to source-level greps but fully visible to a watchpoint.
+>
+> Two things watchpoints do *not* catch: writes through `sun.misc.Unsafe.compareAndSwap*` operations on JDK internals that route through intrinsics (these may bypass the field-event machinery on some JVMs), and writes to a *different* field that happens to alias via `VarHandle` direct-memory access (which on some JVMs uses paths that escape watchpoint instrumentation). For normal application code these escape hatches don't apply.
+>
+> The JVM-level support also explains the performance warning: a watchpoint on a hot field installs a JVM-side hook that fires on *every* access. For an inner-loop variable read a million times a second, that is a million events per second on the JDWP socket — easily enough to dominate target-VM CPU. Hence the perf hint `jdwp_diagnose` surfaces.
+
+A field BP in `BOTH` mode binds **one** synthetic ID to **two** underlying requests: an `AccessWatchpointRequest` and a `ModificationWatchpointRequest`. The model is `FieldBreakpointInfo` (lines 1903-1986). Mode enum at line 1903: `ACCESS | MODIFICATION | BOTH`.
+
+Invariants:
+
+- `registerFieldBreakpoint` validates at least one of the request slots is non-null (lines 692-694).
+- `indexFieldRequest` is called for each non-null slot (lines 699-704), so the lookup `firingRequest → ID` works for either half.
+- Removal tears down both halves (`removeFieldBreakpoint` at lines 801-822).
+- Chain enable/disable also flips both halves (`setBreakpointEnabledById` at lines 1341-1359). The two requests are treated as one logical breakpoint everywhere except inside the watchpoint event handler, where we still need to know whether this event was an access or a modification.
+
+### Promotion rollback
+
+`promoteSinglePendingField` (`BreakpointTracker.java:1002-1079`) creates the two requests sequentially. If the second creation fails (rare, but possible — JDI can refuse if VM capabilities change), the first one is rolled back. `createdRequests` (line 1036) tracks what was created; the rollback runs at lines 1061-1078 to delete any half-armed request. A half-armed pair would suspend on access but not on modification (or vice versa) — confusing and easy to misdiagnose. The rollback guarantees atomicity.
+
+### Filter wiring
+
+`configureFieldRequest` (lines 1087-1110) applies optional filters:
+
+- `addThreadFilter(threadRef)` — restrict to one thread.
+- `addInstanceFilter(objectRef)` — restrict to one specific object instance.
+
+The thread filter is useful for narrowing down "who writes to this static field, but only from the worker pool". The instance filter is the way to watch `order.status` without firing on every other `Order`'s `status`.
+
+## 8. Synthetic bindings on field events
+
+When a watchpoint fires, the expression scope gets five extra bindings injected via `buildFieldEventBindings` (`JdiEventListener.java:776-791`):
+
+| Binding | Value | Notes |
+|---|---|---|
+| `$oldValue` | `event.valueCurrent()` | Always present |
+| `$newValue` | `((ModificationWatchpointEvent) event).valueToBe()` | Modification events only |
+| `$object` | `event.object()` | `null` for static fields |
+| `$fieldName` | `vm.mirrorOf(fieldName)` | String mirror |
+| `$mode` | `vm.mirrorOf("access" \| "modification")` | String mirror |
+
+(The `$` sigil is the same one used by marks. Reserved-binding validation refuses to let a mark collide with these names.)
+
+The bindings flow through `mergeMarkedBindings` (`JdiEventListener.java:891-899`) — which combines them with `MarkedInstanceRegistry.buildBindings()` (per-event names win on collision) — and into the evaluator. The user's condition or logpoint expression sees them as ordinary method parameters in the generated wrapper class.
+
+Conditional presence is **absence in the map** rather than a null sentinel: `$object` is simply not in the bindings for a static-field event. Referencing it in an expression for a static-field event yields a JDT compile error, not a misleading NPE at evaluation time.
+
+The synthetic bindings on **exception** breakpoints follow the same pattern:
+
+- `$exception` — the thrown `Throwable`, always non-null.
+
+## 9. Untracked events
+
+Three edge cases produce events with no matching registry entry:
+
+- **Untracked line BP** (`JdiEventListener.java:396-400`) — `event.request()` is a `BreakpointRequest` but `findIdByRequest` returns null. Log a warning, return `true` (suspend). The agent gets to inspect. No tracker mutation, no history entry.
+- **Untracked field watchpoint** (`JdiEventListener.java:707-711`) — same shape, same outcome.
+- **Untracked StepEvent** — the listener still deletes the one-shot `StepRequest` defensively (lines 462-464) and runs the normal STEP path. There is no "untracked" classification because step requests are not registered in the tracker — they are inherently one-shot per call.
+- **Untracked ExceptionEvent** — `event.request()` is not in the tracker. Both `info` and `firingId` come back null. The handler falls through to the default suspending branch (records `EXCEPTION`, fires latch, returns `true` at lines 587-603) without applying chain effects (`firingId == null` skips them, line 597).
+
+The pattern: **defensive suspend, no chain effects.** An untracked event suggests a registration race or a JDI peculiarity; suspending lets the agent investigate, and skipping chain effects prevents an unmodelled hit from disarming a dependent.
+
+## 10. Suspension policies — JDI level
+
+Each BP-creating tool method picks a JDI-level suspension policy:
+
+- `SUSPEND_ALL` — every thread in the target pauses on hit. Useful when the agent wants to inspect global state consistently.
+- `SUSPEND_EVENT_THREAD` (default) — only the firing thread pauses. Other threads keep running. This is what IntelliJ's "Suspend: Thread" does.
+- `SUSPEND_NONE` — JDI does not pause anything. Used implicitly nowhere in the tracker because the listener needs `invokeMethod` to be legal, which requires the thread to be suspended.
+
+Line BPs accept all three via the `suspendPolicy` parameter (`JDWPTools.java:1829-1844`, applied at 1885 and 1912). Exception and field BPs are always `SUSPEND_EVENT_THREAD` because every code path that fires them may evaluate a logpoint or condition expression — and that needs a suspended thread.
+
+The JDI-level policy is independent of the listener's "should suspend" decision. The JDI policy determines which threads JDI parks when the event fires; the listener decides whether to call `eventSet.resume()` once it has handled them. Even with `SUSPEND_ALL`, a logpoint hit resumes the set on its way out — so the temporary pause is invisible to the agent.
+
+## 11. Adding a new breakpoint kind
+
+If you find yourself adding a new variant, the shape to follow:
+
+1. **Models** — add an active info class and a pending info class to `BreakpointTracker`. Make them records or near-records; immutability after creation simplifies reasoning.
+2. **Registries** — two `ConcurrentHashMap`s on `BreakpointTracker`, one active and one pending. Indexed by synthetic ID and (where applicable) by `EventRequest` for the listener's hot-path lookup.
+3. **Register entry points** — one public method per `BreakpointTracker`; let it bump `idCounter` and call into the shared metadata machinery.
+4. **Promotion** — if the kind has a deferred form, wire it into `handleClassPrepareEvent` and add a `promotePendingXxxForClass` method on the tracker. Decide whether promotion must be synchronous (any kind that observes static initializer effects must) or can run via `tryPromotePending`.
+5. **Listener handler** — new `dispatchByType` branch in the listener loop. Follow the standard shape: reentrancy check → identify firing ID → snapshot/history/latch (suspending) or evaluate/history (logpoint).
+6. **MCP tool methods** — one per direction (set/log) on `JDWPTools`, both delegating to a single `registerXxxInternal`.
+7. **Chain participation** — opt in by calling `applyChainEffectsAfterHit` from your handler and by accepting `triggerBreakpointId` / `oneShot` parameters in the registration path. Existing chain machinery handles the rest.
+8. **`jdwp_overview` rendering** — add the new kind to the rendering switch so the agent can see it.
+9. **`jdwp_clear_breakpoint` routing** — add the new registry to the lookup chain.
+
+The whole machine is shaped so that new kinds slot in via parallel structure, not by adding special cases to existing kinds.

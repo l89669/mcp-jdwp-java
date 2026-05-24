@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>4.0.5</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>one.edee.mcp.jdwp</groupId>
+    <artifactId>mcp-jdwp-parent</artifactId>
+    <version>1.0.0</version>
+    <packaging>pom</packaging>
+
+    <name>MCP JDWP Inspector (parent)</name>
+    <description>Parent POM for the MCP JDWP Inspector reactor: mcp-server + jdwp-sandbox.</description>
+
+    <modules>
+        <module>jdwp-mcp-server</module>
+        <module>jdwp-sandbox</module>
+    </modules>
+
+    <properties>
+        <java.version>17</java.version>
+        <spring-ai-mcp.version>2.0.0-M4</spring-ai-mcp.version>
+        <ecj.version>3.45.0</ecj.version>
+        <!-- NullAway 0.13.1 still references com.google.errorprone.predicates.type.DescendantOf,
+             which was removed in Error Prone 2.49.0 — stay on 2.48.0 until NullAway catches up. -->
+        <error-prone.version>2.48.0</error-prone.version>
+        <nullaway.version>0.13.1</nullaway.version>
+        <!-- Error Prone ≥ 2.32 ships Java 21 bytecode, so javac itself must run on a JDK ≥ 21.
+             The reactor still releases Java 17 bytecode — see maven-compiler-plugin <release>. -->
+        <build.jdk.version>[21,)</build.jdk.version>
+        <!-- Default empty so surefire's argLine can be extended via -DargLine="..." on the command line -->
+        <argLine/>
+    </properties>
+
+    <build>
+        <plugins>
+            <!-- Force the compile step onto a JDK ≥ 21 toolchain (declared in ~/.m2/toolchains.xml)
+                 because Error Prone 2.48 is compiled against Java 21. Bytecode target stays at
+                 Java 17 via maven-compiler-plugin's <release>. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-toolchains-plugin</artifactId>
+                <version>3.2.0</version>
+                <configuration>
+                    <toolchains>
+                        <jdk>
+                            <version>${build.jdk.version}</version>
+                        </jdk>
+                    </toolchains>
+                </configuration>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>toolchain</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>
