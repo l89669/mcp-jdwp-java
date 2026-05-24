@@ -21,8 +21,12 @@ import java.util.Collections;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
@@ -286,6 +290,58 @@ class JDWPToolsToStringTest {
 	 * recognised via the message-substring fallback inside {@code isVmGone}. Pins the
 	 * "Connection reset" branch of the message scan.
 	 */
+	/**
+	 * Pre-flight check against a hostile thread state: a thread that is JDI-suspended *on top of*
+	 * a Java-monitor block is technically suspended (`isSuspended() == true`) but invoking on it
+	 * with `INVOKE_SINGLE_THREADED` would hang forever — the contended lock is held by another
+	 * suspended thread and can never be released. The guard refuses cleanly without firing
+	 * `invokeMethod`.
+	 */
+	@Test
+	@DisplayName("refuses invocation when thread is BLOCKED on a Java monitor (would hang)")
+	void shouldRefuseWhenThreadIsBlockedOnMonitor() throws Exception {
+		final ObjectReference obj = mock(ObjectReference.class);
+		final ThreadReference thread = mock(ThreadReference.class);
+		when(thread.uniqueID()).thenReturn(7L);
+		when(thread.name()).thenReturn("T1");
+		when(thread.isSuspended()).thenReturn(true);
+		when(thread.status()).thenReturn(ThreadReference.THREAD_STATUS_MONITOR);
+		when(jdiService.getCachedObject(42L)).thenReturn(obj);
+		when(jdiService.getVM()).thenReturn(vm);
+		when(vm.allThreads()).thenReturn(List.of(thread));
+
+		final String out = tools.jdwp_to_string(42L, 7L);
+
+		assertThat(out).startsWith("Error: Thread 'T1' (#7) is BLOCKED waiting on a Java monitor");
+		assertThat(out).contains("jdwp_get_stack(7)");
+		assertThat(out).contains("jdwp_get_threads");
+		verify(obj, never()).invokeMethod(any(), any(), any(), anyInt());
+	}
+
+	/**
+	 * Same guard, WAIT variant: a thread inside `Object.wait()` is suspended but cannot be safely
+	 * invoked on — the `notify()` that would wake it cannot fire while all threads are suspended.
+	 */
+	@Test
+	@DisplayName("refuses invocation when thread is inside Object.wait() (would hang)")
+	void shouldRefuseWhenThreadIsInsideObjectWait() throws Exception {
+		final ObjectReference obj = mock(ObjectReference.class);
+		final ThreadReference thread = mock(ThreadReference.class);
+		when(thread.uniqueID()).thenReturn(8L);
+		when(thread.name()).thenReturn("T-waiter");
+		when(thread.isSuspended()).thenReturn(true);
+		when(thread.status()).thenReturn(ThreadReference.THREAD_STATUS_WAIT);
+		when(jdiService.getCachedObject(42L)).thenReturn(obj);
+		when(jdiService.getVM()).thenReturn(vm);
+		when(vm.allThreads()).thenReturn(List.of(thread));
+
+		final String out = tools.jdwp_to_string(42L, 8L);
+
+		assertThat(out).startsWith("Error: Thread 'T-waiter' (#8) is inside Object.wait()");
+		assertThat(out).contains("jdwp_get_stack(8)");
+		verify(obj, never()).invokeMethod(any(), any(), any(), anyInt());
+	}
+
 	@Test
 	@DisplayName("F-RA1: surfaces message-only transport failure as the canonical [VM_DEATH] hint")
 	void shouldSurfaceMessageOnlyTransportFailureAsCanonicalHint() throws Exception {

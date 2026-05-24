@@ -282,6 +282,40 @@ public class JDWPTools {
             .orElse(null);
     }
 
+    /**
+     * Pre-flight check before any JDI {@code invokeMethod} call: a thread that is JDI-suspended on
+     * top of a Java-level monitor block ({@link ThreadReference#THREAD_STATUS_MONITOR}) or inside
+     * {@code Object.wait()} ({@link ThreadReference#THREAD_STATUS_WAIT}) cannot make progress when
+     * single-threaded resumed for an invocation — the lock it needs is held by another suspended
+     * thread, or the {@code notify()} that would wake it can never fire. JDI's {@code invokeMethod}
+     * has no timeout, so an invocation on such a thread hangs the MCP server indefinitely.
+     * <p>
+     * Returns an error message naming the contending state and recommending the safe alternative
+     * ({@code jdwp_get_stack} / {@code jdwp_get_threads}) when the thread is unsafe to invoke on;
+     * returns {@code null} when invocation is safe to proceed.
+     */
+    @Nullable
+    private static String checkSafeToInvoke(ThreadReference thread) {
+        final int status = thread.status();
+        if (status == ThreadReference.THREAD_STATUS_MONITOR) {
+            return String.format(
+                "Error: Thread '%s' (#%d) is BLOCKED waiting on a Java monitor — invokeMethod would "
+                + "hang indefinitely because the lock it needs is held by another suspended thread. "
+                + "Use jdwp_get_stack(%d) to see what it's waiting on, and jdwp_get_threads to find "
+                + "the thread that owns the contended lock. This is the deadlock-diagnosis path.",
+                thread.name(), thread.uniqueID(), thread.uniqueID());
+        }
+        if (status == ThreadReference.THREAD_STATUS_WAIT) {
+            return String.format(
+                "Error: Thread '%s' (#%d) is inside Object.wait() — invokeMethod would hang because "
+                + "the notify() that would wake it cannot fire while all threads are suspended. "
+                + "Use jdwp_get_stack(%d) to inspect, or pick a different thread (any RUNNING-then-"
+                + "suspended thread is safe to invoke on).",
+                thread.name(), thread.uniqueID(), thread.uniqueID());
+        }
+        return null;
+    }
+
     @McpTool(description = "Connect to the JDWP server using configuration from .mcp.json")
     public String jdwp_connect() {
         final String host = "localhost";
@@ -750,6 +784,10 @@ public class JDWPTools {
             if (!thread.isSuspended()) {
                 return "Error: Thread is not suspended.";
             }
+            final String invokeGuard = checkSafeToInvoke(thread);
+            if (invokeGuard != null) {
+                return invokeGuard;
+            }
 
             final Method toStringMethod = obj.referenceType()
                 .methodsByName("toString", "()Ljava/lang/String;")
@@ -820,6 +858,10 @@ public class JDWPTools {
             if (!thread.isSuspended()) {
                 return "Error: Thread is not suspended.";
             }
+            final String invokeGuard = checkSafeToInvoke(thread);
+            if (invokeGuard != null) {
+                return invokeGuard;
+            }
 
             expressionEvaluator.configureCompilerClasspath(thread);
 
@@ -861,6 +903,10 @@ public class JDWPTools {
             }
             if (!thread.isSuspended()) {
                 return "Error: Thread is not suspended.";
+            }
+            final String invokeGuard = checkSafeToInvoke(thread);
+            if (invokeGuard != null) {
+                return invokeGuard;
             }
 
             expressionEvaluator.configureCompilerClasspath(thread);
@@ -3875,8 +3921,12 @@ public class JDWPTools {
             if (!thread.isSuspended()) {
                 return String.format("""
                     [ERROR] Thread %d is NOT suspended
-                    
+
                     Thread must be stopped at a breakpoint to evaluate watchers.""", threadId);
+            }
+            final String invokeGuard = checkSafeToInvoke(thread);
+            if (invokeGuard != null) {
+                return invokeGuard;
             }
 
             // Configure classpath here, not inside evaluate(), to avoid nested JDI calls.

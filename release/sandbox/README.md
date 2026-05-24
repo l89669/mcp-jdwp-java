@@ -35,15 +35,43 @@ mvn test -Dtest=OrderProcessorTest -DskipTests=false -Dmaven.surefire.debug
 
 The test process **hangs** at "Listening for transport dt_socket at address: 5005" — that's correct. It's waiting for a debugger.
 
-**Terminal 2** — open Claude Code in this folder and type:
-
-```
-Use JDWP to play test flight #1 (OrderProcessorTest). Port 5005.
-```
+**Terminal 2** — open Claude Code in this folder and paste the assignment prompt below.
 
 Claude will attach, set breakpoints, evaluate expressions, and walk you through what the JVM actually does. When it's solved, kill the test (or let it finish) and move on to the next flight.
 
 Between flights, ask Claude to run `jdwp_reset()` — it clears breakpoints and cached state without dropping the connection.
+
+## The assignment prompt
+
+Paste this into Claude Code to start a flight. Replace `#N (TestClass)` with the flight you want.
+
+```
+You are about to play JDWP test flight #1 (OrderProcessorTest) on port 5005.
+
+The rules:
+1. The /java-debug skill is your playbook. Use it.
+2. Sandbox source under src/main/java/.../ is OFF LIMITS until you can finish this
+   sentence at a breakpoint: "My evidence is X, my hypothesis is Y, the source I'd
+   like to read to confirm is Z." The failing test class itself is fair game — it's
+   the problem statement.
+3. Don't fix the bug. Diagnose it. The broken state is load-bearing for future flights.
+4. Don't read this project's main README or the spoiler blocks anywhere — that's cheating.
+5. Score yourself: count the JDWP tool calls you made to crack this flight. Each flight
+   has a "par" — the minimum tool count that cleanly reveals the root cause. Hitting par
+   = ⭐⭐⭐. Within 2× par = ⭐⭐. Solved at all = ⭐. Report the count when you finish.
+
+Now attach via jdwp_wait_for_attach(port=5005), set the breakpoints the flight calls
+for, and tell me:
+  - What the bug actually is (root cause in one sentence)
+  - Which JVM observation revealed it (the tool call + the value that contradicted
+    the source-level assumption)
+  - What you would change to fix it (but don't make the change)
+  - Your tool-call count for this flight
+
+Good hunting.
+```
+
+If you'd rather Claude pick the flight: replace the first line with `You are about to play one JDWP test flight — pick one from README.md and tell me which.`
 
 ## House rules
 
