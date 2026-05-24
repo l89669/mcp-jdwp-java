@@ -2172,6 +2172,17 @@ public class JDWPTools {
         }
     }
 
+    /**
+     * Appended to every logpoint confirmation (line / field / exception) so the agent knows where
+     * output lands and how to retrieve it. Logpoints never suspend and never push anything back into
+     * the agent's turn — so unlike a breakpoint there is no "Event fired" response to react to. The
+     * only way to see logpoint results is to pull the event log on demand. This single sentence makes
+     * the otherwise-implicit set → run → read chain explicit at the point the agent arms the logpoint.
+     */
+    private static final String LOGPOINT_READBACK_HINT =
+        " Each hit is appended to the event log the moment it fires (execution is never paused and "
+        + "nothing is pushed to you) — read the accumulated hits any time with jdwp_get_events.";
+
     @McpTool(description = "Set a logpoint (non-stopping breakpoint) that evaluates an expression and logs the result without pausing execution. Supports an optional condition — the expression is only logged when the condition evaluates to true. Both expression and condition support `{ block }` syntax for multi-statement. By default the logpoint is registered passively: if the class is not yet loaded, it is deferred via a ClassPrepareRequest and activates on natural load. Pass forceLoad=true to force the class load (runs `<clinit>`, may mask lazy-init diagnostics).")
     public String jdwp_set_logpoint(
         @McpToolParam(description = "Fully qualified class name") String className,
@@ -2235,19 +2246,22 @@ public class JDWPTools {
                             }
                             return String.format("Logpoint set at %s:%d (ID: %d, expression: %s%s) " +
                                     "(bound by a concurrent activation path)",
-                                className, lineNumber, pendingId, expression, conditionInfo);
+                                className, lineNumber, pendingId, expression, conditionInfo)
+                                + LOGPOINT_READBACK_HINT;
                         }
                         // Won the promotion — emit the multi-location diagnostic for THIS bind. Same
                         // rationale as jdwp_set_breakpoint.
                         return String.format("Logpoint set at %s:%d (ID: %d, expression: %s%s%s)",
                             className, lineNumber, pendingId, expression, conditionInfo,
-                            multiLocationDiagnostic(pendingId, className, lineNumber, locations, boundLocation, "LP"));
+                            multiLocationDiagnostic(pendingId, className, lineNumber, locations, boundLocation, "LP"))
+                            + LOGPOINT_READBACK_HINT;
                     }
                 }
 
                 return String.format("Logpoint deferred for %s:%d (ID: %d, expression: %s%s). " +
                         "Class not yet loaded — will activate when the JVM loads it.",
-                    className, lineNumber, pendingId, expression, conditionInfo);
+                    className, lineNumber, pendingId, expression, conditionInfo)
+                    + LOGPOINT_READBACK_HINT;
             }
 
             final ReferenceType refType = classes.get(0);
@@ -2270,7 +2284,8 @@ public class JDWPTools {
             // Diagnostic — see jdwp_set_breakpoint for the rationale.
             return String.format("Logpoint set at %s:%d (ID: %d, expression: %s%s%s)",
                 className, lineNumber, breakpointId, expression, conditionInfo,
-                multiLocationDiagnostic(breakpointId, className, lineNumber, locations, boundLocation, "LP"));
+                multiLocationDiagnostic(breakpointId, className, lineNumber, locations, boundLocation, "LP"))
+                + LOGPOINT_READBACK_HINT;
         } catch (AbsentInformationException e) {
             cleanupOrphanPendingBreakpoint(pendingIdForCleanup);
             return "Error: No line number information available. Compile with debug info (-g).";
@@ -2687,7 +2702,8 @@ public class JDWPTools {
                     isLogpoint ? "log-only" : "suspend",
                     expressionLine,
                     conditionLine,
-                    chainInfo);
+                    chainInfo)
+                    + (isLogpoint ? LOGPOINT_READBACK_HINT : "");
             }
 
             // Create the exception request DISABLED, finish wiring it up (including the chain
@@ -2715,7 +2731,8 @@ public class JDWPTools {
                 isLogpoint ? "log-only" : "suspend",
                 expressionLine,
                 conditionLine,
-                chainInfo);
+                chainInfo)
+                + (isLogpoint ? LOGPOINT_READBACK_HINT : "");
         } catch (Exception e) {
             return "Error: " + e.getMessage();
         }
@@ -2887,7 +2904,8 @@ public class JDWPTools {
                         Class not yet loaded — will activate automatically when the JVM loads it.""",
                     pendingId, className, fieldName, watchMode.name().toLowerCase(Locale.ROOT),
                     isLogpoint ? "log-only" : "suspend",
-                    expressionLine, conditionLine, filterLine, chainInfo, excludeLine, objectFilterWarning);
+                    expressionLine, conditionLine, filterLine, chainInfo, excludeLine, objectFilterWarning)
+                    + (isLogpoint ? LOGPOINT_READBACK_HINT : "");
             }
 
             // Resolve the field on the eagerly-loaded class. Ambiguous (declared on multiple types
@@ -2963,7 +2981,8 @@ public class JDWPTools {
                       Mode: %s (%s)%s%s%s%s%s""",
                 id, className, fieldName, watchMode.name().toLowerCase(Locale.ROOT),
                 isLogpoint ? "log-only" : "suspend",
-                expressionLine, conditionLine, filterLine, chainInfo, excludeLine);
+                expressionLine, conditionLine, filterLine, chainInfo, excludeLine)
+                + (isLogpoint ? LOGPOINT_READBACK_HINT : "");
         } catch (Exception e) {
             return "Error: " + e.getMessage();
         }
