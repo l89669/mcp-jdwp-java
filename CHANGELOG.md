@@ -5,6 +5,61 @@ All notable changes to the `jdwp-debugging` plugin are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.3.0] — 2026-05-24
+
+### New — deferred breakpoint/logpoint install diagnostics
+
+When a breakpoint or logpoint targets a class that has not loaded yet, or a
+line that compiles to more than one bytecode location, the install used to
+succeed silently and leave you guessing why nothing fired. Two
+no-behaviour-change diagnostics now make those cases visible. Resolves #9.
+
+- **`CLASS_PREPARE` recorded in event history** — `jdwp_get_events` previously
+  showed only `[VM_START, VM_DEATH]` for a session parked on a deferred
+  breakpoint, so an agent could not tell "the class never loaded" from "the
+  class loaded but the breakpoint never fired." The class-prepare event is now
+  captured, making the distinction observable.
+- **Multi-location warning** — when `locationsOfLine` returns more than one
+  `Location` (typical for lambdas: one in the enclosing method, one in the
+  synthetic `lambda$…$N`), the server emits a `BP_MULTI_LOCATION` event, a
+  WARN log, and a `WARNING` suffix on the `jdwp_set_breakpoint` /
+  `jdwp_set_logpoint` response. The bind logic is unchanged — it still binds
+  the first location — so this is diagnostics only; a proper multi-location
+  bind is tracked separately.
+
+### Fixed — expression evaluation reaches a non-public `this` and its package-private members
+
+Expression evaluation always emitted its wrapper class into a fixed
+`mcp.jdi.evaluation` package, so a non-public `this` type and its
+package-private fields were unreachable — the `this.field` auto-rewrite
+short-circuited on the common case (e.g. a package-private
+`BitmapSlicer.translator`). Resolves #7.
+
+- **Wrapper emitted into `this`'s own package** when `this` is non-public and
+  the package is addressable (not `java.*` / `javax.*` / `sun.*` / `jdk.*`,
+  not a local/anonymous class). Same-package reachability then lets the
+  wrapper dereference package-private types and members directly; the
+  field-rewrite filter widens to public/protected/package-private (private
+  still needs reflection).
+- **Define-time fallback to the default package** — if a sealed package,
+  module strong-encapsulation, or a restrictive classloader rejects
+  `defineClass` for the application package, evaluation retries once in
+  `mcp.jdi.evaluation`. The user expression never ran (the failure is in the
+  define phase, before invoke), so the retry is safe and preserves the
+  pre-target-package behaviour for public-only expressions.
+- **Non-public interface types resolve to a reachable supertype** instead of
+  dead-ending the declared-type walk.
+- **Pipeline-exception subtype preserved** — a define-vs-invoke failure keeps
+  its original `JdiEvaluationException` subtype and message instead of being
+  flattened into a generic wrapper.
+
+### Docs
+
+- **Release workflow skill** — added a `release` skill capturing the
+  plugin-release procedure (marketplace.json + CHANGELOG bump, annotated tag,
+  cherry-pick/back-fill recovery), plus a fix to its predecessor-tag selection
+  so release notes diff against the immediately-lower `v*` tag.
+
 ## [2.2.0] — 2026-05-23
 
 ### New — agent-driven JDI wedge recovery
