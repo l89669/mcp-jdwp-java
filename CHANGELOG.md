@@ -5,6 +5,43 @@ All notable changes to the `jdwp-debugging` plugin are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.6.1] — 2026-05-24
+
+### Fixed — connect / diagnose no longer alias a dead VM
+
+The liveness check behind `jdwp_connect`'s "already connected" guard and the
+`jdwp_diagnose` connection status probed the target with `vm.name()`, which JDI
+caches after its first fetch — so a VM whose socket had already closed (an
+orphaned test JVM left over from a previous debug session, or one mid-exit)
+still read as alive. `connect` then short-circuited onto the stale VM and
+`jdwp_diagnose` reported a live connection that wasn't; breakpoints never fired
+and the disconnect only surfaced later.
+
+- **Round-tripping liveness probe** — these two paths now issue a bounded
+  `vm.allThreads()` (a real JDWP exchange) instead of the cached name: a closed
+  socket is detected promptly and a wedged VM is bounded by a short timeout, so
+  `connect` re-attaches to the VM you actually launched and `jdwp_diagnose`
+  tells the truth. The cheap cached check stays on the per-tool-call hot path,
+  where a false positive is harmless (the next real JDI call surfaces the
+  disconnect). (resolves #21)
+
+### Docs
+
+- **"The Field That Lies" reads as a puzzle again** — the test-flight scenario
+  had promised that a field-modification watchpoint catches the reflective
+  `Field.set` that mutates the field; a flight on JDK 21 disproved it (JDI
+  watchpoints fire on the `putfield` bytecode, not on reflective / `Unsafe`
+  stores). The scenario no longer hands over the answer, and the `java-debug`
+  skill gained a caveat: watchpoints miss reflective / `Unsafe` writes
+  regardless of finality — bisect with line breakpoints + `identityHashCode`
+  instead.
+
+### CI
+
+- **Actions pinned to Node 24** — `actions/checkout` and `actions/setup-java`
+  were bumped past the Node 20 runtime deprecation in both the CI and release
+  workflows.
+
 ## [2.6.0] — 2026-05-24
 
 ### New — tool responses now navigate to the next step
