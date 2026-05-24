@@ -39,12 +39,9 @@ import static org.mockito.Mockito.when;
  */
 class JdiExpressionEvaluatorPackageFallbackTest {
 
-	private static final String DEFAULT_PACKAGE = "mcp.jdi.evaluation";
-
 	private InMemoryJavaCompiler compiler;
 	private JdiExpressionEvaluator evaluator;
 	private StackFrame frame;
-	private ClassType thisType;
 
 	@BeforeEach
 	void setUp() throws Exception {
@@ -72,7 +69,7 @@ class JdiExpressionEvaluatorPackageFallbackTest {
 		when(frame.visibleVariables()).thenReturn(List.of());
 
 		final ObjectReference thisRef = mock(ObjectReference.class);
-		thisType = mock(ClassType.class);
+		final ClassType thisType = mock(ClassType.class);
 		when(thisType.name()).thenReturn("com.app.Foo");
 		when(thisType.isPublic()).thenReturn(publicThis);
 		when(thisType.allFields()).thenReturn(List.of());

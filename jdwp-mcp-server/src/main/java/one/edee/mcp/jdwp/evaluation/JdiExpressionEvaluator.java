@@ -22,8 +22,10 @@ import java.util.stream.Collectors;
  * 2. Auto-rewrite bare field identifiers (`field` → `_this.field`) via
  * {@link #rewriteThisFieldReferences} when safe; explicit `this`/`this.field` is handled
  * separately by {@link #rewriteThisKeyword}.
- * 3. Cache lookup keyed on `signature + "###" + expression`; on miss, generate a wrapper class
- * with a UUID-suffixed name, compile via {@link InMemoryJavaCompiler}, and cache the bytecode.
+ * 3. Cache lookup keyed on `wrapperPackage + "###" + signature + "###" + expression` (the package
+ * is part of the key because a define-time fallback may recompile the same expression into a
+ * different package); on miss, generate a wrapper class with a UUID-suffixed name, compile via
+ * {@link InMemoryJavaCompiler}, and cache the bytecode.
  * 4. Inject the bytecode into the target VM and execute via {@link RemoteCodeExecutor}.
  * <p>
  * Cache eviction: when {@link #compilationCache} reaches {@link #MAX_CACHE_SIZE} entries it is
@@ -751,11 +753,13 @@ public class JdiExpressionEvaluator {
      * Evaluates `expression` in the context of `frame` plus any caller-supplied synthetic bindings,
      * and returns the result as a JDI {@link Value}. Side effect: populates {@link #compilationCache}.
      *
-     * <p>The auto-rewrite of bare {@code this.field} references runs when EITHER {@code this}'s
-     * declared type is public OR the wrapper is emitted into {@code this}'s own package (see
-     * {@link #resolveWrapperPackage}). In the latter case package-private and protected fields
-     * also become candidates — subject to {@link #isFieldAccessibleFromWrapper}'s per-field
-     * accessibility check.
+     * <p>The auto-rewrite of bare field identifiers ({@code field} → {@code _this.field}, via
+     * {@link #rewriteThisFieldReferences}) runs when EITHER {@code this}'s declared type is public
+     * OR the wrapper is emitted into {@code this}'s own package (see {@link #resolveWrapperPackage}).
+     * In the latter case package-private and protected fields also become candidates — subject to
+     * {@link #isFieldAccessibleFromWrapper}'s per-field accessibility check. (Explicit {@code this}
+     * and {@code this.field} are handled separately and unconditionally by
+     * {@link #rewriteThisKeyword}.)
      *
      * <p>Synthetic bindings (e.g. {@code "$exception" -> ObjectReference}) appear in the wrapper's
      * parameter list after the real locals and can be referenced by name in the expression. This is
@@ -813,6 +817,12 @@ public class JdiExpressionEvaluator {
         } catch (Exception e) {
             log.warn("[Evaluator] Expression evaluation failed after {}ms: {}",
                 System.currentTimeMillis() - startTime, e.getMessage());
+            // Already a pipeline exception (incl. JdiClassDefinitionException) — propagate it
+            // unchanged so the define-vs-invoke subtype and its original message survive rather
+            // than being flattened into a generic "Expression evaluation failed" wrapper.
+            if (e instanceof JdiEvaluationException jdi) {
+                throw jdi;
+            }
             // Un-wrap runtime exception from cache computation
             if (e instanceof RuntimeException && e.getCause() instanceof JdiEvaluationException jdiEx) {
                 throw jdiEx;
