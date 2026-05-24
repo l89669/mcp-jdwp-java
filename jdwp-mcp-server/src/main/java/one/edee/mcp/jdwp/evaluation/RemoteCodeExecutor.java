@@ -1,6 +1,7 @@
 package one.edee.mcp.jdwp.evaluation;
 
 import com.sun.jdi.*;
+import one.edee.mcp.jdwp.evaluation.exceptions.JdiClassDefinitionException;
 import one.edee.mcp.jdwp.evaluation.exceptions.JdiEvaluationException;
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
@@ -100,6 +101,11 @@ public final class RemoteCodeExecutor {
             final String exceptionType = exception != null ? exception.type().name() : "unknown";
             log.error("[Executor] Target VM threw exception after {}ms: {}", elapsed, exceptionType, e);
             throw new JdiEvaluationException("Target VM threw exception: " + exceptionType, e);
+        } catch (JdiEvaluationException e) {
+            // Already classified by a lower phase (notably loadClass's JdiClassDefinitionException).
+            // Propagate unchanged so the evaluator can act on the precise subtype — re-wrapping here
+            // would erase the define-vs-invoke distinction the package-fallback retry depends on.
+            throw e;
         } catch (Exception e) {
             final long elapsed = System.currentTimeMillis() - startTime;
             log.error("[Executor] Unexpected exception after {}ms: {}", elapsed, e.getClass().getName(), e);
@@ -166,12 +172,12 @@ public final class RemoteCodeExecutor {
 
         } catch (InvalidTypeException | ClassNotLoadedException | IncompatibleThreadStateException e) {
             log.error("[Executor] Failed to load class {}: {}", className, e.getClass().getSimpleName(), e);
-            throw new JdiEvaluationException("Failed to load class '" + className + "' into target VM: " + e.getMessage(), e);
+            throw new JdiClassDefinitionException("Failed to load class '" + className + "' into target VM: " + e.getMessage(), e);
         } catch (InvocationException e) {
             final ObjectReference exception = e.exception();
             final String exceptionType = exception != null ? exception.type().name() : "unknown";
             log.error("[Executor] defineClass threw exception {}: {}", exceptionType, e.getMessage(), e);
-            throw new JdiEvaluationException("Failed to load class '" + className + "': " + exceptionType, e);
+            throw new JdiClassDefinitionException("Failed to load class '" + className + "': " + exceptionType, e);
         }
     }
 

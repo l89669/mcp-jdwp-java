@@ -18,7 +18,11 @@ import org.junit.jupiter.api.Test;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -36,14 +40,17 @@ class JDWPToolsSetBreakpointTest {
 	private JDWPTools tools;
 	private VirtualMachine vm;
 	private EventRequestManager erm;
+	private EventHistory eventHistory;
 
 	@BeforeEach
 	void setUp() throws Exception {
 		jdiService = mock(JDIConnectionService.class);
-		tracker = new BreakpointTracker();
+		// Spy (delegates to the real impl) so the race-guard tests can force promotePendingToActive
+		// to win/lose the promotion race deterministically; all other tests see real behaviour.
+		tracker = spy(new BreakpointTracker());
 		final WatcherManager watcherManager = new WatcherManager();
 		final JdiExpressionEvaluator evaluator = mock(JdiExpressionEvaluator.class);
-		final EventHistory eventHistory = new EventHistory();
+		eventHistory = new EventHistory();
 		tools = JDWPToolsTestSupport.newTools(
 			jdiService, tracker, watcherManager, evaluator,
 			eventHistory, new EvaluationGuard(), new JvmDiscoveryService());
@@ -228,6 +235,121 @@ class JDWPToolsSetBreakpointTest {
 			final String result = tools.jdwp_set_breakpoint("com.example.Foo", 10, "all", "i > 0", null, null, null);
 
 			assertThat(result).contains("condition: i > 0");
+		}
+	}
+
+	@Nested
+	@DisplayName("multi-location diagnostic")
+	class MultiLocationDiagnostic {
+
+		@Test
+		@DisplayName("eager bind to a line with >1 Location warns in the response AND records BP_MULTI_LOCATION")
+		void shouldWarnAndRecordEventForMultiLocationEagerBind() throws Exception {
+			final ReferenceType refType = mock(ReferenceType.class);
+			final Location bound = mock(Location.class);
+			final Location lambda = mock(Location.class);
+			// describeLocation reads method().name() + codeIndex() off the bound Location.
+			final com.sun.jdi.Method method = mock(com.sun.jdi.Method.class);
+			when(method.name()).thenReturn("doWork");
+			when(bound.method()).thenReturn(method);
+			when(bound.codeIndex()).thenReturn(7L);
+			when(jdiService.findLoadedClass("com.example.WithLambda")).thenReturn(refType);
+			when(refType.locationsOfLine(99)).thenReturn(List.of(bound, lambda));
+			when(erm.createBreakpointRequest(bound)).thenReturn(mock(BreakpointRequest.class));
+
+			final String result = tools.jdwp_set_breakpoint("com.example.WithLambda", 99, "all", null, null, null, null);
+
+			assertThat(result)
+				.startsWith("Breakpoint set at com.example.WithLambda:99")
+				.contains("WARNING: line has 2 Locations")
+				.contains("other paths will MISS this BP");
+
+			assertThat(eventHistory.getRecent(10))
+				.anySatisfy(e -> {
+					assertThat(e.type()).isEqualTo("BP_MULTI_LOCATION");
+					assertThat(e.summary()).startsWith("BP ");
+					assertThat(e.summary()).contains("com.example.WithLambda:99");
+					assertThat(e.summary()).contains("2 bytecode locations");
+					assertThat(e.details()).containsEntry("kind", "breakpoint");
+					assertThat(e.details()).containsEntry("locationCount", "2");
+				});
+		}
+
+		@Test
+		@DisplayName("single-Location bind records NO BP_MULTI_LOCATION event and adds no warning")
+		void shouldNotWarnOrRecordForSingleLocationBind() throws Exception {
+			wireEagerSet("com.example.Foo", 10);
+
+			final String result = tools.jdwp_set_breakpoint("com.example.Foo", 10, "all", null, null, null, null);
+
+			assertThat(result).doesNotContain("WARNING");
+			assertThat(eventHistory.getRecent(10))
+				.noneSatisfy(e -> assertThat(e.type()).isEqualTo("BP_MULTI_LOCATION"));
+		}
+	}
+
+	@Nested
+	@DisplayName("race-guard multi-location diagnostic")
+	class RaceGuardMultiLocationDiagnostic {
+
+		/**
+		 * Drives the race-guard recheck path: the class is NOT loaded eagerly, so a pending entry +
+		 * ClassPrepareRequest are registered, but {@code vm.classesByName} then finds it (it loaded
+		 * between the two checks), and the tool binds inline.
+		 */
+		private ReferenceType wireRaceGuard(String className, int line, Location... locations) throws Exception {
+			final ReferenceType refType = mock(ReferenceType.class);
+			when(jdiService.findLoadedClass(className)).thenReturn(null);
+			when(erm.createClassPrepareRequest()).thenReturn(mock(ClassPrepareRequest.class));
+			when(vm.classesByName(className)).thenReturn(List.of(refType));
+			when(refType.locationsOfLine(line)).thenReturn(List.of(locations));
+			when(erm.createBreakpointRequest(locations[0])).thenReturn(mock(BreakpointRequest.class));
+			return refType;
+		}
+
+		@Test
+		@DisplayName("losing the promotion race emits NO BP_MULTI_LOCATION and notes the concurrent path")
+		void shouldNotRecordMultiLocationWhenPromotionLost() throws Exception {
+			final Location bound = mock(Location.class);
+			final Location lambda = mock(Location.class);
+			wireRaceGuard("com.example.Lam", 50, bound, lambda);
+			// Another path already promoted this id — our inline bind loses the race.
+			doReturn(false).when(tracker).promotePendingToActive(anyInt(), any());
+
+			final String result = tools.jdwp_set_breakpoint("com.example.Lam", 50, "all", null, null, null, null);
+
+			assertThat(result)
+				.startsWith("Breakpoint set at com.example.Lam:50")
+				.contains("bound by a concurrent activation path")
+				.doesNotContain("WARNING");
+			// The winning path owns the diagnostic; we must not double-record it.
+			assertThat(eventHistory.getRecent(10))
+				.noneSatisfy(e -> assertThat(e.type()).isEqualTo("BP_MULTI_LOCATION"));
+		}
+
+		@Test
+		@DisplayName("winning the promotion race records BP_MULTI_LOCATION and warns")
+		void shouldRecordMultiLocationWhenPromotionWon() throws Exception {
+			final Location bound = mock(Location.class);
+			final Location lambda = mock(Location.class);
+			final com.sun.jdi.Method method = mock(com.sun.jdi.Method.class);
+			when(method.name()).thenReturn("doWork");
+			when(bound.method()).thenReturn(method);
+			when(bound.codeIndex()).thenReturn(3L);
+			wireRaceGuard("com.example.Lam", 50, bound, lambda);
+			doReturn(true).when(tracker).promotePendingToActive(anyInt(), any());
+
+			final String result = tools.jdwp_set_breakpoint("com.example.Lam", 50, "all", null, null, null, null);
+
+			assertThat(result)
+				.startsWith("Breakpoint set at com.example.Lam:50")
+				.contains("WARNING: line has 2 Locations")
+				.doesNotContain("concurrent activation path");
+			assertThat(eventHistory.getRecent(10))
+				.anySatisfy(e -> {
+					assertThat(e.type()).isEqualTo("BP_MULTI_LOCATION");
+					assertThat(e.details()).containsEntry("locationCount", "2");
+				});
 		}
 	}
 }
