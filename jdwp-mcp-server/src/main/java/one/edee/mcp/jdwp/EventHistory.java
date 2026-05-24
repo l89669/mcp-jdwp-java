@@ -23,8 +23,8 @@ import java.util.concurrent.ConcurrentLinkedDeque;
  * producers, no global ordering is guaranteed beyond each individual {@code record} call.
  * - Cleared on `jdwp_reset`, `jdwp_clear_events`, and {@link JDIConnectionService#cleanupSessionState}.
  * <p>
- * Documented event type strings (exhaustive — keep in sync with every {@code DebugEvent} type
- * recorded across the codebase): `BREAKPOINT`, `BREAKPOINT_SUPPRESSED`, `STEP`, `STEP_SUPPRESSED`,
+ * Documented event type strings (exhaustive for production code — keep in sync; tests may record
+ * ad-hoc types that are intentionally not listed here): `BREAKPOINT`, `BREAKPOINT_SUPPRESSED`, `STEP`, `STEP_SUPPRESSED`,
  * `EXCEPTION`, `EXCEPTION_SUPPRESSED`, `EXCEPTION_LOG`, `EXCEPTION_LOG_ERROR`, `LOGPOINT`,
  * `LOGPOINT_ERROR`, `FIELD_ACCESS`, `FIELD_MODIFICATION`, `FIELD_BREAKPOINT_SUPPRESSED`,
  * `FIELD_LOGPOINT`, `FIELD_LOGPOINT_ERROR`, `CHAIN_ARMED`, `CHAIN_DISARMED`, `CHAIN_BROKEN`,
@@ -42,7 +42,10 @@ public class EventHistory {
 
     /**
      * Appends an event and evicts the oldest entries until the buffer is at or below {@link #MAX_EVENTS}.
-     * Called exclusively from {@link JdiEventListener} on the JDI event listener thread; non-blocking.
+     * Non-blocking, and safe to call from any thread: most records come from the JDI event listener
+     * thread ({@link JdiEventListener}), but MCP worker threads also record install-time diagnostics
+     * (e.g. {@code BP_MULTI_LOCATION}, {@code RECONNECT}). The backing {@link ConcurrentLinkedDeque}
+     * tolerates these concurrent producers.
      */
     public void record(DebugEvent event) {
         events.addLast(event);

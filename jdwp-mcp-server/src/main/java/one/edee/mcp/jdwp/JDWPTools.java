@@ -2242,7 +2242,7 @@ public class JDWPTools {
      * <ul>
      *   <li>logs a WARN line, and</li>
      *   <li>records a {@code BP_MULTI_LOCATION} {@link EventHistory.DebugEvent} (same type and detail
-     *       keys as the deferred path in {@link JdiEventListener#handleClassPrepareEvent}),</li>
+     *       keys as the deferred class-prepare path in {@link JdiEventListener}),</li>
      * </ul>
      * so {@code jdwp_get_events} surfaces the diagnostic uniformly whether the bind happened
      * immediately or on a later ClassPrepare. Returns an empty string when there is only one
