@@ -428,6 +428,49 @@ class JdiEventListenerFieldWatchpointTest {
 		assertThat(captured.get("$object")).as("$object must be present with null value").isNull();
 	}
 
+	/**
+	 * Regression: on an ACCESS watchpoint event there is no incoming value, so {@code $newValue}
+	 * used to be omitted from the bindings entirely. A {@code mode="both"} logpoint/condition whose
+	 * expression names {@code $newValue} then failed to COMPILE on every read (one
+	 * {@code FIELD_LOGPOINT_ERROR} per access hit), forcing callers to split into separate access /
+	 * modification watchpoints. The contract now is: {@code $newValue} is always bound, mapped to a
+	 * typed-null on access events, so the same {@code "$oldValue -> $newValue"} expression compiles
+	 * and renders {@code … -> null} on reads.
+	 */
+	@Test
+	@DisplayName("Access event → $newValue still PRESENT (null-valued) so mode=both expressions compile")
+	void shouldBindNullNewValueOnAccessEvents() throws Exception {
+		AccessWatchpointRequest req = mock(AccessWatchpointRequest.class);
+		int bpId = tracker.registerFieldBreakpoint(
+			BreakpointTracker.FieldBreakpointSpec.suspending(
+				"com.Foo", "counter", BreakpointTracker.FieldWatchMode.ACCESS,
+				null, null, "true"),
+			req, null);
+		tracker.setCondition(bpId, "true");
+
+		ThreadReference thread = mockThread("worker-access-newvalue", 4014L);
+		StackFrame frame = mock(StackFrame.class);
+		when(thread.frame(0)).thenReturn(frame);
+
+		@SuppressWarnings("unchecked")
+		org.mockito.ArgumentCaptor<java.util.Map<String, Value>> bindingsCaptor =
+			(org.mockito.ArgumentCaptor<java.util.Map<String, Value>>)
+				(org.mockito.ArgumentCaptor<?>) org.mockito.ArgumentCaptor.forClass(java.util.Map.class);
+		BooleanValue trueResult = mock(BooleanValue.class);
+		when(trueResult.value()).thenReturn(true);
+		when(evaluator.evaluate(any(StackFrame.class), anyString(), bindingsCaptor.capture()))
+			.thenReturn(trueResult);
+
+		// Access of a field that currently holds a non-null value — there is no value-to-be.
+		AccessWatchpointEvent event = mockAccessEvent(thread, req, "com.Foo", "counter", null);
+		runListenerWith(listener, mockEventSet(event));
+
+		java.util.Map<String, Value> captured = bindingsCaptor.getValue();
+		assertThat(captured).containsKey("$newValue");
+		assertThat(captured.get("$newValue")).as("$newValue must be bound as null on access events").isNull();
+		assertThat(captured.get("$mode")).as("$mode mirror is bound").isNotNull();
+	}
+
 	@Test
 	@DisplayName("excludeConstructors=true silently drops <init> writes — no event, no suspend, no chain")
 	void shouldSkipConstructorWritesWhenExcludeConstructorsSet() throws Exception {

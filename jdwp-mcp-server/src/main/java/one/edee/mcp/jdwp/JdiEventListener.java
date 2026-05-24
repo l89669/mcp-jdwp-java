@@ -833,8 +833,9 @@ public class JdiEventListener {
     /**
      * Builds the synthetic-binding map exposed to conditions and logpoint expressions on a field
      * watchpoint hit. {@code $oldValue} (always — null for the first write to an uninitialised
-     * reference field), {@code $newValue} (always for {@link ModificationWatchpointEvent}, otherwise
-     * absent), and {@code $object} (null for static-field events) are bound. Null values are bound
+     * reference field), {@code $newValue} (the value-to-be for {@link ModificationWatchpointEvent};
+     * bound as a typed-null on access events so a {@code mode="both"} expression that names it still
+     * compiles), and {@code $object} (null for static-field events) are bound. Null values are bound
      * as the typed-null literal by {@code JdiExpressionEvaluator#inferDeclaredType} ({@code
      * java.lang.Object}), so string-concatenation expressions like {@code "$oldValue + \" -> \" +
      * $newValue"} render the literal {@code "null"} instead of failing at compile time.
@@ -852,6 +853,14 @@ public class JdiEventListener {
         bindings.put("$oldValue", event.valueCurrent());
         if (isModification) {
             bindings.put("$newValue", ((ModificationWatchpointEvent) event).valueToBe());
+        } else {
+            // Access events carry no incoming value. Bind $newValue as a typed-null (HashMap
+            // permits null; JdiExpressionEvaluator#inferDeclaredType resolves it to
+            // java.lang.Object) so a mode="both" logpoint/condition that names $newValue compiles
+            // and renders "null" on reads — instead of failing to compile with one
+            // FIELD_LOGPOINT_ERROR per access hit just because the symbol is unbound on the
+            // access half of the watchpoint.
+            bindings.put("$newValue", null);
         }
         bindings.put("$object", event.object());
         bindings.put("$fieldName", vm.mirrorOf(fieldName));
