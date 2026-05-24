@@ -25,6 +25,12 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import static one.edee.mcp.jdwp.ThreadFormatting.isJvmInternalThread;
 
@@ -245,10 +251,13 @@ public class JDIConnectionService {
     }
 
     /**
-     * Pure liveness probe — issues {@code vm.name()} and returns false on any exception. Does NOT
-     * mutate the {@link #vm} field, so diagnostic callers like {@link #getConnectionStatus()} can
-     * read connection state without an observable side effect. Stale-state cleanup is handled by
-     * the connect/reconnect paths via {@link #cleanupSessionState()}.
+     * Cheap, optimistic liveness probe — issues the JDI-cached {@code vm.name()} and returns false
+     * on any exception. Because {@code name()} is cached after its first fetch, this can report a VM
+     * as alive after its socket has already closed; it is therefore only used on the hot
+     * {@code getVM()} / {@link #ensureConnected()} precondition path, where a false positive is
+     * harmless (the next real JDI operation surfaces {@code VMDisconnectedException}). Authoritative
+     * checks that must not alias to a dead VM use {@link #isVMResponsive()} instead. Does NOT mutate
+     * the {@link #vm} field.
      */
     private boolean isVMAlive() {
         final VirtualMachine local = vm;
@@ -260,6 +269,50 @@ public class JDIConnectionService {
             return true;
         } catch (Exception e) {
             return false;
+        }
+    }
+
+    /**
+     * Connect-time liveness timeout. A held VM that cannot answer a round-tripping JDI command
+     * within this budget is treated as dead, so {@link #connect} re-attaches rather than aliasing to
+     * it. Deliberately shorter than the health monitor's wedged-detection probe — a connect attempt
+     * should not stall on a hung VM.
+     */
+    private static final long LIVENESS_PROBE_TIMEOUT_MS = 2_000L;
+
+    /**
+     * Authoritative liveness probe: issues a round-tripping {@code vm.allThreads()} and waits up to
+     * {@link #LIVENESS_PROBE_TIMEOUT_MS} for it. Unlike {@link #isVMAlive()} (which calls the
+     * JDI-cached {@code vm.name()} and so cannot detect a socket that closed since the first fetch),
+     * this forces a fresh JDWP exchange: a dead socket throws promptly and a wedged VM is bounded by
+     * the timeout, so a non-live VM reliably reads as dead. Used by the {@link #connect}
+     * "already connected" guard and by {@link #getConnectionStatus()} so neither aliases to a stale
+     * VM (e.g. an orphaned test JVM left over from a previous debug session). Side-effect free apart
+     * from the probe traffic; does NOT mutate the {@link #vm} field.
+     */
+    private boolean isVMResponsive() {
+        final VirtualMachine local = vm;
+        if (local == null) {
+            return false;
+        }
+        final ExecutorService probe = Executors.newSingleThreadExecutor(r -> {
+            final Thread t = new Thread(r, "jdi-liveness-probe");
+            t.setDaemon(true);
+            return t;
+        });
+        try {
+            final Future<Boolean> result = probe.submit(() -> {
+                local.allThreads();
+                return Boolean.TRUE;
+            });
+            return Boolean.TRUE.equals(result.get(LIVENESS_PROBE_TIMEOUT_MS, TimeUnit.MILLISECONDS));
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            return false;
+        } catch (TimeoutException | ExecutionException probeFailed) {
+            return false;
+        } finally {
+            probe.shutdownNow();
         }
     }
 
@@ -277,7 +330,7 @@ public class JDIConnectionService {
         lastConnectAttempt = Instant.now();
         lastConnectAttemptHost = host;
         lastConnectAttemptPort = port;
-        if (vm != null && isVMAlive()) {
+        if (vm != null && isVMResponsive()) {
             if (host.equals(lastHost) && port == lastPort) {
                 lastConnectError = null;
                 return "Already connected to " + vm.name();
@@ -337,12 +390,13 @@ public class JDIConnectionService {
 
     /**
      * Read-only snapshot of the connection target used by {@code jdwp_diagnose}. The
-     * {@code connected} field runs a fresh liveness probe ({@code vm.name()}) on every call,
-     * so callers must not cache the returned status — the underlying VM can die between calls.
+     * {@code connected} field runs a fresh round-tripping liveness probe ({@link #isVMResponsive()})
+     * on every call, so callers must not cache the returned status — the underlying VM can die
+     * between calls.
      */
     public synchronized ConnectionStatus getConnectionStatus() {
         return new ConnectionStatus(
-            vm != null && isVMAlive(),
+            vm != null && isVMResponsive(),
             lastConnectAttemptHost,
             lastConnectAttemptPort,
             lastConnectAttempt,
