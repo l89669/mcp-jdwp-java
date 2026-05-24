@@ -10,6 +10,13 @@ pom.xml.versionsBackup
 *.iws
 *.ipr
 
+# Eclipse
+.project
+.classpath
+.factorypath
+.settings/
+.apt_generated/
+
 # OS
 .DS_Store
 Thumbs.db
@@ -24,3 +31,7 @@ mcp-jdwp-inspector.log
 
 # Sandbox release artifacts (produced by release/sandbox/assemble.sh)
 release/sandbox/dist/
+
+# Core dumps (e.g. from a crashing CLI proxy dropping `core` into the tree)
+core
+core.*
