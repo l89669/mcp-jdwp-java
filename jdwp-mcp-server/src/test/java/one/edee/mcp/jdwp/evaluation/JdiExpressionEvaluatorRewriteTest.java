@@ -429,9 +429,12 @@ class JdiExpressionEvaluatorRewriteTest {
 	@Test
 	@DisplayName("isBlockMode: brace-balanced internals followed by expression text are NOT a block")
 	void shouldNotDetectBlockWhenInternalBraceClosesEarly() {
-		// `{a;}+b;` — the first `}` closes the outer brace at i=4, depth goes to 0 before the
-		// trailing `}` at i=7. Block detection must reject this.
-		assertThat(JdiExpressionEvaluator.isBlockMode("{a;}+b;")).isFalse();
+		// `{a;}+b;}` — input both starts and ends with a brace (so it clears the cheap
+		// first/last-char guard), but the FIRST `}` at i=3 drops depth to 0 before the trailing
+		// `}` at i=7. That trailing brace is therefore a separate closer, not the match for the
+		// opening one, so this exercises the early `depth == 0` rejection branch — not the
+		// end-char guard. Block detection must reject it.
+		assertThat(JdiExpressionEvaluator.isBlockMode("{a;}+b;}")).isFalse();
 	}
 
 	@Test
