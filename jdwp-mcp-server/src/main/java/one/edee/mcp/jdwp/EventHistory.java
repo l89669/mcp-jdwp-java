@@ -23,7 +23,8 @@ import java.util.concurrent.ConcurrentLinkedDeque;
  * `EXCEPTION_LOG_ERROR`, `LOGPOINT`, `LOGPOINT_ERROR`, `FIELD_ACCESS`, `FIELD_MODIFICATION`,
  * `FIELD_LOGPOINT`, `FIELD_LOGPOINT_ERROR`, `BREAKPOINT_SUPPRESSED`, `EXCEPTION_SUPPRESSED`,
  * `FIELD_BREAKPOINT_SUPPRESSED`, `CHAIN_ARMED`, `CHAIN_DISARMED`, `CHAIN_BROKEN`, `VM_START`,
- * `VM_DEATH`. These are the keys clients can grep on or filter by.
+ * `VM_DEATH`, `CLASS_PREPARE`, `BP_MULTI_LOCATION`, `BP_PROMOTION_FAILED`. These are the keys
+ * clients can grep on or filter by.
  */
 @Service
 public class EventHistory {

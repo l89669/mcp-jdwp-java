@@ -1046,22 +1046,36 @@ public class JdiEventListener {
             final List<Map.Entry<Integer, BreakpointTracker.PendingFieldBreakpoint>> pendingFieldList =
                 breakpointTracker.getPendingFieldBreakpointsForClass(className);
 
+            // No deferred work keyed to this class. We deliberately do NOT record a CLASS_PREPARE
+            // event here: EVERY loaded class fires a prepare, so recording unconditionally would
+            // bury the one actionable signal — "a class carrying deferred BPs/LPs just loaded" —
+            // under thousands of irrelevant entries. CLASS_PREPARE is recorded below only when the
+            // prepare actually activates pending work.
             if (pendingList.isEmpty() && pendingExList.isEmpty() && pendingFieldList.isEmpty()) {
                 return;
             }
 
-            log.info("[JDI] ClassPrepareEvent for '{}', activating {} deferred breakpoint(s), {} deferred exception breakpoint(s), {} deferred field BP(s)",
-                className, pendingList.size(), pendingExList.size(), pendingFieldList.size());
+            // The pending-line list mixes breakpoints and logpoints (logpoints ride the same
+            // deferred-line path), so split the counts — reporting everything as "line BP(s)"
+            // would misattribute deferred logpoints in the diagnostic.
+            final long lineLpCount = pendingList.stream()
+                .filter(e -> breakpointTracker.isLogpoint(e.getKey()))
+                .count();
+            final long lineBpCount = pendingList.size() - lineLpCount;
+
+            log.info("[JDI] ClassPrepareEvent for '{}', activating {} deferred line BP(s), {} deferred logpoint(s), {} deferred exception breakpoint(s), {} deferred field BP(s)",
+                className, lineBpCount, lineLpCount, pendingExList.size(), pendingFieldList.size());
 
             // Surface the CPE to agents via jdwp_get_events. Without this, an agent that sets a
             // deferred BP and waits on jdwp_resume_until_event sees only [VM_START, VM_DEATH] and
             // cannot tell whether the class ever loaded — making it impossible to distinguish
             // "class never loaded" from "class loaded but BP did not fire".
             eventHistory.record(new EventHistory.DebugEvent("CLASS_PREPARE",
-                String.format("ClassPrepareEvent for %s, activating %d line BP(s), %d exception BP(s), %d field BP(s)",
-                    className, pendingList.size(), pendingExList.size(), pendingFieldList.size()),
+                String.format("ClassPrepareEvent for %s, activating %d line BP(s), %d logpoint(s), %d exception BP(s), %d field BP(s)",
+                    className, lineBpCount, lineLpCount, pendingExList.size(), pendingFieldList.size()),
                 Map.of("class", className,
-                    "lineBpCount", String.valueOf(pendingList.size()),
+                    "lineBpCount", String.valueOf(lineBpCount),
+                    "lineLpCount", String.valueOf(lineLpCount),
                     "exceptionBpCount", String.valueOf(pendingExList.size()),
                     "fieldBpCount", String.valueOf(pendingFieldList.size()))));
 
@@ -1112,21 +1126,25 @@ public class JdiEventListener {
                     final boolean isLogpoint = breakpointTracker.isLogpoint(id);
                     final String kindUpper = isLogpoint ? "LP" : "BP";
                     final String kindLower = isLogpoint ? "logpoint" : "breakpoint";
+                    // describeLocation is best-effort and can change/throw during a VM tear-down
+                    // race, so compute it ONCE and reuse — keeping the log, summary and details
+                    // mutually consistent and avoiding repeated JDI round-trips.
+                    final String boundLocationDesc = describeLocation(location);
                     if (locations.size() > 1) {
                         log.warn("[JDI] Deferred {} {} activated at {}:{} — line has {} Locations; bound only to {} (other paths will MISS this {})",
-                            kindLower, id, className, pending.getLineNumber(), locations.size(), describeLocation(location), kindUpper);
+                            kindLower, id, className, pending.getLineNumber(), locations.size(), boundLocationDesc, kindUpper);
                         eventHistory.record(new EventHistory.DebugEvent("BP_MULTI_LOCATION",
                             String.format("%s #%d at %s:%d — line has %d bytecode locations; bound only to %s (other paths will MISS)",
-                                kindUpper, id, className, pending.getLineNumber(), locations.size(), describeLocation(location)),
+                                kindUpper, id, className, pending.getLineNumber(), locations.size(), boundLocationDesc),
                             Map.of("breakpointId", String.valueOf(id),
                                 "kind", kindLower,
                                 "class", className,
                                 "line", String.valueOf(pending.getLineNumber()),
                                 "locationCount", String.valueOf(locations.size()),
-                                "boundLocation", describeLocation(location))));
+                                "boundLocation", boundLocationDesc)));
                     } else {
                         log.info("[JDI] Deferred {} {} activated at {}:{} ({})",
-                            kindLower, id, className, pending.getLineNumber(), describeLocation(location));
+                            kindLower, id, className, pending.getLineNumber(), boundLocationDesc);
                     }
 
                 } catch (AbsentInformationException e) {

@@ -436,6 +436,39 @@ class JdiEventListenerClassPrepareTest {
 			});
 	}
 
+	@Test
+	@DisplayName("CLASS_PREPARE summary splits the line-pending count into BP(s) vs logpoint(s)")
+	void shouldSplitLineBpAndLogpointCountsInClassPrepareSummary() throws Exception {
+		ReferenceType refType = mock(ReferenceType.class);
+		Location bpLoc = mock(Location.class);
+		Location lpLoc = mock(Location.class);
+		when(refType.name()).thenReturn("com.example.Mixed");
+		when(refType.locationsOfLine(10)).thenReturn(List.of(bpLoc));
+		when(refType.locationsOfLine(20)).thenReturn(List.of(lpLoc));
+
+		EventRequestManager erm = mock(EventRequestManager.class);
+		when(erm.createBreakpointRequest(bpLoc)).thenReturn(mock(BreakpointRequest.class));
+		when(erm.createBreakpointRequest(lpLoc)).thenReturn(mock(BreakpointRequest.class));
+
+		// One plain breakpoint and one logpoint deferred against the same class — both ride the
+		// pending-line path, so the summary must attribute them to separate buckets.
+		tracker.registerPendingBreakpoint("com.example.Mixed", 10, 2, "ALL");
+		int lpId = tracker.registerPendingBreakpoint("com.example.Mixed", 20, 2, "ALL");
+		tracker.setLogpointExpression(lpId, "x + 1");
+
+		ClassPrepareEvent event = mockClassPrepareEvent(refType, erm);
+		runListenerWith(listener, mockEventSet(event));
+
+		assertThat(eventHistory.getRecent(10))
+			.anySatisfy(e -> {
+				assertThat(e.type()).isEqualTo("CLASS_PREPARE");
+				assertThat(e.summary()).contains("1 line BP(s)");
+				assertThat(e.summary()).contains("1 logpoint(s)");
+				assertThat(e.details()).containsEntry("lineBpCount", "1");
+				assertThat(e.details()).containsEntry("lineLpCount", "1");
+			});
+	}
+
 	// ── Test-specific event factory ──────────────────────────────────────────
 
 	private static ClassPrepareEvent mockClassPrepareEvent(ReferenceType refType, EventRequestManager erm) {
