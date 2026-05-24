@@ -632,7 +632,8 @@ public class JdiExpressionEvaluator {
         // SecurityException far from the decision site.
         if (pkg.isEmpty() || pkg.startsWith("java.") || pkg.equals("java")
             || pkg.startsWith("javax.") || pkg.equals("javax")
-            || pkg.startsWith("sun.") || pkg.startsWith("jdk.")) {
+            || pkg.startsWith("sun.") || pkg.equals("sun")
+            || pkg.startsWith("jdk.") || pkg.equals("jdk")) {
             return DEFAULT_EVALUATION_PACKAGE;
         }
         return pkg;
