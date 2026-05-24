@@ -2,41 +2,22 @@ package one.edee.jdwp.sandbox.config;
 
 import org.junit.jupiter.api.Test;
 
-import java.util.concurrent.atomic.AtomicReference;
-
 import static org.assertj.core.api.Assertions.assertThat;
 
 class ConfigurationProviderTest {
 
 	@Test
-	void shouldProvideFullyInitializedConfig() throws Exception {
+	void shouldRetainInitializedTimeout() throws Exception {
 		ConfigurationProvider provider = new ConfigurationProvider();
-		AtomicReference<Integer> timeout = new AtomicReference<>();
 
-		// Initializer thread — calls getConfig() which assigns instance before init()
-		Thread initializer = new Thread(() -> provider.getConfig());
-		initializer.start();
+		// Run the maintenance sweep (background thread). It should leave a live config untouched.
+		provider.runMaintenanceSweep();
 
-		// Wait until the instance reference is assigned (but init() hasn't been called)
-		provider.awaitAssignment();
-
-		// Reader thread — reads the partially-constructed configuration
-		Thread reader = new Thread(() -> {
-			Configuration config = provider.getConfig();
-			timeout.set(config.getTimeout());
-		});
-		reader.start();
-
-		// The reader sees instance != null (first null check passes) and returns it
-		// with timeout still at 0. Let init() proceed now.
-		Thread.sleep(50); // Give reader time to read the partial state
-		provider.releaseInit();
-
-		reader.join(2000);
-		initializer.join(2000);
-
-		assertThat(timeout.get())
-			.describedAs("Timeout should be fully initialized to 5000")
-			.isEqualTo(5000); // Fails: gets 0 because reader saw partially-constructed object
+		// Fails: timeout is 0, not 5000. The constructor set 5000, but the sweep wrote 0 over it.
+		// At this point the heap shows 0 and there is no local holding 5000 — the only evidence
+		// that 5000 was ever written is the field-modification history.
+		assertThat(provider.getConfig().getTimeout())
+			.describedAs("Timeout set during construction should survive the maintenance sweep")
+			.isEqualTo(5000);
 	}
 }

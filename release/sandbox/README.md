@@ -1,6 +1,8 @@
 # JDWP Test Flights — Sandbox Edition
 
-Six deliberately broken Java scenarios. Each one compiles, looks reasonable, and **fails its test with a confusing message**. Your job: attach Claude Code via the `jdwp-debugging` plugin and let the debugger find the root cause that source-level reading would miss.
+Nine deliberately broken Java scenarios. Each one compiles, looks reasonable, and **fails its test with a confusing message**. Your job: attach Claude Code via the `jdwp-debugging` plugin and let the debugger find the root cause that source-level reading would miss.
+
+Each flight is built so that one tool group is the cleanest way in, and lists a **par** — the minimum tool calls that reveal the root cause. Across the nine, the suite exercises expression eval, exception breakpoints, field watchpoints, event history, marked instances, logpoints, runtime mutation, and multi-thread inspection.
 
 This is the companion sandbox for the [jdwp-debugging Claude Code plugin](https://github.com/FgForrest/mcp-jdwp-java). Install the plugin first, then come back here.
 
@@ -30,7 +32,7 @@ Two terminals.
 **Terminal 1** — launch the broken test under JDWP, suspended at startup:
 
 ```bash
-mvn test -Dtest=OrderProcessorTest -DskipTests=false -Dmaven.surefire.debug
+mvn test -Dtest=SessionStoreTest -DskipTests=false -Dmaven.surefire.debug
 ```
 
 The test process **hangs** at "Listening for transport dt_socket at address: 5005" — that's correct. It's waiting for a debugger.
@@ -46,7 +48,7 @@ Between flights, ask Claude to run `jdwp_reset()` — it clears breakpoints and 
 Paste this into Claude Code to start a flight. Replace `#N (TestClass)` with the flight you want.
 
 ```
-You are about to play JDWP test flight #1 (OrderProcessorTest) on port 5005.
+You are about to play JDWP test flight #1 (SessionStoreTest) on port 5005.
 
 The rules:
 1. The /java-debug skill is your playbook. Use it.
@@ -79,62 +81,90 @@ If you'd rather Claude pick the flight: replace the first line with `You are abo
 
 ## The flights
 
-### #1 The Vanishing Pennies
+### #1 The Phantom Session
 
-**Difficulty:** Warm-up | **Test:** `OrderProcessorTest` | **Package:** `order`
-
-**Symptom:** `expected 71.982 but was 71.0` — the order total loses its decimal part somewhere between calculation and return.
-
-**Hint:** The calculation is correct. Something *after* it changes the total. Who would mutate an order during logging?
-
-### #2 The Phantom Session
-
-**Difficulty:** Moderate | **Test:** `SessionStoreTest` | **Package:** `session`
+**Difficulty:** Moderate | **Test:** `SessionStoreTest` | **Package:** `session` | **Par:** 4
 
 **Symptom:** `retrieve() returned null` — a session was stored, upgraded, and then... vanished from the map.
 
 **Hint:** The session is still *in* the HashMap. The HashMap just can't *find* it anymore.
 
-### #3 The Swallowed Exception
+### #2 The Swallowed Exception
 
-**Difficulty:** Moderate | **Test:** `EventBusTest` | **Package:** `events`
+**Difficulty:** Hard | **Test:** `EventBusTest` | **Package:** `events` | **Par:** 4
 
-**Symptom:** `expected stock < 100 but was 100` and no error summary — the order was supposed to reserve inventory, but nothing happened and nobody complained.
+**Symptom:** `expected stock < 100 but was 100` and an empty error summary — the order was supposed to reserve inventory, but nothing happened and nobody complained.
 
-**Hint:** There are actually *two* bugs. One is hiding the other. Start with the exception — why isn't the error summary showing anything?
+**Hint:** The handler runs on a background thread. Nothing in your code catches its failure — so there's no catch block to break on. Catch the throw itself.
 
-### #4 The Time Traveler's Config
+### #3 The Time Traveler's Config
 
-**Difficulty:** Hard | **Test:** `ConfigurationProviderTest` | **Package:** `config`
+**Difficulty:** Hard | **Test:** `ConfigurationProviderTest` | **Package:** `config` | **Par:** 4
 
-**Symptom:** `expected timeout=5000 but was 0` — the configuration exists but its timeout field is still at the default value.
+**Symptom:** `expected timeout=5000 but was 0` — the timeout was set during construction, yet it reads back as the default.
 
-**Hint:** The config object is assigned to the shared field *before* it's fully initialized. A reader thread sees the reference but reads a half-constructed object.
+**Hint:** The value *was* set correctly. Something wrote over it afterward. There's no half-built object to inspect — the damage is in the order of writes.
 
-### #5 The Audit That Lies
+### #4 The Audit That Lies
 
-**Difficulty:** Hard | **Test:** `TransferServiceTest` | **Package:** `bank`
+**Difficulty:** Hard | **Test:** `TransferServiceTest` | **Package:** `bank` | **Par:** 4
 
 **Symptom:** `expected discrepancy=0 but was non-zero` — money is neither created nor destroyed, yet the audit says the books don't balance.
 
 **Hint:** The transfer moves money in two steps. The audit snapshot is taken between them.
 
-### #6 The Field That Lies
+### #5 The Field That Lies
 
-**Difficulty:** Hard | **Test:** `UserProfileTest` | **Package:** `userprofile`
+**Difficulty:** Hard | **Test:** `UserProfileTest` | **Package:** `userprofile` | **Par:** 3
 
 **Symptom:** `expected: <Alice> but was: <alice>` — the welcome message rendered correctly, yet the user's stored display name has silently changed casing.
 
 **Hint:** You will not find the write by ripgrep'ing for `setDisplayName` — the public setter is never called. A line BP on the setter never fires. Whatever path the write travels, the field's value still flips. Let the JVM tell you exactly when it changes, regardless of how the write reaches the field.
 
+### #6 The Doppelgänger Cart
+
+**Difficulty:** Moderate | **Test:** `CheckoutTest` | **Package:** `cart` | **Par:** 6
+
+**Symptom:** `expected 45.0 but was 0.0` — the cart goes through pricing and discounting, yet its total never changes.
+
+**Hint:** The object you get back from the pipeline is not the object you passed in. Prove it.
+
+### #7 The Heisenbug Race
+
+**Difficulty:** Hard | **Test:** `RaceCounterTest` | **Package:** `race` | **Par:** 3
+
+**Symptom:** `expected 2 but was 1` — two threads each increment a counter once, but one increment vanishes.
+
+**Hint:** Two threads, one lost update. Suspending a thread to look changes the timing — watch the reads without stopping anything.
+
+### #8 The Magic Patch
+
+**Difficulty:** Warm-up | **Test:** `DateParserTest` | **Package:** `parser` | **Par:** 3
+
+**Symptom:** `NumberFormatException: For input string: "15 "` — a date string that looks right fails to parse.
+
+**Hint:** The input looks *almost* right. Rather than rebuild with a fix, patch the value in place and see if the test goes green.
+
+### #9 The Polite Standoff
+
+**Difficulty:** Hard | **Test:** `TransferDeadlockTest` | **Package:** `deadlock` | **Par:** 4
+
+**Symptom:** The test hangs and then fails its join — both transfers never complete.
+
+**Hint:** Nothing is executing. No exception is thrown. Find out what each thread is waiting for. (Don't try to evaluate expressions on the stuck threads — the debugger refuses, and that refusal is a clue.)
+
 ## Scorecard
+
+**Flights solved** — did you find the root cause?
 
 | Solved | Rating                                                               |
 |--------|----------------------------------------------------------------------|
-| 0-1    | The JVM is winning. Check your setup.                                |
-| 2-3    | Solid start. You're getting the hang of breakpoint-driven debugging. |
-| 4-5    | Impressive. You found bugs that would take hours with println.       |
-| 6      | Bug terminator. Nothing survives your debugger.                      |
+| 0-2    | The JVM is winning. Check your setup.                                |
+| 3-5    | Solid start. You're getting the hang of breakpoint-driven debugging. |
+| 6-8    | Impressive. You found bugs that would take hours with println.       |
+| 9      | Bug terminator. Nothing survives your debugger.                      |
+
+**Style** — how close to par? ⭐⭐⭐ at par tool count, ⭐⭐ within 2×, ⭐ solved at all. A flawless run is 27 stars across the nine flights.
 
 ## Where the spoilers live
 
@@ -151,4 +181,4 @@ The reveals are deliberately not in this zip so the agent that you ask to play c
 
 ## Have fun
 
-The point isn't to solve them fastest. The point is to feel what a runtime-aware debugger gives you that a code reader can't see. If you finish all six and want more, the same techniques apply to real bugs in your own code.
+The point isn't to solve them fastest. The point is to feel what a runtime-aware debugger gives you that a code reader can't see. If you finish all nine and want more, the same techniques apply to real bugs in your own code.

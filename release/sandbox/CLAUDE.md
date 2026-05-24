@@ -41,8 +41,9 @@ After each flight, tell the user:
 - **What the bug actually is** (root cause in one sentence).
 - **Which JVM observation revealed it** (the specific tool call + the value that contradicted the assumption from source reading).
 - **What you would change to fix it** — but do NOT make the change. The sandbox is intentionally broken.
+- **Your tool-call count** for the flight, against its **par** (listed per flight in `README.md`). Par = ⭐⭐⭐, within 2× = ⭐⭐, solved = ⭐.
 
-After all flights, score against the scorecard in `README.md`. Top of card is "Bug terminator — 6/6".
+After all flights, score against the scorecard in `README.md`. Top of card is "Bug terminator — 9/9".
 
 ## What you may freely do
 
