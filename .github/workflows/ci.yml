@@ -30,7 +30,7 @@ jobs:
       # Actions pinned to SHA (same pins as release.yml) so a moved major-version
       # tag can't pull in a malicious commit; the comment shows the tag at pin time.
       - name: Check out repository
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           persist-credentials: false
 
@@ -39,7 +39,7 @@ jobs:
       # no vendor constraint). Java 21 matches release.yml; the reactor still
       # targets Java 17 bytecode via maven-compiler-plugin <release>.
       - name: Set up JDK 21
-        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9  # v4.8.0
+        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654  # v5.2.0
         with:
           distribution: temurin
           java-version: "21"
