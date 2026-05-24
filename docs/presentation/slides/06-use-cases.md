@@ -1,15 +1,15 @@
-<!-- .slide: data-background-image="images/bg-content.png" data-background-size="cover" -->
+<!-- .slide: class="hub-slide" data-background-image="images/bg-content.png" data-background-size="cover" -->
 
 ## What an agent needs
 
 A human in IntelliJ has eyes, a mouse, and patience. An agent has none of those — so the debugger is reshaped around how it actually works.
 
-- **Tools shaped to the task** — not raw JDWP; one call returns the whole picture
-- **Context & hints in the response** — named args, "do this next" pointers
-- **Token-economical I/O** — right-sized payloads, no resume→poll loops
-- **No blind hangs** — soft-waits return health + options; wait indefinitely, never frozen
-- **Guard rails** — recursion guards, deferred BPs, stuck-state detection
-- **A skill that teaches** — worked recipes turn a tool pile into a workflow
+- **Tools shaped to the task** — built for the job, not raw protocol calls
+- **Context & hints in the response** — clear names, and what to do next
+- **Token-economical I/O** — just enough output, never a firehose
+- **No blind hangs** — it can wait as long as it takes, never frozen
+- **Guard rails** — it can't get itself stuck
+- **A skill that teaches** — worked examples, not just a tool list
 
 <small class="muted">↓ press Down for the deep dives</small>
 
@@ -23,7 +23,7 @@ Note:
 
 ### Bootstrap, redesigned for agents
 
-- **One attach verb** — `wait_for_attach` polls every 200 ms and connects in the background; optional `port`, default 5005
+- **The server polls, not the agent** — one `wait_for_attach` call retries the port every 200 ms until the JVM is up, then returns the live session; optional `port`, default 5005
 - **No port guessing** — `jdwp://diagnose` / `jdwp://jvms` report which local JVMs are up and on which JDWP port (no `jps` / `lsof`)
 - **Deferred breakpoints** — arm BPs on not-yet-loaded classes; they bind via class-prepare when the JVM loads them on its own
 - **`reconnect` keeps the session** — re-attach to the last target; BP specs, conditions, logpoints, chains, watchers + their IDs survive (BP #7 stays #7)
@@ -42,27 +42,34 @@ Note:
 
 ### Expressions — compiled, not interpreted
 
-<div class="cols">
-<div>
+- **Real Java → real bytecode** — compiled, not interpreted
+- **Self-configuring** — finds the classpath and a matching JDK for you
+- **Two modes** — a single expression, or a `{ … return X; }` block
+- **Full scope** — reaches private / package-private members too
+- **Recursion guard** — re-entrant eval won't deadlock the target
 
-- **Real Java → real bytecode** — Eclipse JDT (ECJ) compiles your expression in the **MCP server's** memory, then `defineClass` + invokes it in the target over JDI
-- **Self-configuring** — discovers the target's classpath (Tomcat-aware) and a local JDK matching its Java version to compile against
-- **Two modes** — a bare expression (`order.getTotal()`) or a `{ … return X; }` block with try/catch, locals, early return
-- **Full scope** — reaches non-public `this` and package-private members
-- **Recursion guard** — an eval that re-enters the breakpointed method won't deadlock
+<small class="muted">↓ press Down for the pipeline</small>
 
-</div>
-<div>
+Note:
+- Compiled in the MCP server's memory via Eclipse JDT (ECJ); only the final `defineClass` + invoke runs inside the target JVM (over JDI)
+- "Finds the classpath": walks the target's classloader hierarchy, including Tomcat / app-server webapp classloaders — `WEB-INF/lib` JARs aren't on `java.class.path`, so this is what lets eval resolve your app's own classes
+- "Matching JDK": JdkDiscoveryService locates a local JDK of the target's major version (the target's own `java.home` first), passed to JDT as `--system` so `java.*` resolves; language level matches the target. ECJ is self-contained, so the target can be newer than the server's own runtime JDK as long as a matching JDK is installed
+- Block mode works in every eval slot: conditions, logpoints, watchers, assertions
+- Recursion guard: an eval that re-enters the breakpointed method is refused rather than deadlocking
+
+--
+
+<!-- .slide: data-background-image="images/bg-content.png" data-background-size="cover" -->
+
+### The expression pipeline
 
 ![Expression evaluation pipeline](images/eval-pipeline.png) <!-- .element: class="diagram" -->
 
-</div>
-</div>
+Agent expression → compiled in the **MCP server** → bytecode injected and invoked in the **target JVM**.
 
 Note:
-- Only the final defineClass + invoke executes inside the target JVM; compilation and orchestration are MCP-server-side
-- JdkDiscoveryService finds a local JDK matching the target's major version (used as `--system` so JDT resolves `java.*`)
-- Block mode works in every eval slot: conditions, logpoints, watchers, assertions
+- Only the final `defineClass` + invoke crosses into the target JVM; everything else is MCP-server-side
+- Two JDI hops cross the boundary: ClasspathDiscoverer reads the target's classloaders; RemoteCodeExecutor ships the bytecode and invokes it
 
 --
 
@@ -89,21 +96,23 @@ Note:
 
 ### Logpoints & watchpoints
 
-Observe without a single `println` or redeploy.
+Observe without a single `println` — and catch writes a setter breakpoint never sees.
 
-- **Logpoints** — line / exception / field — evaluate an expression, log it, **never suspend** the thread
-- **Field watchpoints** — fire on every JVM-level store, incl. reflection (`Field.set`) and `Unsafe`; a line BP on the setter misses every reflective write (ORMs, DI, JSON mappers)
-- Synthetic bindings: `$oldValue`, `$newValue`, `$object`, `$fieldName`, `$mode`
-- All share the in-target compiler — any classpath method, lambdas, streams
-
-**Anchor: test flight #6.** `displayName` is mutated via `Field.setAccessible(true) + Field.set(...)`; a line BP never fires, one field watchpoint catches it on the first write.
+- **Field watchpoints** — fire on every JVM-level store (incl. reflection `Field.set`, `Unsafe`); the thread **suspends at the write**, so `jdwp_get_stack` names the writer on the spot
+- **Logpoints** — line / exception / field — evaluate + **write the result to the event log**, **never suspend** the thread, **never push** — the hit isn't surfaced live
+- **`jdwp_get_events` is where it lands** — the agent pulls the log back on its own turn; replays every hit in order, across threads (`$oldValue` → `$newValue`, last 100)
+- A line BP on the setter misses reflective / framework writes (ORMs, DI, JSON mappers); a **field-modification watchpoint** doesn't — it fires on the store itself, not the method
 
 <small class="warn">Perf: hot fields can dominate target-VM CPU — filter narrowly or keep sessions short.</small>
 
 Note:
-- Logpoints replace println; race-condition debugging — stopping perturbs timing, logpoints don't
-- Field logpoints are unique here (`$oldValue` / `$newValue`); IntelliJ has line logpoints only
-- Field watchpoints CAN suspend or just log — the rogue-writer story is the clearest test-flight payoff
+- Two primitives: `jdwp_set_field_breakpoint` (watchpoint — suspends at the store) vs `jdwp_set_field_logpoint` / line / exception logpoints (log, never stop)
+- A logpoint NEVER notifies — it writes one entry to EventHistory and the thread runs on. No callback, no inline return, nothing surfaced at fire time. The agent pulls the log back with `jdwp_get_events` on a later turn — that's the *only* data channel for a logpoint hit. (The server also mirrors the line to its own SLF4J log on stderr, but that's operator-side, not something the agent reads.)
+- This decoupling — when it fired vs when you read it — is exactly what makes non-stopping observation possible: a logpoint that never suspends would otherwise be write-only
+- Every hit — suspending or not — is recorded in EventHistory (last 100); `jdwp_get_events` gives the ordered, cross-thread timeline of stores. That timeline cracks flight #3 (a config-reaper thread clobbers the value 5000→0) and flight #5 (a reflective `Field.set` bypasses the setter — a line BP on it never fires)
+- Synthetic bindings in the expression: `$oldValue`, `$newValue`, `$object`, `$fieldName`, `$mode`
+- Logpoint expressions use the in-target compiler — any classpath method, lambdas, streams
+- Field logpoints are unique here; IntelliJ has line logpoints only. Stopping a thread perturbs race timing — logpoints don't.
 
 --
 
@@ -137,10 +146,14 @@ The bundled `java-debug` skill teaches the agent:
 - **How** to pick — line BP / logpoint / field watchpoint / exception BP
 - **Which** tools to chain into a real workflow
 
+And it doesn't stop at the plan — **each tool response is written to navigate**: what just happened, what to expect, which tool to reach for next. The skill is the route; the responses are the turn-by-turn directions along it.
+
 Without it, the model freelances. With it, sessions look like an experienced developer's: attach, set targeted BPs, dump context, eval, mutate, verify, clean up, disconnect.
 
 <small class="muted">Companion docs: <code>prerequisites.md</code>, <code>troubleshooting.md</code>.</small>
 
 Note:
 - Skill is what turns the tool pile into a learnable workflow
+- Two layers of guidance: the skill is the strategy (the route), each tool response is the tactics (turn-by-turn). The responses carry the next-step hint so the plan survives turn-to-turn even when the agent drifts
+- Examples: `wait_for_attach` → "set BPs, then resume_until_event"; soft-wait → offers {wait_more, reconnect, abort}; `clear_breakpoint_dependency` → suggests `resume_until_event`. This is the "do this next" half of the hub slide
 - Without it the model picks tools at random; with it sessions look professional

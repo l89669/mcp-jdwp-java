@@ -2,7 +2,7 @@
 
 ## Architecture
 
-![Architecture: Claude Code ↔ MCP Server ↔ Target JVM](images/architecture.png) <!-- .element: class="diagram diagram-compact" -->
+![Architecture: Claude Code ↔ MCP Server ↔ Target JVM](images/architecture.png) <!-- .element: class="diagram" -->
 
 - **Spring AI MCP**: `@McpTool` → JSON schema → STDIO
 - Only the server ships; JDI lives in `jdk.jdi`

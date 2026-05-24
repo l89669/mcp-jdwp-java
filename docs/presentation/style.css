@@ -45,6 +45,14 @@
 .reveal section.vs-table td:nth-child(3) {
 	width: 50%;
 }
+.reveal section.vs-table tbody tr:nth-child(even) td {
+	background: rgba(255, 255, 255, 0.035);
+}
+.reveal section.vs-table th {
+	color: #bd93f9;
+	font-weight: 600;
+	letter-spacing: 0.02em;
+}
 
 /* ---- code blocks ---- */
 .reveal pre {
@@ -107,10 +115,36 @@
 .reveal section.scenarios-slide .cols pre code {
 	font-size: 1.2em;
 }
+/* scenarios slide: each column reads as a "card" — clearer visual grouping */
+.reveal section.scenarios-slide .cols > div {
+	padding: 0.6em 0.9em 0.4em;
+	border-radius: 0.5em;
+	background: rgba(126, 198, 255, 0.05);
+	border: 1px solid rgba(126, 198, 255, 0.18);
+}
+.reveal section.scenarios-slide .cols > div h3 {
+	border-bottom: 1px solid rgba(126, 198, 255, 0.22);
+	padding-bottom: 0.25em;
+	margin-bottom: 0.4em;
+}
 
 /* ---- title slide flourish ---- */
-.reveal .title-slide h1 { font-size: 2.6em; line-height: 1.05; }
-.reveal .title-slide h2 { color: #7ec6ff; font-size: 1.2em; opacity: 0.9; }
+.reveal .title-slide h1 {
+	font-size: 2.6em;
+	line-height: 1.05;
+	text-shadow: 0 2px 18px rgba(0, 0, 0, 0.55);
+}
+.reveal .title-slide h2 {
+	color: #bd93f9;
+	font-size: 1.35em;
+	opacity: 0.95;
+	letter-spacing: 0.02em;
+	margin-top: 0.1em;
+	text-shadow: 0 2px 14px rgba(0, 0, 0, 0.5);
+}
+.reveal .title-slide small {
+	text-shadow: 0 1px 8px rgba(0, 0, 0, 0.6);
+}
 
 /* ---- diagrams: keep images tidy and centered ---- */
 .reveal img.diagram {
@@ -126,8 +160,8 @@
 	max-height: 50vh;
 }
 .reveal img.diagram-compact {
-	max-width: 50%;
-	max-height: 290px;
+	max-width: 68%;
+	max-height: 420px;
 }
 
 /* ---- install slide: bigger code, smaller inline-code so it stays on one line ---- */
@@ -141,10 +175,92 @@
 	font-size: 0.8em;
 }
 
+/* ---- outro slide (#9 "Try the full gauntlet"): oversize the call-to-action
+       code ~2x so it reads from the back row. Wrap rather than overflow the
+       long marketplace URL. ---- */
+.reveal section.outro-slide pre code {
+	font-size: 1.24em;
+	white-space: pre-wrap;
+	overflow-wrap: break-word;
+}
+
+/* ---- contact card (outro): the links closed in a labelled box ---- */
+.reveal .contact-card {
+	display: inline-block;
+	margin: 0.2em auto 0;
+	padding: 0.5em 1.2em;
+	border: 1px solid rgba(126, 198, 255, 0.35);
+	border-radius: 0.6em;
+	background: rgba(126, 198, 255, 0.08);
+	font-size: 0.55em;
+	line-height: 1.5;
+}
+.reveal .contact-card .contact-lead {
+	display: block;
+	font-size: 0.85em;
+	text-transform: uppercase;
+	letter-spacing: 0.08em;
+	opacity: 0.65;
+	margin-bottom: 0.25em;
+}
+
 /* ---- dense-table: for overview slides with many rows ---- */
-.reveal .dense-table h2 { font-size: 1.1em; margin-bottom: 0.2em; }
+.reveal .dense-table h2,
+.reveal .dense-table h3 { font-size: 1.1em; margin-bottom: 0.2em; }
 .reveal .dense-table > p { font-size: 0.75em; margin: 0.2em 0; }
-.reveal .dense-table table { font-size: 0.48em; margin: 0.2em auto; }
+.reveal .dense-table table { font-size: 0.55em; margin: 0.2em auto; }
 .reveal .dense-table table th,
-.reveal .dense-table table td { padding: 0.12em 0.6em; }
+.reveal .dense-table table td { padding: 0.18em 0.7em; }
+.reveal .dense-table tbody tr:nth-child(even) td {
+	background: rgba(255, 255, 255, 0.035);
+}
+.reveal .dense-table table th {
+	color: #bd93f9;
+	font-weight: 600;
+}
 .reveal .dense-table small { font-size: 0.5em; }
+
+/* ---- chip grid: capability tags arranged in a flowed row ---- */
+.reveal .chips {
+	display: flex;
+	flex-wrap: wrap;
+	justify-content: center;
+	gap: 0.4em 0.45em;
+	margin: 0.5em auto 0.2em;
+	max-width: 92%;
+	font-size: 0.82em;
+}
+.reveal .chips .chip {
+	display: inline-block;
+	padding: 0.18em 0.75em;
+	border-radius: 1em;
+	background: rgba(126, 198, 255, 0.10);
+	color: #d9e6f5;
+	border: 1px solid rgba(126, 198, 255, 0.35);
+	line-height: 1.3;
+	white-space: nowrap;
+}
+.reveal .chips .chip.accent {
+	background: rgba(189, 147, 249, 0.16);
+	color: #e2cfff;
+	border-color: rgba(189, 147, 249, 0.5);
+}
+
+/* ---- hub slide (07 use-cases first slide): more breathing room for headline bullets ---- */
+.reveal section.hub-slide ul { margin-top: 0.6em; }
+.reveal section.hub-slide li { margin: 0.45em 0; }
+.reveal section.hub-slide li strong { color: #bd93f9; }
+
+/* ---- pull-quote: emphasized closing line ---- */
+.reveal .pull-quote {
+	display: block;
+	margin: 0.6em auto 0;
+	padding: 0.45em 1em;
+	max-width: 90%;
+	border-left: 3px solid rgba(189, 147, 249, 0.6);
+	background: rgba(189, 147, 249, 0.06);
+	font-style: italic;
+	color: #e2cfff;
+	font-size: 0.95em;
+	line-height: 1.4;
+}
