@@ -3,6 +3,7 @@ package one.edee.mcp.jdwp.evaluation;
 import com.sun.jdi.*;
 import one.edee.mcp.jdwp.EvaluationGuard;
 import one.edee.mcp.jdwp.JDIConnectionService;
+import one.edee.mcp.jdwp.evaluation.exceptions.JdiClassDefinitionException;
 import one.edee.mcp.jdwp.evaluation.exceptions.JdiEvaluationException;
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
@@ -480,8 +481,10 @@ public class JdiExpressionEvaluator {
     /**
      * Depth-first search of {@code type}'s superinterface graph for an interface the wrapper class
      * can reference (public, or non-public but sharing {@code wrapperPackage}). Returns {@code null}
-     * when none is reachable, so the caller falls back to {@code java.lang.Object}. The
-     * {@code visited} set guards against the diamond inheritance interfaces routinely exhibit.
+     * when none is reachable, so the caller falls back to {@code java.lang.Object}. Interface
+     * inheritance is acyclic, so the walk terminates regardless; the {@code visited} set just
+     * avoids re-expanding a shared parent in the diamonds interfaces routinely exhibit (and stays
+     * safe against pathological/cyclic input).
      */
     @Nullable
     private static InterfaceType findReachableInterface(InterfaceType type, String wrapperPackage, Set<String> visited) {
@@ -595,6 +598,16 @@ public class JdiExpressionEvaluator {
      * </ul>
      * Local and anonymous classes ({@code $<digit>}) must be filtered upstream; this method
      * does not reject them because the same conversion is occasionally useful for diagnostics.
+     *
+     * <p><b>Known limitation:</b> a {@code $} embedded between identifier characters is treated as a
+     * nesting separator even for a <em>top-level</em> type whose simple name genuinely contains
+     * {@code $} (e.g. {@code class Foo$Bar {}}), so {@code Foo$Bar} is rendered as {@code Foo.Bar}
+     * and the wrapper fails to compile for that type. A binary name alone cannot distinguish the two
+     * cases — {@code Outer$Inner} (a member type) and a top-level {@code Foo$Bar} are identical
+     * strings — and disambiguating would require a per-type VM round-trip (or compile-then-fallback)
+     * disproportionate to the risk: JLS §3.8 reserves {@code $} for "mechanically generated source
+     * code", so such top-level names do not occur in normal application code. Accepted as a
+     * limitation rather than guarded.
      */
     private static String toSourceTypeName(String binaryName) {
         if (binaryName.indexOf('$') < 0 || binaryName.contains("$$")) {
@@ -781,104 +794,22 @@ public class JdiExpressionEvaluator {
             final ObjectReference thisObject = frame.thisObject();
             final String wrapperPackage = resolveWrapperPackage(thisObject);
 
-            // 1. Analyze the frame to build the evaluation context
-            final EvaluationContext context = buildContext(frame, extraBindings, wrapperPackage);
-
-            // Auto-rewrite bare references to fields of `this` so users can write
-            // `sessions.containsKey(session)` instead of `_this.sessions.containsKey(session)`.
-            // Each candidate field is filtered for accessibility from the wrapper class:
-            //  - When the wrapper lives in the default isolated package, only public fields on a
-            //    public declaring type are reachable.
-            //  - When the wrapper lives in `this`'s own package, public/protected/package-private
-            //    fields are reachable PROVIDED the field's declaring type ALSO lives in that
-            //    package. A protected field inherited from a class in some other package is not
-            //    accessible from a non-subclass even when `this`'s runtime type is in the wrapper
-            //    package — so we'd produce a misleading "not visible" error if we rewrote it.
-            //  - Private fields are never rewritten.
-            if (thisObject != null && thisObject.referenceType() instanceof ClassType thisClass) {
-                final boolean sharingPackage = !wrapperPackage.equals(DEFAULT_EVALUATION_PACKAGE)
-                    && wrapperPackage.equals(packageOf(thisClass.name()));
-                if (thisClass.isPublic() || sharingPackage) {
-                    final Set<String> shadowingLocals = context.getVariables().stream()
-                        .map(v -> v.name)
-                        .collect(Collectors.toSet());
-                    final Set<String> rewritableFieldNames = thisClass.allFields().stream()
-                        .filter(f -> isFieldAccessibleFromWrapper(f, wrapperPackage, sharingPackage))
-                        .map(Field::name)
-                        .collect(Collectors.toSet());
-                    expression = rewriteThisFieldReferences(expression, rewritableFieldNames, shadowingLocals);
+            try {
+                return evaluateInPackage(frame, expression, extraBindings, wrapperPackage, startTime);
+            } catch (JdiClassDefinitionException defineFailure) {
+                // The wrapper could not be DEFINED into the chosen package — a sealed package, module
+                // strong-encapsulation, or a restrictive custom classloader can reject defineClass for
+                // an application package while still accepting the isolated default package. The user
+                // expression never ran (the failure is in the define phase, before invoke), so it is
+                // safe to retry once in the default package. This preserves the pre-target-package
+                // behaviour for public-only expressions instead of regressing them to a hard failure.
+                if (wrapperPackage.equals(DEFAULT_EVALUATION_PACKAGE)) {
+                    throw defineFailure;
                 }
+                log.warn("[Evaluator] Defining wrapper into package '{}' failed ({}); retrying in default package '{}'",
+                    wrapperPackage, defineFailure.getMessage(), DEFAULT_EVALUATION_PACKAGE);
+                return evaluateInPackage(frame, expression, extraBindings, DEFAULT_EVALUATION_PACKAGE, startTime);
             }
-
-            // 2. Use cache key based on context + expression (excludes UUID for cache hits)
-            final String cacheKey = context.getSignature() + "###" + expression;
-
-            // Full-flush eviction is deliberate: LRU bookkeeping isn't worth it for a cache whose
-            // miss cost (compile + cache) is already orders of magnitude larger than just rebuilding
-            // the few entries that get hot again.
-            if (compilationCache.size() >= MAX_CACHE_SIZE) {
-                log.info("[Evaluator] Compilation cache reached {} entries, clearing", compilationCache.size());
-                compilationCache.clear();
-            }
-
-            final CachedCompilation cached = compilationCache.get(cacheKey);
-
-            final String className;
-            byte[] bytecode;
-
-            if (cached != null) {
-                // Cache hit — reuse previously compiled class name and bytecode
-                className = cached.className;
-                bytecode = cached.bytecode;
-            } else {
-                // Cache miss — generate unique class name, compile, and cache
-                final String uniqueId = UUID.randomUUID().toString().replace("-", "");
-                className = wrapperPackage + '.' + EVALUATION_CLASS_PREFIX + uniqueId;
-
-                final String sourceCode = generateSourceCode(className, context, expression);
-
-                final Map<String, byte[]> compiledCode = compiler.compile(className, sourceCode);
-
-                bytecode = compiledCode.get(className);
-                if (bytecode == null) {
-                    // Some compilers key by binary name with slashes, simple name, or with leading slashes —
-                    // fall back to a suffix match on the simple class name.
-                    final String simpleName = className.substring(className.lastIndexOf('.') + 1);
-                    for (Map.Entry<String, byte[]> entry : compiledCode.entrySet()) {
-                        final String key = entry.getKey();
-                        String keyTail = key.substring(key.lastIndexOf('/') + 1).replace(".class", "");
-                        keyTail = keyTail.substring(keyTail.lastIndexOf('.') + 1);
-                        if (keyTail.equals(simpleName)) {
-                            bytecode = entry.getValue();
-                            log.debug("[Evaluator] Bytecode found via fallback key '{}' for class '{}'", key, className);
-                            break;
-                        }
-                    }
-                }
-                if (bytecode == null) {
-                    throw new JdiEvaluationException("Could not find compiled bytecode for class " + className
-                        + " (available keys: " + compiledCode.keySet() + ')');
-                }
-
-                compilationCache.put(cacheKey, new CachedCompilation(className, bytecode));
-            }
-
-            // 3. Find a suitable class loader in the target VM
-            final ClassLoaderReference classLoader = findClassLoader(frame);
-
-            // 4. Execute the code remotely
-            final Value value = RemoteCodeExecutor.execute(
-                frame.virtualMachine(),
-                frame.thread(),
-                classLoader,
-                className,
-                bytecode,
-                EVALUATION_METHOD_NAME,
-                context.getValues()
-            );
-            log.info("[Evaluator] Expression evaluated in {}ms (cache {})",
-                System.currentTimeMillis() - startTime, cached != null ? "hit" : "miss");
-            return value;
         } catch (Exception e) {
             log.warn("[Evaluator] Expression evaluation failed after {}ms: {}",
                 System.currentTimeMillis() - startTime, e.getMessage());
@@ -890,6 +821,125 @@ public class JdiExpressionEvaluator {
         } finally {
             evaluationGuard.exit(guardedThreadId);
         }
+    }
+
+    /**
+     * Builds the evaluation context, compiles (or reuses a cached) wrapper class living in
+     * {@code wrapperPackage}, defines it into the target VM, and invokes it. Factored out of
+     * {@link #evaluate} so that method can retry in {@link #DEFAULT_EVALUATION_PACKAGE} when a
+     * non-default package is rejected at define time — see {@link JdiClassDefinitionException}.
+     * <p>
+     * The {@code this.field} rewrite is performed here (not in the caller) because which fields are
+     * reachable from the wrapper depends on {@code wrapperPackage}; a retry in a different package
+     * must redo it from the original expression. {@code expression} is the local parameter, so the
+     * reassignment never leaks back to {@link #evaluate}.
+     */
+    private @Nullable Value evaluateInPackage(StackFrame frame, String expression,
+                                              Map<String, Value> extraBindings, String wrapperPackage,
+                                              long startTime)
+        throws JdiEvaluationException, AbsentInformationException {
+        // 1. Analyze the frame to build the evaluation context
+        final EvaluationContext context = buildContext(frame, extraBindings, wrapperPackage);
+
+        // Auto-rewrite bare references to fields of `this` so users can write
+        // `sessions.containsKey(session)` instead of `_this.sessions.containsKey(session)`.
+        // Each candidate field is filtered for accessibility from the wrapper class:
+        //  - When the wrapper lives in the default isolated package, only public fields on a
+        //    public declaring type are reachable.
+        //  - When the wrapper lives in `this`'s own package, public/protected/package-private
+        //    fields are reachable PROVIDED the field's declaring type ALSO lives in that
+        //    package. A protected field inherited from a class in some other package is not
+        //    accessible from a non-subclass even when `this`'s runtime type is in the wrapper
+        //    package — so we'd produce a misleading "not visible" error if we rewrote it.
+        //  - Private fields are never rewritten.
+        final ObjectReference thisObject = frame.thisObject();
+        if (thisObject != null && thisObject.referenceType() instanceof ClassType thisClass) {
+            final boolean sharingPackage = !wrapperPackage.equals(DEFAULT_EVALUATION_PACKAGE)
+                && wrapperPackage.equals(packageOf(thisClass.name()));
+            if (thisClass.isPublic() || sharingPackage) {
+                final Set<String> shadowingLocals = context.getVariables().stream()
+                    .map(v -> v.name)
+                    .collect(Collectors.toSet());
+                final Set<String> rewritableFieldNames = thisClass.allFields().stream()
+                    .filter(f -> isFieldAccessibleFromWrapper(f, wrapperPackage, sharingPackage))
+                    .map(Field::name)
+                    .collect(Collectors.toSet());
+                expression = rewriteThisFieldReferences(expression, rewritableFieldNames, shadowingLocals);
+            }
+        }
+
+        // 2. Cache key includes the wrapper package: the same (signature, expression) may be
+        //    compiled into two different packages (e.g. after a define-time fallback), and the
+        //    cached className + bytecode are package-specific.
+        final String cacheKey = wrapperPackage + "###" + context.getSignature() + "###" + expression;
+
+        // Full-flush eviction is deliberate: LRU bookkeeping isn't worth it for a cache whose
+        // miss cost (compile + cache) is already orders of magnitude larger than just rebuilding
+        // the few entries that get hot again.
+        if (compilationCache.size() >= MAX_CACHE_SIZE) {
+            log.info("[Evaluator] Compilation cache reached {} entries, clearing", compilationCache.size());
+            compilationCache.clear();
+        }
+
+        final CachedCompilation cached = compilationCache.get(cacheKey);
+
+        final String className;
+        byte[] bytecode;
+
+        if (cached != null) {
+            // Cache hit — reuse previously compiled class name and bytecode
+            className = cached.className;
+            bytecode = cached.bytecode;
+        } else {
+            // Cache miss — generate unique class name, compile, and cache
+            final String uniqueId = UUID.randomUUID().toString().replace("-", "");
+            className = wrapperPackage + '.' + EVALUATION_CLASS_PREFIX + uniqueId;
+
+            final String sourceCode = generateSourceCode(className, context, expression);
+
+            final Map<String, byte[]> compiledCode = compiler.compile(className, sourceCode);
+
+            bytecode = compiledCode.get(className);
+            if (bytecode == null) {
+                // Some compilers key by binary name with slashes, simple name, or with leading slashes —
+                // fall back to a suffix match on the simple class name.
+                final String simpleName = className.substring(className.lastIndexOf('.') + 1);
+                for (Map.Entry<String, byte[]> entry : compiledCode.entrySet()) {
+                    final String key = entry.getKey();
+                    String keyTail = key.substring(key.lastIndexOf('/') + 1).replace(".class", "");
+                    keyTail = keyTail.substring(keyTail.lastIndexOf('.') + 1);
+                    if (keyTail.equals(simpleName)) {
+                        bytecode = entry.getValue();
+                        log.debug("[Evaluator] Bytecode found via fallback key '{}' for class '{}'", key, className);
+                        break;
+                    }
+                }
+            }
+            if (bytecode == null) {
+                throw new JdiEvaluationException("Could not find compiled bytecode for class " + className
+                    + " (available keys: " + compiledCode.keySet() + ')');
+            }
+
+            compilationCache.put(cacheKey, new CachedCompilation(className, bytecode));
+        }
+
+        // 3. Find a suitable class loader in the target VM
+        final ClassLoaderReference classLoader = findClassLoader(frame);
+
+        // 4. Execute the code remotely. A define-phase rejection surfaces as
+        //    JdiClassDefinitionException, which the caller may catch to retry in the default package.
+        final Value value = RemoteCodeExecutor.execute(
+            frame.virtualMachine(),
+            frame.thread(),
+            classLoader,
+            className,
+            bytecode,
+            EVALUATION_METHOD_NAME,
+            context.getValues()
+        );
+        log.info("[Evaluator] Expression evaluated in {}ms (cache {})",
+            System.currentTimeMillis() - startTime, cached != null ? "hit" : "miss");
+        return value;
     }
 
     /**

@@ -315,14 +315,16 @@ class JdiExpressionEvaluatorGetDeclaredTypeTest {
 		}
 
 		@Test
-		@DisplayName("diamond superinterface graph — visited-guard prevents infinite recursion")
+		@DisplayName("diamond superinterface graph — visited-guard avoids re-expanding the shared parent")
 		void shouldTerminateOnDiamondInheritance() throws Exception {
 			InterfaceType pub = mock(InterfaceType.class);
 			when(pub.name()).thenReturn("com.example.Root");
 			when(pub.isPublic()).thenReturn(true);
 
 			// Two non-public mid-level interfaces both extend the same public Root (a diamond when
-			// a leaf extends both). The visited set must stop Root being re-expanded endlessly.
+			// a leaf extends both). Interface inheritance is acyclic, so the walk terminates even
+			// without the visited set; the set's job here is to avoid re-expanding the shared Root
+			// twice (and to stay safe against pathological/cyclic inputs).
 			InterfaceType left = mock(InterfaceType.class);
 			when(left.name()).thenReturn("com.elsewhere.Left");
 			when(left.isPublic()).thenReturn(false);
