@@ -116,11 +116,15 @@ class JDWPToolsResumeUntilEventVmDeathTest {
 
 	/**
 	 * Defensive branch: latch fires but {@link BreakpointTracker#getLastBreakpoint()} returns
-	 * {@code null} (listener never recorded a snapshot — should not happen in production but is
-	 * covered for safety).
+	 * {@code null} with a non-VM_DEATH tail. In practice this only happens when a concurrent
+	 * {@code jdwp_reset} / {@code jdwp_disconnect} (or a listener teardown) tripped the latch to
+	 * free the waiter and then nulled the snapshot — so the response must be an actionable
+	 * {@code [NO_EVENT]} message pointing at recovery, not the old "this should not happen" dead
+	 * end. Re-waiting here would be wrong: the awaited breakpoint no longer exists, so it would
+	 * only burn the remaining deadline.
 	 */
 	@Test
-	@DisplayName("returns synthetic message when latch fired but no breakpoint snapshot")
+	@DisplayName("returns actionable [NO_EVENT] when latch fired but no breakpoint snapshot")
 	void shouldReturnSyntheticMessageWhenLatchFiredButHistoryIsEmpty() throws Exception {
 		final VirtualMachine vm = mock(VirtualMachine.class);
 		when(jdiService.getVM()).thenReturn(vm);
@@ -133,7 +137,9 @@ class JDWPToolsResumeUntilEventVmDeathTest {
 
 		final String result = tools.jdwp_resume_until_event(1_000);
 
-		assertThat(result).contains("Event fired but no breakpoint thread recorded");
+		assertThat(result).startsWith("[NO_EVENT]");
+		assertThat(result).contains("jdwp_reset");
+		assertThat(result).contains("jdwp_resume_until_event");
 	}
 
 	/**

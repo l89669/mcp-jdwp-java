@@ -1049,7 +1049,18 @@ public class JDWPTools {
             }
 
             if (snapshot == null) {
-                return "Event fired but no breakpoint thread recorded (this should not happen — check the listener logs).";
+                // The wait was released but no suspending snapshot exists and the tail is not
+                // VM_DEATH. This is not a real stop: in practice the latch was tripped by a state
+                // change rather than a debug event — a concurrent jdwp_reset / jdwp_disconnect
+                // (both fire the latch to free waiters, then null the snapshot) or a listener
+                // teardown. The session no longer has the breakpoint that was being awaited, so
+                // re-waiting here would just burn the deadline; surface an actionable next step
+                // instead of the old "this should not happen" dead end.
+                return "[NO_EVENT] The wait was released without a suspending event and no breakpoint context is "
+                    + "available. This usually means the debug session was cleared concurrently "
+                    + "(jdwp_reset / jdwp_disconnect) or the event listener was torn down. Re-check state with "
+                    + "jdwp_overview (or jdwp_diagnose if the connection looks wrong), re-set your breakpoints, "
+                    + "then call jdwp_resume_until_event again.";
             }
             final ThreadReference thread = snapshot.thread();
             // P3-1: append source location to the happy path. The previous "Event fired. Thread: …"
