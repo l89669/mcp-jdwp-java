@@ -376,10 +376,24 @@ public class JdiExpressionEvaluator {
 
     /**
      * Generates a wrapper class with a static `evaluate()` method that accepts the context
-     * variables as parameters and returns the result of the user expression. The user expression
-     * is wrapped in `(Object)(...)` so any value type — including primitives via autoboxing —
-     * can be returned. The bare `this` keyword in the expression is tokenizer-rewritten to `_this`
-     * because the wrapper class doesn't have a `this` reference (it's a static method).
+     * variables as parameters and returns the result of the user input.
+     *
+     * <p>Two input modes, picked by {@link #isBlockMode}:
+     * <ul>
+     *   <li><b>Expression mode (default).</b> The input is treated as a single Java expression and
+     *       wrapped as {@code return (Object) (<expr>);} so any value type — including primitives
+     *       via autoboxing — flows back as the method's return value.</li>
+     *   <li><b>Block mode.</b> The trimmed input starts with '{' and ends with the matching '}';
+     *       the inside is spliced into the method body verbatim, guarded by a runtime-only branch
+     *       so that the trailing fallthrough {@code return null;} stays reachable even when the
+     *       user body ends with an explicit {@code return X;}. The user is responsible for writing
+     *       {@code return X;} statements to yield a value — block mode supports {@code try/catch},
+     *       intermediate locals, early {@code return}, and other statement-level constructs that
+     *       the single-expression mode could not express.</li>
+     * </ul>
+     *
+     * <p>In both modes, the bare {@code this} keyword is tokenizer-rewritten to {@code _this}
+     * because the wrapper is a static method.
      *
      * <p>The package portion of {@code className} drives the wrapper's {@code package} declaration.
      * When the caller routes a non-public {@code this} type into its own package via
@@ -400,15 +414,145 @@ public class JdiExpressionEvaluator {
         // literals are NOT rewritten — see {@link #rewriteThisKeyword(String)}.
         final String safeExpression = rewriteThisKeyword(expression);
 
+        final String methodBody;
+        if (isBlockMode(safeExpression)) {
+            // Extract the body inside the outermost braces — already balanced because
+            // isBlockMode verified the structure (start with `{`, balanced end with `}`,
+            // string/char/text-block/comment regions skipped).
+            //
+            // The user body is wrapped in `if (__mcpFallthroughGuard) { ... }` where the guard
+            // is a non-final local set to true. The compiler can't treat it as a compile-time
+            // constant (JLS §15.29 — only `final` variables initialised with constant
+            // expressions qualify), so it does NOT prove the post-if `return null;` unreachable.
+            // That keeps the wrapper compiling whether or not the user's body ends with an
+            // explicit `return X;`. At runtime the guard is always true → user body always runs;
+            // `return null;` is the safety net for blocks that fall through without returning.
+            final String trimmed = safeExpression.trim();
+            final String userBody = trimmed.substring(1, trimmed.length() - 1);
+            methodBody =
+                "        // User block:\n" +
+                "        boolean __mcpFallthroughGuard = true;\n" +
+                "        if (__mcpFallthroughGuard) {\n" +
+                userBody + '\n' +
+                "        }\n" +
+                "        // Fallthrough guard — only reached when the user's block doesn't return.\n" +
+                "        return null;\n";
+        } else {
+            methodBody =
+                "        // User expression:\n" +
+                "        return (Object) (" + safeExpression + ");\n";
+        }
+
         final String packageDecl = packageName.isEmpty() ? "" : "package " + packageName + ";\n\n";
         return packageDecl +
             "// Automatically generated class for JDI expression evaluation\n" +
             "public class " + simpleClassName + " {\n" +
             "    public static Object " + EVALUATION_METHOD_NAME + '(' + methodParameters + ") {\n" +
-            "        // User expression:\n" +
-            "        return (Object) (" + safeExpression + ");\n" +
+            methodBody +
             "    }\n" +
             "}\n";
+    }
+
+    /**
+     * Returns {@code true} when the user input is in block mode — i.e. its trimmed form starts
+     * with '{' and ends with the matching '}'. Tokenizer-aware: braces inside string / char /
+     * text-block literals and inside line ({@code //…}) or block ({@code /*…*}{@code /}) comments
+     * are ignored, so inputs like {@code "{x}".length()} (a method call on a string literal that
+     * happens to start with '{') stay in expression mode, and a comment containing '}' inside an
+     * otherwise-block input does not prematurely close the outer block.
+     *
+     * <p>Static + package-private so it can be unit-tested without a real {@link StackFrame}.
+     */
+    static boolean isBlockMode(String expression) {
+        final String trimmed = expression.trim();
+        if (trimmed.length() < 2 || trimmed.charAt(0) != '{' || trimmed.charAt(trimmed.length() - 1) != '}') {
+            return false;
+        }
+        // Walk the inside and confirm brace balance returns to zero at exactly the closing `}`.
+        // Tokenizer-aware so braces inside string / char / text-block literals and Java comments
+        // are ignored.
+        final int n = trimmed.length() - 1;
+        int depth = 1;
+        int i = 1;
+        while (i < n) {
+            final char c = trimmed.charAt(i);
+            if (c == '"') {
+                i = skipStringLiteral(trimmed, i);
+                continue;
+            }
+            if (c == '\'') {
+                i = skipCharLiteral(trimmed, i);
+                continue;
+            }
+            if (c == '/' && i + 1 < n) {
+                final char next = trimmed.charAt(i + 1);
+                if (next == '/') {
+                    i = skipLineComment(trimmed, i);
+                    // A line comment that runs to end-of-string would have swallowed the
+                    // trailing `}` (no newline before it) — there is no real closer, so the
+                    // input is not block-mode.
+                    if (i > n) {
+                        return false;
+                    }
+                    continue;
+                }
+                if (next == '*') {
+                    i = skipBlockComment(trimmed, i);
+                    // Unterminated block comment swallows the trailing `}` too. Same rationale.
+                    if (i > n) {
+                        return false;
+                    }
+                    continue;
+                }
+            }
+            if (c == '{') {
+                depth++;
+            } else if (c == '}') {
+                depth--;
+                if (depth == 0) {
+                    // Hit a top-level `}` before the trailing one — input is something like
+                    // `{stmt;} + foo` so the trailing `}` of the trimmed form is a different
+                    // closer and block-mode does not apply.
+                    return false;
+                }
+            }
+            i++;
+        }
+        // Trailing `}` at index n closes the outer brace.
+        return depth == 1;
+    }
+
+    /**
+     * Returns the index just past the end of a {@code //…} line comment that starts at
+     * {@code start}. Terminator is the next newline; if no newline is found, returns the end of
+     * the string (best-effort tolerance — never throws).
+     */
+    private static int skipLineComment(String s, int start) {
+        final int n = s.length();
+        int i = start + 2;
+        while (i < n && s.charAt(i) != '\n') {
+            i++;
+        }
+        // Caller resumes scanning AT the newline (or end). The newline itself is not part of the
+        // comment, so we don't advance past it here.
+        return i;
+    }
+
+    /**
+     * Returns the index just past the end of a {@code /*…*}{@code /} block comment that starts at
+     * {@code start}. If the closing {@code *}{@code /} is missing, returns the end of the string
+     * (best-effort tolerance — never throws).
+     */
+    private static int skipBlockComment(String s, int start) {
+        final int n = s.length();
+        int i = start + 2;
+        while (i + 1 < n) {
+            if (s.charAt(i) == '*' && s.charAt(i + 1) == '/') {
+                return i + 2;
+            }
+            i++;
+        }
+        return n;
     }
 
     /**
@@ -759,7 +903,9 @@ public class JdiExpressionEvaluator {
      * In the latter case package-private and protected fields also become candidates — subject to
      * {@link #isFieldAccessibleFromWrapper}'s per-field accessibility check. (Explicit {@code this}
      * and {@code this.field} are handled separately and unconditionally by
-     * {@link #rewriteThisKeyword}.)
+     * {@link #rewriteThisKeyword}.) The bare-identifier rewrite is SKIPPED entirely in block mode
+     * (see {@link #isBlockMode}), where a statement body may declare locals the identifier-level
+     * rewriter would mistake for field references.
      *
      * <p>Synthetic bindings (e.g. {@code "$exception" -> ObjectReference}) appear in the wrapper's
      * parameter list after the real locals and can be referenced by name in the expression. This is
@@ -853,6 +999,12 @@ public class JdiExpressionEvaluator {
 
         // Auto-rewrite bare references to fields of `this` so users can write
         // `sessions.containsKey(session)` instead of `_this.sessions.containsKey(session)`.
+        // SKIPPED in block mode — the rewriter is identifier-level and cannot distinguish
+        // a field reference from a local-variable declaration. Rewriting a statement-body
+        // input like `int count = 1; ...` would corrupt the declaration into
+        // `int _this.count = 1; ...`. Block-mode users are expected to use explicit
+        // `this.field` / `_this.field` references (the keyword rewrite in `generateSourceCode`
+        // still handles `this.field` → `_this.field`).
         // Each candidate field is filtered for accessibility from the wrapper class:
         //  - When the wrapper lives in the default isolated package, only public fields on a
         //    public declaring type are reachable.
@@ -863,7 +1015,8 @@ public class JdiExpressionEvaluator {
         //    package — so we'd produce a misleading "not visible" error if we rewrote it.
         //  - Private fields are never rewritten.
         final ObjectReference thisObject = frame.thisObject();
-        if (thisObject != null && thisObject.referenceType() instanceof ClassType thisClass) {
+        if (!isBlockMode(expression)
+            && thisObject != null && thisObject.referenceType() instanceof ClassType thisClass) {
             final boolean sharingPackage = !wrapperPackage.equals(DEFAULT_EVALUATION_PACKAGE)
                 && wrapperPackage.equals(packageOf(thisClass.name()));
             if (thisClass.isPublic() || sharingPackage) {

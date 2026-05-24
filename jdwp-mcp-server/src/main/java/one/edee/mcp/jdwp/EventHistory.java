@@ -10,20 +10,26 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentLinkedDeque;
 
 /**
- * Bounded ring buffer of debug events captured from the JDI event queue. Records every interesting
- * event for post-mortem inspection via the `jdwp_get_events` tool.
+ * Bounded ring buffer of debug events for post-mortem inspection via the `jdwp_get_events` tool.
+ * Most events originate from the JDI event queue drained by {@link JdiEventListener}, but it is NOT
+ * the sole producer: synchronous install-time diagnostics are recorded from MCP worker threads too
+ * (e.g. {@code BP_MULTI_LOCATION} from {@link JDWPTools}, {@code RECONNECT} from
+ * {@link JDIConnectionService}).
  * <p>
  * Behaviour:
  * - FIFO ring buffer with a fixed cap of {@link #MAX_EVENTS} entries; oldest entries are dropped first.
- * - Thread-safe via {@link ConcurrentLinkedDeque}; the producer ({@link JdiEventListener}) and consumers
- * (MCP tool calls on worker threads) never block each other.
+ * - Thread-safe via {@link ConcurrentLinkedDeque}: the listener thread and the MCP worker threads may
+ * record concurrently, and concurrent readers never block writers. Because there are multiple
+ * producers, no global ordering is guaranteed beyond each individual {@code record} call.
  * - Cleared on `jdwp_reset`, `jdwp_clear_events`, and {@link JDIConnectionService#cleanupSessionState}.
  * <p>
- * Documented event type strings: `BREAKPOINT`, `STEP`, `EXCEPTION`, `EXCEPTION_LOG`,
- * `EXCEPTION_LOG_ERROR`, `LOGPOINT`, `LOGPOINT_ERROR`, `FIELD_ACCESS`, `FIELD_MODIFICATION`,
- * `FIELD_LOGPOINT`, `FIELD_LOGPOINT_ERROR`, `BREAKPOINT_SUPPRESSED`, `EXCEPTION_SUPPRESSED`,
- * `FIELD_BREAKPOINT_SUPPRESSED`, `CHAIN_ARMED`, `CHAIN_DISARMED`, `CHAIN_BROKEN`, `VM_START`,
- * `VM_DEATH`. These are the keys clients can grep on or filter by.
+ * Documented event type strings (exhaustive for production code — keep in sync; tests may record
+ * ad-hoc types that are intentionally not listed here): `BREAKPOINT`, `BREAKPOINT_SUPPRESSED`, `STEP`, `STEP_SUPPRESSED`,
+ * `EXCEPTION`, `EXCEPTION_SUPPRESSED`, `EXCEPTION_LOG`, `EXCEPTION_LOG_ERROR`, `LOGPOINT`,
+ * `LOGPOINT_ERROR`, `FIELD_ACCESS`, `FIELD_MODIFICATION`, `FIELD_BREAKPOINT_SUPPRESSED`,
+ * `FIELD_LOGPOINT`, `FIELD_LOGPOINT_ERROR`, `CHAIN_ARMED`, `CHAIN_DISARMED`, `CHAIN_BROKEN`,
+ * `CLASS_PREPARE`, `BP_MULTI_LOCATION`, `BP_PROMOTION_FAILED`, `RECONNECT`, `VM_START`, `VM_DEATH`.
+ * These are the keys clients can grep on or filter by.
  */
 @Service
 public class EventHistory {
@@ -36,7 +42,10 @@ public class EventHistory {
 
     /**
      * Appends an event and evicts the oldest entries until the buffer is at or below {@link #MAX_EVENTS}.
-     * Called exclusively from {@link JdiEventListener} on the JDI event listener thread; non-blocking.
+     * Non-blocking, and safe to call from any thread: most records come from the JDI event listener
+     * thread ({@link JdiEventListener}), but MCP worker threads also record install-time diagnostics
+     * (e.g. {@code BP_MULTI_LOCATION}, {@code RECONNECT}). The backing {@link ConcurrentLinkedDeque}
+     * tolerates these concurrent producers.
      */
     public void record(DebugEvent event) {
         events.addLast(event);

@@ -323,6 +323,152 @@ class JdiEventListenerClassPrepareTest {
 		assertThat(pending.getFailureReason()).contains("ERM rejected the exception request");
 	}
 
+	// ── Diagnostic event emissions (CLASS_PREPARE, BP_MULTI_LOCATION) ────────
+
+	@Test
+	@DisplayName("CLASS_PREPARE event recorded in EventHistory when a CPE activates pending items")
+	void shouldRecordClassPrepareEventInHistory() throws Exception {
+		ReferenceType refType = mock(ReferenceType.class);
+		Location loc = mock(Location.class);
+		when(refType.name()).thenReturn("com.example.Foo");
+		when(refType.locationsOfLine(42)).thenReturn(List.of(loc));
+
+		BreakpointRequest createdBp = mock(BreakpointRequest.class);
+		EventRequestManager erm = mock(EventRequestManager.class);
+		when(erm.createBreakpointRequest(loc)).thenReturn(createdBp);
+
+		tracker.registerPendingBreakpoint("com.example.Foo", 42, 2, "ALL");
+
+		ClassPrepareEvent event = mockClassPrepareEvent(refType, erm);
+		runListenerWith(listener, mockEventSet(event));
+
+		assertThat(eventHistory.getRecent(10))
+			.anySatisfy(e -> {
+				assertThat(e.type()).isEqualTo("CLASS_PREPARE");
+				assertThat(e.summary()).contains("com.example.Foo");
+				assertThat(e.summary()).contains("1 line BP");
+			});
+	}
+
+	@Test
+	@DisplayName("CLASS_PREPARE NOT recorded when the CPE has no pending items for the class")
+	void shouldNotRecordClassPrepareWhenNothingPending() throws Exception {
+		ReferenceType refType = mock(ReferenceType.class);
+		when(refType.name()).thenReturn("com.example.Unrelated");
+		EventRequestManager erm = mock(EventRequestManager.class);
+
+		// No pending entries for "com.example.Unrelated".
+		ClassPrepareEvent event = mockClassPrepareEvent(refType, erm);
+		runListenerWith(listener, mockEventSet(event));
+
+		// The handler short-circuits at the "all pending lists empty" check before recording.
+		assertThat(eventHistory.getRecent(10))
+			.noneSatisfy(e -> assertThat(e.type()).isEqualTo("CLASS_PREPARE"));
+	}
+
+	@Test
+	@DisplayName("BP_MULTI_LOCATION recorded when locationsOfLine returns more than one Location (lambda case)")
+	void shouldRecordMultiLocationEventForLambdaLine() throws Exception {
+		ReferenceType refType = mock(ReferenceType.class);
+		Location enclosingLoc = mock(Location.class);
+		Location lambdaLoc = mock(Location.class);
+		// Mock describeLocation's path so the summary is readable. The exact contents aren't
+		// what the test asserts on, but a sane shape helps diagnosis if the assertion fails.
+		com.sun.jdi.Method enclosingMethod = mock(com.sun.jdi.Method.class);
+		when(enclosingMethod.name()).thenReturn("doWork");
+		when(enclosingLoc.method()).thenReturn(enclosingMethod);
+		when(enclosingLoc.codeIndex()).thenReturn(12L);
+
+		when(refType.name()).thenReturn("com.example.WithLambda");
+		when(refType.locationsOfLine(99)).thenReturn(List.of(enclosingLoc, lambdaLoc));
+
+		BreakpointRequest createdBp = mock(BreakpointRequest.class);
+		EventRequestManager erm = mock(EventRequestManager.class);
+		when(erm.createBreakpointRequest(enclosingLoc)).thenReturn(createdBp);
+
+		int pendingId = tracker.registerPendingBreakpoint("com.example.WithLambda", 99, 2, "ALL");
+
+		ClassPrepareEvent event = mockClassPrepareEvent(refType, erm);
+		runListenerWith(listener, mockEventSet(event));
+
+		assertThat(eventHistory.getRecent(10))
+			.anySatisfy(e -> {
+				assertThat(e.type()).isEqualTo("BP_MULTI_LOCATION");
+				assertThat(e.summary()).contains("#" + pendingId);
+				assertThat(e.summary()).contains("com.example.WithLambda:99");
+				assertThat(e.summary()).contains("2 bytecode locations");
+				assertThat(e.summary()).contains("other paths will MISS");
+				// Per the new logpoint-vs-breakpoint distinction, this is a plain BP.
+				assertThat(e.summary()).startsWith("BP ");
+			});
+	}
+
+	@Test
+	@DisplayName("BP_MULTI_LOCATION label is `LP` when the activated pending entry is a logpoint")
+	void shouldLabelMultiLocationAsLogpointWhenLogpointMetadataPresent() throws Exception {
+		ReferenceType refType = mock(ReferenceType.class);
+		Location enclosingLoc = mock(Location.class);
+		Location lambdaLoc = mock(Location.class);
+		com.sun.jdi.Method enclosingMethod = mock(com.sun.jdi.Method.class);
+		when(enclosingMethod.name()).thenReturn("doWork");
+		when(enclosingLoc.method()).thenReturn(enclosingMethod);
+		when(enclosingLoc.codeIndex()).thenReturn(12L);
+
+		when(refType.name()).thenReturn("com.example.WithLambda");
+		when(refType.locationsOfLine(99)).thenReturn(List.of(enclosingLoc, lambdaLoc));
+
+		BreakpointRequest createdBp = mock(BreakpointRequest.class);
+		EventRequestManager erm = mock(EventRequestManager.class);
+		when(erm.createBreakpointRequest(enclosingLoc)).thenReturn(createdBp);
+
+		int pendingId = tracker.registerPendingBreakpoint("com.example.WithLambda", 99, 2, "ALL");
+		// Mark this pending entry as a logpoint by attaching an expression.
+		tracker.setLogpointExpression(pendingId, "x + 1");
+
+		ClassPrepareEvent event = mockClassPrepareEvent(refType, erm);
+		runListenerWith(listener, mockEventSet(event));
+
+		assertThat(eventHistory.getRecent(10))
+			.anySatisfy(e -> {
+				assertThat(e.type()).isEqualTo("BP_MULTI_LOCATION");
+				// The diagnostic should use "LP" rather than "BP" because this entry is a logpoint.
+				assertThat(e.summary()).startsWith("LP ");
+			});
+	}
+
+	@Test
+	@DisplayName("CLASS_PREPARE summary splits the line-pending count into BP(s) vs logpoint(s)")
+	void shouldSplitLineBpAndLogpointCountsInClassPrepareSummary() throws Exception {
+		ReferenceType refType = mock(ReferenceType.class);
+		Location bpLoc = mock(Location.class);
+		Location lpLoc = mock(Location.class);
+		when(refType.name()).thenReturn("com.example.Mixed");
+		when(refType.locationsOfLine(10)).thenReturn(List.of(bpLoc));
+		when(refType.locationsOfLine(20)).thenReturn(List.of(lpLoc));
+
+		EventRequestManager erm = mock(EventRequestManager.class);
+		when(erm.createBreakpointRequest(bpLoc)).thenReturn(mock(BreakpointRequest.class));
+		when(erm.createBreakpointRequest(lpLoc)).thenReturn(mock(BreakpointRequest.class));
+
+		// One plain breakpoint and one logpoint deferred against the same class — both ride the
+		// pending-line path, so the summary must attribute them to separate buckets.
+		tracker.registerPendingBreakpoint("com.example.Mixed", 10, 2, "ALL");
+		int lpId = tracker.registerPendingBreakpoint("com.example.Mixed", 20, 2, "ALL");
+		tracker.setLogpointExpression(lpId, "x + 1");
+
+		ClassPrepareEvent event = mockClassPrepareEvent(refType, erm);
+		runListenerWith(listener, mockEventSet(event));
+
+		assertThat(eventHistory.getRecent(10))
+			.anySatisfy(e -> {
+				assertThat(e.type()).isEqualTo("CLASS_PREPARE");
+				assertThat(e.summary()).contains("1 line BP(s)");
+				assertThat(e.summary()).contains("1 logpoint(s)");
+				assertThat(e.details()).containsEntry("lineBpCount", "1");
+				assertThat(e.details()).containsEntry("lineLpCount", "1");
+			});
+	}
+
 	// ── Test-specific event factory ──────────────────────────────────────────
 
 	private static ClassPrepareEvent mockClassPrepareEvent(ReferenceType refType, EventRequestManager erm) {
