@@ -5,6 +5,32 @@ All notable changes to the `jdwp-debugging` plugin are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.8.0] — 2026-05-25
+
+### Fixed — disconnect no longer wipes your session in silence
+
+The session-epoch work in 2.7.0 made the *event log* segment cleanly across a
+VM restart, but the teardown tools themselves stayed mute about what they threw
+away. `jdwp_disconnect` returned a bare `"Disconnected"` while it silently
+cleared every breakpoint, watcher, mark, the object cache and the event
+history; `jdwp_connect` switching to a different target tore down the prior
+session just as quietly. An agent that had armed a dozen breakpoints got no
+signal they had vanished. `jdwp_reset` and `jdwp_reconnect` already itemize what
+they touch — this brings disconnect and connect up to the same parity.
+
+- **`jdwp_disconnect` now reports what it cleared** — an itemized summary
+  (breakpoints by kind, watchers, marks, event history, object cache) instead of
+  one word. Counts are snapshotted before the wipe, so they reflect what the call
+  actually discarded.
+- **A reconnect hint, only when it matters** — when breakpoints or watchers were
+  cleared, the reply points at `jdwp_reconnect` (re-attach to the same target,
+  specs preserved) as the way to keep them across a VM restart. A bookkeeping
+  disconnect with nothing set stays a terse one-liner — token-optimized.
+- **`jdwp_connect` announces a target switch** — attaching to a different
+  `host:port` now prepends a one-line "released previous session — N
+  breakpoint(s), M watcher(s) cleared" notice, with the same reconnect pointer.
+  (resolves #25)
+
 ## [2.7.0] — 2026-05-25
 
 ### New — see the lock graph, not just the threads
