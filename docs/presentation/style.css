@@ -176,13 +176,18 @@
 }
 
 /* ---- outro slide (#9 "Try the full gauntlet"): oversize the call-to-action
-       code ~2x so it reads from the back row. Wrap rather than overflow the
-       long marketplace URL. ---- */
+       code so it reads from the back row, but stay tight vertically — the
+       slide also hosts the "questions?" beat and the contact card. ---- */
 .reveal section.outro-slide pre code {
-	font-size: 1.24em;
+	font-size: 1.05em;
 	white-space: pre-wrap;
 	overflow-wrap: break-word;
+	padding: 0.5em 0.9em;
 }
+.reveal section.outro-slide pre { margin: 0.25em auto; }
+.reveal section.outro-slide h2 { margin-bottom: 0.3em; }
+.reveal section.outro-slide p { margin: 0.2em 0; }
+.reveal section.outro-slide .contact-card { margin-top: 0.4em; }
 
 /* ---- contact card (outro): the links closed in a labelled box ---- */
 .reveal .contact-card {

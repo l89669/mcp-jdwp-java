@@ -8,8 +8,6 @@
 <small class="muted">Built on <a href="https://github.com/NicolasVautrin/mcp-jdwp-java">mcp-jdwp-java</a> by Nicolas Vautrin</small>
 
 Note:
-- ~25 min + Q&A
-- An MCP server: Claude Code attaches to a JVM and drives the debugger
-- Agent does the breakpoints, eval, mutation — not you
-- Built on Nicolas Vautrin's mcp-jdwp-java (threads, stack, vars, stepping)
-- Press `S` for speaker view
+- Hello everyone, my name is Jan Novotný and today I want to introduce you a Java debugger for AI agents.
+- First and foremost, excuse my English, but I'm used to listening more than speaking.
+- Built on Nicolas Vautrin's mcp-jdwp-java (proof of concept)

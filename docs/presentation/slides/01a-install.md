@@ -20,3 +20,4 @@ Note:
 - Trust surface collapses to "is the Git history clean?" — answerable in Claude Code itself
 - Try: "audit these sources for anything that touches network or filesystem beyond the JVM target"
 - First session triggers Maven (~30 s, one-off); JAR cached after; `git pull` + restart updates
+- Try restarting Claude + reconnect MCP if anything is wrong

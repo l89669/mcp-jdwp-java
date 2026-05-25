@@ -11,13 +11,9 @@
 <small class="muted">↓ press Down for MCP in a nutshell</small>
 
 Note:
-- Why this layer: Claude can't speak JDWP (binary, stateful); server keeps VM ref, object cache, BPs, chains, events alive across tool calls
-- JDWPTools — 46 @McpTool methods, thin orchestration
-- JDIConnectionService — singleton VM, ObjectReference cache, marks pinned via `disableCollection`
-- BreakpointTracker — synthetic IDs, pending/deferred, chain dependencies with cycle detection
-- JdiEventListener — daemon consuming the JDI event queue
-- EvaluationGuard — per-thread reentrancy guard, prevents deadlock on re-entrant eval
-- EventHistory — ring buffer of last 100 events
+- Why this layer:
+  - Claude can't speak JDWP (binary, stateful);
+  - server keeps VM ref, object cache, BPs, chains, events alive across tool calls
 - Spring Boot SYNC, no HTTP — JSON over STDIO
 - Deep dive: `docs/index.md`
 
@@ -38,7 +34,7 @@ Note:
   - **Prompts** — reusable templates
 - **This plugin:** STDIO + Tools + Resources
   - no daemon, no port, no auth surface
-  - Resources (`jdwp://diagnose`, `jdwp://jvms`) attach via `@`, zero tool turns
+  - Resources (`jdwp://diagnose`, `jdwp://jvms`) used via `@`
   - Prompts skipped — the workflow lives in the bundled skill
 
 <small class="muted">↓ press Down: writing your own in Java</small>
@@ -46,7 +42,6 @@ Note:
 Note:
 - MCP = open standard, JSON-RPC; one client ↔ many servers ("USB-C for AI tools")
 - Transports: STDIO = local subprocess (what we use); Streamable HTTP/SSE = remote servers
-- Three server primitives: Tools (model-invoked), Resources (app-controlled, URI-addressed, read-only), Prompts (user-selected templates)
 - We expose Tools + Resources over STDIO; no Prompts — the bundled skill carries the workflow
 - Why STDIO: local, no open port, no auth to misconfigure; the JVM target is the only network surface
 

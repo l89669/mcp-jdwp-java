@@ -31,8 +31,10 @@
 </div>
 
 Note:
-- Primary win: failing tests — agent stops hallucinating from stack traces, sees actual runtime state
-- `suspend=y` (set by `-Dmaven.surefire.debug`) holds the JVM until the agent attaches — no race
-- Secondary win: running apps — "broken only in staging" investigations without redeploy
-- Logpoints replace `println`; field watchpoints find rogue writers; conditions tame hot-loop floods
-- Raw JDI is fine for a human in IntelliJ — agents need more (conditions, eval, mutation, guards)
+- Designed with two scenarios in mind:
+  - failing tests — agent stops hallucinating from stack traces, sees actual runtime state
+    - `suspend=y` (set by `-Dmaven.surefire.debug`) holds the JVM until the agent attaches — no race
+  - running apps — "broken only in staging" investigations without redeploy
+    - Logpoints replace `println`; 
+    - field watchpoints find rogue writers;
+    - conditions tame hot-loop floods

@@ -33,7 +33,9 @@ For each flight (#1 → #9):
   WITHOUT peeking at source, disconnect.
 
 End with a scorecard — one line per flight:
-  bug · root cause · star tool · calls vs par · ⭐.</code></pre>
+  bug · root cause · star tool · calls vs par · ⭐.
+
+Measure time, the faster you are the better.</code></pre>
 
 Copy-paste verbatim. No source-peeking is enforced by `CLAUDE.md` in the sandbox.
 
@@ -43,11 +45,7 @@ Copy-paste verbatim. No source-peeking is enforced by `CLAUDE.md` in the sandbox
 <small class="muted">↓ press Down for the flight roster</small>
 
 Note:
-- Step 1 keeps the audience on a fresh, parentless Maven project — no clone of the whole reactor
-- Step 2 shows what CC will run nine times — one JVM per flight, suspend=y each time
-- Step 3 is the hero — copy-paste verbatim. The "no peeking at source" rule keeps the demo honest
-- Pre-trigger the hunt in a separate terminal; come back to the scorecard at the end of the deck
-- #5 (The Field That Lies) is the headliner — a field watchpoint catches a reflective `Field.set` that line BPs miss
+- Run the demo in Hole
 
 --
 
@@ -70,7 +68,5 @@ Note:
 <small class="muted">Each flight lists a **par** (min tool calls) — a flawless run is 27 ⭐ across the nine.</small>
 
 Note:
-- Backup story if the live hunt stalls: evita-db `OffsetIndexTest.generationalProofTest` off-by-one in `countDifference()` — found in minutes
-- Each row pairs a bug with the tool group that's the path of least resistance; par is the elegant-solve tool-call count
-- Field watchpoints anchor three flights (#3, #4, #5); #5 The Field That Lies is the showcase — a reflective `Field.set` a line BP can never catch
-- #6 marks, #7 logpoints, #8 runtime mutation, #9 deadlock-via-thread-inspection-alone round out the tool surface
+
+- each test is designed to verify the tool's capabilities in agent hands

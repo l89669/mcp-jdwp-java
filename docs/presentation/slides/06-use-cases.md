@@ -31,10 +31,9 @@ Note:
 Deferred BPs are the unlock under `mvn test`: the agent is too slow to race the classloader, so it arms everything *before* code runs.
 
 Note:
-- wait_for_attach lands at VM_START suspended and tells the agent "set BPs, then resume_until_event" — eval needs a real BP first
-- forceLoad=true binds a BP immediately but runs `<clinit>` (early static init, masked lazy-load) — off by default
-- Soft-wait: at the 30s ceiling, wait_for_attach / resume_until_event return `still_waiting` + JDI health + {wait_more, reconnect, abort} — unlimited waiting, never a blind freeze
-- reconnect LOSES marks, object cache, last-thread, classpath cache (can't survive vm.dispose); target VM resumes after
+- if you try to debug tests naively, the test finishes before the agent can set BPs
+- another problems are scenarios when agent never stops on BP -> timeouts
+- reconnect communicates what stays and what is lost
 
 --
 
@@ -45,17 +44,19 @@ Note:
 - **Real Java → real bytecode** — compiled, not interpreted
 - **Self-configuring** — finds the classpath and a matching JDK for you
 - **Two modes** — a single expression, or a `{ … return X; }` block
-- **Full scope** — reaches private / package-private members too
+- **Full scope** — reaches private / package-private members too (with limitations)
 - **Recursion guard** — re-entrant eval won't deadlock the target
 
 <small class="muted">↓ press Down for the pipeline</small>
 
 Note:
-- Compiled in the MCP server's memory via Eclipse JDT (ECJ); only the final `defineClass` + invoke runs inside the target JVM (over JDI)
-- "Finds the classpath": walks the target's classloader hierarchy, including Tomcat / app-server webapp classloaders — `WEB-INF/lib` JARs aren't on `java.class.path`, so this is what lets eval resolve your app's own classes
-- "Matching JDK": JdkDiscoveryService locates a local JDK of the target's major version (the target's own `java.home` first), passed to JDT as `--system` so `java.*` resolves; language level matches the target. ECJ is self-contained, so the target can be newer than the server's own runtime JDK as long as a matching JDK is installed
+- "Finds the classpath":
+  - walks the target's classloader hierarchy, including Tomcat / app-server webapp classloaders — `WEB-INF/lib` JARs aren't on `java.class.path`, 
+  - so this is what lets eval resolve your app's own classes
+- "Matching JDK": 
+  - JdkDiscoveryService locates a local JDK of the target's major version (the target's own `java.home` first), passed to JDT as `--system` so `java.*` resolves; 
+  - language level matches the target. ECJ is self-contained, so the target can be newer than the server's own runtime JDK as long as a matching JDK is installed
 - Block mode works in every eval slot: conditions, logpoints, watchers, assertions
-- Recursion guard: an eval that re-enters the breakpointed method is refused rather than deadlocking
 
 --
 
@@ -69,7 +70,9 @@ Agent expression → compiled in the **MCP server** → bytecode injected and in
 
 Note:
 - Only the final `defineClass` + invoke crosses into the target JVM; everything else is MCP-server-side
-- Two JDI hops cross the boundary: ClasspathDiscoverer reads the target's classloaders; RemoteCodeExecutor ships the bytecode and invokes it
+- Two JDI hops cross the boundary:
+  - ClasspathDiscoverer reads the target's classloaders;
+  - RemoteCodeExecutor ships the bytecode and invokes it
 
 --
 
@@ -88,7 +91,7 @@ The agent stops reasoning from stack traces and reads the actual runtime state.
 Note:
 - assert_expression comparison is string-based against the same formatting evaluate_expression uses
 - Chains: cycles rejected at registration; diagnose flags the "armed but waiting on a non-fired trigger" stuck state
-- IntelliJ has dependent BPs but no log-only chains; marks-as-conditions has no IJ equivalent
+- IntelliJ has dependent BPs but no log-only chains;
 
 --
 
@@ -101,18 +104,15 @@ Observe without a single `println` — and catch writes a setter breakpoint neve
 - **Field watchpoints** — fire on every JVM-level store (incl. reflection `Field.set`, `Unsafe`); the thread **suspends at the write**, so `jdwp_get_stack` names the writer on the spot
 - **Logpoints** — line / exception / field — evaluate + **write the result to the event log**, **never suspend** the thread, **never push** — the hit isn't surfaced live
 - **`jdwp_get_events` is where it lands** — the agent pulls the log back on its own turn; replays every hit in order, across threads (`$oldValue` → `$newValue`, last 100)
-- A line BP on the setter misses reflective / framework writes (ORMs, DI, JSON mappers); a **field-modification watchpoint** doesn't — it fires on the store itself, not the method
 
 <small class="warn">Perf: hot fields can dominate target-VM CPU — filter narrowly or keep sessions short.</small>
 
 Note:
-- Two primitives: `jdwp_set_field_breakpoint` (watchpoint — suspends at the store) vs `jdwp_set_field_logpoint` / line / exception logpoints (log, never stop)
-- A logpoint NEVER notifies — it writes one entry to EventHistory and the thread runs on. No callback, no inline return, nothing surfaced at fire time. The agent pulls the log back with `jdwp_get_events` on a later turn — that's the *only* data channel for a logpoint hit. (The server also mirrors the line to its own SLF4J log on stderr, but that's operator-side, not something the agent reads.)
-- This decoupling — when it fired vs when you read it — is exactly what makes non-stopping observation possible: a logpoint that never suspends would otherwise be write-only
-- Every hit — suspending or not — is recorded in EventHistory (last 100); `jdwp_get_events` gives the ordered, cross-thread timeline of stores. That timeline cracks flight #3 (a config-reaper thread clobbers the value 5000→0) and flight #5 (a reflective `Field.set` bypasses the setter — a line BP on it never fires)
+- Two primitives:
+  - `jdwp_set_field_breakpoint` (watchpoint — suspends at the store) vs
+  - `jdwp_set_field_logpoint` / line / exception logpoints (log, never stop)
 - Synthetic bindings in the expression: `$oldValue`, `$newValue`, `$object`, `$fieldName`, `$mode`
 - Logpoint expressions use the in-target compiler — any classpath method, lambdas, streams
-- Field logpoints are unique here; IntelliJ has line logpoints only. Stopping a thread perturbs race timing — logpoints don't.
 
 --
 
@@ -120,7 +120,7 @@ Note:
 
 ### Token economy
 
-- **`resume_until_event`** — server-side block until the next event; kills the resume→poll→poll loop
+- **`resume_until_event`** — server-side block until the next event; kills the resume → poll → poll loop
 - **`get_breakpoint_context`** — thread + frames + locals + `this`-fields in **one** call (vs four)
 - **`overview` / `clear`** — one read verb, one delete verb for all BP / watcher / mark state
 - **Smart filtering** — junit / surefire / reflection frames collapsed by default
@@ -130,7 +130,9 @@ Note:
 Individually small; together, the difference between a usable session and a burned context window.
 
 Note:
-- Smart filtering: a 200-thread Tomcat renders in ~25 lines vs ~1000 verbose; stacks collapse junit/maven/reflection unless includeNoise=true
+- Smart filtering:
+  - a 200-thread Tomcat renders in ~25 lines vs ~1000 verbose
+  - stacks collapse junit/maven/reflection unless includeNoise=true
 - clear requires an explicit `types` arg so an empty call can't wipe everything by accident
 - None of this exists in IntelliJ — a human staring at a debugger UI doesn't pay the round-trip cost
 
@@ -154,6 +156,6 @@ Without it, the model freelances. With it, sessions look like an experienced dev
 
 Note:
 - Skill is what turns the tool pile into a learnable workflow
-- Two layers of guidance: the skill is the strategy (the route), each tool response is the tactics (turn-by-turn). The responses carry the next-step hint so the plan survives turn-to-turn even when the agent drifts
-- Examples: `wait_for_attach` → "set BPs, then resume_until_event"; soft-wait → offers {wait_more, reconnect, abort}; `clear_breakpoint_dependency` → suggests `resume_until_event`. This is the "do this next" half of the hub slide
-- Without it the model picks tools at random; with it sessions look professional
+- Two layers of guidance:
+  - the skill is the strategy (the route), each tool response is the tactics (turn-by-turn). 
+  - The responses carry the next-step hint so the plan survives turn-to-turn even when the agent drifts
