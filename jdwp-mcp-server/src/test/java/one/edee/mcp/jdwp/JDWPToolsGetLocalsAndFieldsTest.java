@@ -207,7 +207,7 @@ class JDWPToolsGetLocalsAndFieldsTest {
 
 			final String result = tools.jdwp_set_field(7L, "count", "42");
 
-			assertThat(result).isEqualTo("Field 'com.example.Foo.count' set to 42");
+			assertThat(result).isEqualTo("Field 'com.example.Foo.count' set to 42. Next: jdwp_step_over or jdwp_resume to continue.");
 			verify(obj).setValue(field, mirrored);
 		}
 

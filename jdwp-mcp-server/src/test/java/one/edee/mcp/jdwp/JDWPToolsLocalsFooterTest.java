@@ -66,6 +66,7 @@ class JDWPToolsLocalsFooterTest {
 	private ThreadReference primeEmptyFrame(long threadId) throws Exception {
 		final ThreadReference thread = mock(ThreadReference.class);
 		when(thread.uniqueID()).thenReturn(threadId);
+		when(thread.isSuspended()).thenReturn(true);
 		final StackFrame frame = mock(StackFrame.class);
 		when(thread.frame(0)).thenReturn(frame);
 		when(frame.thisObject()).thenReturn(null);
@@ -171,6 +172,7 @@ class JDWPToolsLocalsFooterTest {
 		final VirtualMachine localVm = mock(VirtualMachine.class);
 		final ThreadReference thread = mock(ThreadReference.class);
 		when(thread.uniqueID()).thenReturn(1L);
+		when(thread.isSuspended()).thenReturn(true);
 		final StackFrame frame = mock(StackFrame.class);
 		when(thread.frame(0)).thenReturn(frame);
 		when(frame.thisObject()).thenReturn(null);

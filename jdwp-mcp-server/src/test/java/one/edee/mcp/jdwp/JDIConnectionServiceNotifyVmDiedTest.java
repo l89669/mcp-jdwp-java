@@ -235,9 +235,9 @@ class JDIConnectionServiceNotifyVmDiedTest {
 			JDIConnectionServiceTestSupport.setVm(service, mock(VirtualMachine.class));
 			JDIConnectionServiceTestSupport.setLastSuccessfulAttach(service, "127.0.0.1", 1);
 
-			final String status = service.disconnect();
+			final JDIConnectionService.DisconnectResult status = service.disconnect();
 
-			assertThat(status).isEqualTo("Disconnected");
+			assertThat(status.wasConnected()).isTrue();
 			assertThatThrownBy(service::getVM)
 				.hasMessageContaining("jdwp_connect");
 		}
@@ -286,16 +286,18 @@ class JDIConnectionServiceNotifyVmDiedTest {
 			// ensureConnected) that decide what to do with the dead handle.
 			final JDIConnectionService service = JDIConnectionServiceTestSupport.newServiceWithMocks();
 			final VirtualMachine deadVm = mock(VirtualMachine.class);
-			org.mockito.Mockito.when(deadVm.name()).thenThrow(new VMDisconnectedException());
+			// getConnectionStatus()'s liveness probe round-trips through vm.allThreads() (not the
+			// JDI-cached vm.name()), so a dead socket is simulated by allThreads() throwing.
+			org.mockito.Mockito.when(deadVm.allThreads()).thenThrow(new VMDisconnectedException());
 			JDIConnectionServiceTestSupport.setVm(service, deadVm);
 
 			final JDIConnectionService.ConnectionStatus first = service.getConnectionStatus();
 			assertThat(first.connected()).isFalse();
 
 			// Read the private vm field via reflection — it must still reference deadVm because
-			// the status call is pure. (If the field had been nulled as a side effect, name()
-			// would never have been called on the dead handle on the second status probe; we
-			// assert the stronger invariant: the field reference is unchanged.)
+			// the status call is pure. (If the field had been nulled as a side effect, the second
+			// status probe would have nothing to probe; we assert the stronger invariant: the
+			// field reference is unchanged.)
 			final java.lang.reflect.Field vmField = JDIConnectionService.class.getDeclaredField("vm");
 			vmField.setAccessible(true);
 			assertThat(vmField.get(service)).isSameAs(deadVm);

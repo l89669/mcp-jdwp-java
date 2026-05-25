@@ -5,6 +5,244 @@ All notable changes to the `jdwp-debugging` plugin are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.8.1] — 2026-05-25
+
+### Fixed — straight answers when evaluation can't see what it needs
+
+Two paths returned dead-ends that steered agents the wrong way.
+`jdwp_resume_until_event` could wake without a stop and flatly blame a concurrent
+`jdwp_reset` / `jdwp_disconnect` — telling you to re-arm breakpoints that were, in
+fact, still armed on a live VM. And any expression evaluated on a stack frame from
+a target compiled without a local-variable table failed with the opaque
+`Expression evaluation failed: null`, even when the expression touched no locals at
+all — the common case for field logpoints using only `$oldValue` / `$newValue`.
+Both now do the check they were skipping.
+
+- **`[NO_EVENT]` checks before it advises** — the no-stop branch now probes VM
+  liveness and the breakpoint registry. If the VM is alive with breakpoints still
+  armed, it says so and tells you to simply call again (do *not* re-arm); only a
+  genuinely cleared session gets the re-setup guidance. `[NO_EVENT]` is now also
+  listed in the tool's documented return values. (resolves #27)
+- **Expressions evaluate without a local-variable table** — a frame from a target
+  built without `-g:vars` (plain `javac`, `-g:none`, or a stripped release) no
+  longer aborts the whole evaluation. Locals are skipped when absent and the
+  expression runs against `this` + the synthetic bindings; an expression that
+  *does* name a missing local now gets a clear "cannot be resolved" compile error
+  instead of `null`. (resolves #29)
+
+### Docs — field watchpoints: what they catch, honestly
+
+- **Reflective writes are not caught — corrected** — `docs/breakpoints.md` claimed
+  a reflective `Field.set` / `Unsafe` write was "fully visible to a watchpoint",
+  contradicting the java-debug skill and the JVM itself. Verified live on JDK 17: a
+  modification watchpoint fires on constructor and direct assignments but stays
+  silent on a reflective `Field.set` of the same field. The docs now say so, drop a
+  test-flight spoiler, and add the reference-vs-contents distinction — a watchpoint
+  fires on the field's slot, not on in-place mutation of the object it references.
+  (resolves #28)
+
+## [2.8.0] — 2026-05-25
+
+### Fixed — disconnect no longer wipes your session in silence
+
+The session-epoch work in 2.7.0 made the *event log* segment cleanly across a
+VM restart, but the teardown tools themselves stayed mute about what they threw
+away. `jdwp_disconnect` returned a bare `"Disconnected"` while it silently
+cleared every breakpoint, watcher, mark, the object cache and the event
+history; `jdwp_connect` switching to a different target tore down the prior
+session just as quietly. An agent that had armed a dozen breakpoints got no
+signal they had vanished. `jdwp_reset` and `jdwp_reconnect` already itemize what
+they touch — this brings disconnect and connect up to the same parity.
+
+- **`jdwp_disconnect` now reports what it cleared** — an itemized summary
+  (breakpoints by kind, watchers, marks, event history, object cache) instead of
+  one word. Counts are snapshotted before the wipe, so they reflect what the call
+  actually discarded.
+- **A reconnect hint, only when it matters** — when breakpoints or watchers were
+  cleared, the reply points at `jdwp_reconnect` (re-attach to the same target,
+  specs preserved) as the way to keep them across a VM restart. A bookkeeping
+  disconnect with nothing set stays a terse one-liner — token-optimized.
+- **`jdwp_connect` announces a target switch** — attaching to a different
+  `host:port` now prepends a one-line "released previous session — N
+  breakpoint(s), M watcher(s) cleared" notice, with the same reconnect pointer.
+  (resolves #25)
+
+## [2.7.0] — 2026-05-25
+
+### New — see the lock graph, not just the threads
+
+A 9-flight test-flight retrospective surfaced the same recurring friction:
+`jdwp_get_threads` tells you a thread is in `MONITOR` status, but not *what*
+it's blocked on or *who* holds the lock — so reconstructing a deadlock meant
+suspending each thread and reading locals by hand. The new tool answers it in
+one call, the natural sequel to 2.6.2's deadlock-inspection error message.
+
+- **`jdwp_dump_locks`** — takes a balanced VM-wide suspend/resume snapshot,
+  reads each thread's contended monitor and its owning thread, and prints the
+  blocked-thread table plus any **deadlock cycle** (e.g.
+  `transfer-A-to-B → transfer-B-to-A → …`). Cycle detection is a pure,
+  JDI-free `DeadlockAnalyzer`. The suspend/resume is balanced, so a genuine
+  deadlock stays put and a healthy VM is undisturbed; only synchronized-monitor
+  contention shows (not `Object.wait()` / `java.util.concurrent` Locks).
+  (resolves #23)
+
+### Fixed — a misspelled breakpoint class no longer defers in silence
+
+A breakpoint set on a fully-qualified class name that doesn't match anything
+(`Config` for `Configuration`) deferred forever, with a message
+indistinguishable from a genuinely not-yet-loaded class — a silent dead end
+that cost a flight ~13 wasted calls.
+
+- **Near-match class suggestions** — when a breakpoint defers because its class
+  isn't loaded, the response now scans the loaded classes for resembling names
+  (simple-name exact/prefix match + bounded edit distance) and appends a
+  *"did you mean…"* hint. Applies to line, logpoint, field, and exception
+  breakpoints; best-effort, never fails a breakpoint set. (resolves #24)
+- **Length-safe event timestamps** — the event listing formatted times with a
+  fixed `substring(11, 23)` that threw on a whole-second `Instant` (which prints
+  without a fraction), collapsing `jdwp_get_events` into an error. It now uses a
+  length-safe `HH:mm:ss.SSS` formatter.
+
+### Changed — event history is now segmented by session
+
+The `jdwp_get_events` log is deliberately preserved across a VM death (so the
+`VM_DEATH` and the events leading to it stay readable), but on an auto-reconnect
+to a relaunched target the old VM's events bled into the new session's stream
+with no way to tell them apart.
+
+- **Session-epoch tagging** — every event carries a monotonic session epoch,
+  bumped on each attach; `jdwp_get_events` shows a per-line `s1`/`s2` tag and a
+  divider at each new-VM boundary, so a death-then-reconnect reads as two clean
+  segments without discarding the pre-death evidence. (resolves #25)
+
+### Docs
+
+- **`java-debug` skill discoverability** — a deadlock recipe built around
+  `jdwp_dump_locks`; guidance to launch fast-finishing tests with `suspend=y` +
+  `jdwp_wait_for_attach` so the VM can't die before breakpoints are armed; and a
+  note that the event log survives a VM death (use `jdwp_clear_events` to start
+  clean). (resolves #26)
+
+## [2.6.2] — 2026-05-25
+
+### Fixed — inspecting a deadlocked thread now points the way
+
+A thread blocked on a monitor or parked in `Object.wait()` that you did not
+stop at a breakpoint reports `Suspended: no` and never halts on its own — the
+classic deadlock case. `jdwp_get_stack` answered that with a dead-end *"Thread
+must be stopped at a breakpoint"*, and `jdwp_get_locals` had no suspend check at
+all and leaked a raw `IncompatibleThreadStateException`. Both pointed away from
+the one tool that actually helps: `jdwp_suspend_thread`, which freezes the
+thread in place so its frames and locals become readable.
+
+- **Actionable not-suspended error** — `jdwp_get_stack` and `jdwp_get_locals`
+  now detect a MONITOR/WAIT thread that isn't JDI-suspended and name
+  `jdwp_suspend_thread(id)` as the deadlock-inspection path (and `get_locals`
+  gained the suspend check it was missing). The invoke-family tools
+  (`evaluate_expression` / `to_string` / `assert_expression`) keep their
+  existing guard — suspending such a thread makes it *inspectable*, not
+  *invocable*. (resolves #22)
+
+### Docs
+
+- **Two `java-debug` skill notes from a live test-flight retro** — how to read a
+  deadlocked thread (`jdwp_suspend_thread` it first), and the reminder that
+  `jdwp_disconnect` does not stop the target JVM: the JVM owns its JDWP port, so
+  a target with live non-daemon threads keeps the port bound after you
+  disconnect — kill the lingering process before relaunching on the same port.
+
+## [2.6.1] — 2026-05-24
+
+### Fixed — connect / diagnose no longer alias a dead VM
+
+The liveness check behind `jdwp_connect`'s "already connected" guard and the
+`jdwp_diagnose` connection status probed the target with `vm.name()`, which JDI
+caches after its first fetch — so a VM whose socket had already closed (an
+orphaned test JVM left over from a previous debug session, or one mid-exit)
+still read as alive. `connect` then short-circuited onto the stale VM and
+`jdwp_diagnose` reported a live connection that wasn't; breakpoints never fired
+and the disconnect only surfaced later.
+
+- **Round-tripping liveness probe** — these two paths now issue a bounded
+  `vm.allThreads()` (a real JDWP exchange) instead of the cached name: a closed
+  socket is detected promptly and a wedged VM is bounded by a short timeout, so
+  `connect` re-attaches to the VM you actually launched and `jdwp_diagnose`
+  tells the truth. The cheap cached check stays on the per-tool-call hot path,
+  where a false positive is harmless (the next real JDI call surfaces the
+  disconnect). (resolves #21)
+
+### Docs
+
+- **"The Field That Lies" reads as a puzzle again** — the test-flight scenario
+  had promised that a field-modification watchpoint catches the reflective
+  `Field.set` that mutates the field; a flight on JDK 21 disproved it (JDI
+  watchpoints fire on the `putfield` bytecode, not on reflective / `Unsafe`
+  stores). The scenario no longer hands over the answer, and the `java-debug`
+  skill gained a caveat: watchpoints miss reflective / `Unsafe` writes
+  regardless of finality — bisect with line breakpoints + `identityHashCode`
+  instead.
+
+### CI
+
+- **Actions pinned to Node 24** — `actions/checkout` and `actions/setup-java`
+  were bumped past the Node 20 runtime deprecation in both the CI and release
+  workflows.
+
+## [2.6.0] — 2026-05-24
+
+### New — tool responses now navigate to the next step
+
+Every tool used to confirm what it did and stop; the calling agent had to
+already know which tool to reach for next, and a logpoint gave no hint that its
+output lands in the event log. An audit of the full tool surface drove a pass
+that makes responses self-navigating — each one now points to the sensible next
+tool (or says what to expect), so the set → run → read chain is visible in the
+output instead of being carried only by the skill.
+
+- **Logpoint confirmations point to the event log** — `jdwp_set_logpoint`,
+  `jdwp_set_field_logpoint`, and `jdwp_set_exception_logpoint` now state that
+  hits are recorded as they fire and read on demand with `jdwp_get_events`
+  (logpoints never suspend and never push, so there is no "event fired" to react
+  to).
+- **Next-step pointers across the surface** — `jdwp_resume` points to the
+  blocking `jdwp_resume_until_event`; `connect` / `reset` say to set breakpoints
+  then resume; `set_local` / `set_field` point to step/resume; the inspectors and
+  watcher / mark tools point to their natural follow-ups. Hints are terse footers
+  added only where a next step is genuinely useful — tool descriptions were left
+  untouched to avoid a per-turn token cost.
+- **Failure paths navigate too** — a failed `jdwp_connect` now points to
+  `jdwp_diagnose` to list local JVMs and their JDWP ports.
+
+### Fixed
+
+- **`$newValue` on field-access events** — a `mode="both"` field logpoint or
+  condition that referenced `$newValue` failed to compile on every *access* hit
+  (one `[FIELD_LOGPOINT_ERROR]` per read), because the binding was populated only
+  for modification events. `$newValue` is now bound as a typed-null on access
+  events, so the same expression compiles on both halves and renders `… -> null`
+  on reads. (resolves #14)
+- **Actionable `[NO_EVENT]` from `jdwp_resume_until_event`** — when the wait was
+  released without a real stop (a concurrent `jdwp_reset` / `jdwp_disconnect`
+  freeing the waiter, then nulling the snapshot), the tool returned a dead-end
+  "this should not happen" message. It now returns an actionable `[NO_EVENT]`
+  naming the likely cause and the recovery path. (resolves #15)
+
+### Docs
+
+- **`java-debug` skill guidance** — set a line breakpoint at the assertion as a
+  safety net before a field watchpoint on short-running tests (avoids the
+  `VM_DEATH` race where the write lands but the suspend never does); set the
+  breakpoint at the `join()` / assertion line for concurrency flights, not right
+  after `Thread.start()`; don't pipe the launch command through `tail` / `head`
+  in a background shell. (resolves #16)
+
+### CI
+
+- **Test gate on push and PR** — a new GitHub Actions workflow runs the full
+  `./mvnw test` suite (including the NullAway / Error Prone gate) on every push to
+  `main` and every pull request, so regressions are caught on the server rather
+  than only at release time. (resolves #18)
+
 ## [2.5.0] — 2026-05-24
 
 ### New — `excludeConstructors` flag on field watchpoints

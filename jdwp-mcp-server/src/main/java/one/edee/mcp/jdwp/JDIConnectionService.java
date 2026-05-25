@@ -25,6 +25,12 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import static one.edee.mcp.jdwp.ThreadFormatting.isJvmInternalThread;
 
@@ -245,10 +251,13 @@ public class JDIConnectionService {
     }
 
     /**
-     * Pure liveness probe — issues {@code vm.name()} and returns false on any exception. Does NOT
-     * mutate the {@link #vm} field, so diagnostic callers like {@link #getConnectionStatus()} can
-     * read connection state without an observable side effect. Stale-state cleanup is handled by
-     * the connect/reconnect paths via {@link #cleanupSessionState()}.
+     * Cheap, optimistic liveness probe — issues the JDI-cached {@code vm.name()} and returns false
+     * on any exception. Because {@code name()} is cached after its first fetch, this can report a VM
+     * as alive after its socket has already closed; it is therefore only used on the hot
+     * {@code getVM()} / {@link #ensureConnected()} precondition path, where a false positive is
+     * harmless (the next real JDI operation surfaces {@code VMDisconnectedException}). Authoritative
+     * checks that must not alias to a dead VM use {@link #isVMResponsive()} instead. Does NOT mutate
+     * the {@link #vm} field.
      */
     private boolean isVMAlive() {
         final VirtualMachine local = vm;
@@ -260,6 +269,50 @@ public class JDIConnectionService {
             return true;
         } catch (Exception e) {
             return false;
+        }
+    }
+
+    /**
+     * Connect-time liveness timeout. A held VM that cannot answer a round-tripping JDI command
+     * within this budget is treated as dead, so {@link #connect} re-attaches rather than aliasing to
+     * it. Deliberately shorter than the health monitor's wedged-detection probe — a connect attempt
+     * should not stall on a hung VM.
+     */
+    private static final long LIVENESS_PROBE_TIMEOUT_MS = 2_000L;
+
+    /**
+     * Authoritative liveness probe: issues a round-tripping {@code vm.allThreads()} and waits up to
+     * {@link #LIVENESS_PROBE_TIMEOUT_MS} for it. Unlike {@link #isVMAlive()} (which calls the
+     * JDI-cached {@code vm.name()} and so cannot detect a socket that closed since the first fetch),
+     * this forces a fresh JDWP exchange: a dead socket throws promptly and a wedged VM is bounded by
+     * the timeout, so a non-live VM reliably reads as dead. Used by the {@link #connect}
+     * "already connected" guard and by {@link #getConnectionStatus()} so neither aliases to a stale
+     * VM (e.g. an orphaned test JVM left over from a previous debug session). Side-effect free apart
+     * from the probe traffic; does NOT mutate the {@link #vm} field.
+     */
+    private boolean isVMResponsive() {
+        final VirtualMachine local = vm;
+        if (local == null) {
+            return false;
+        }
+        final ExecutorService probe = Executors.newSingleThreadExecutor(r -> {
+            final Thread t = new Thread(r, "jdi-liveness-probe");
+            t.setDaemon(true);
+            return t;
+        });
+        try {
+            final Future<Boolean> result = probe.submit(() -> {
+                local.allThreads();
+                return Boolean.TRUE;
+            });
+            return Boolean.TRUE.equals(result.get(LIVENESS_PROBE_TIMEOUT_MS, TimeUnit.MILLISECONDS));
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            return false;
+        } catch (TimeoutException | ExecutionException probeFailed) {
+            return false;
+        } finally {
+            probe.shutdownNow();
         }
     }
 
@@ -277,19 +330,23 @@ public class JDIConnectionService {
         lastConnectAttempt = Instant.now();
         lastConnectAttemptHost = host;
         lastConnectAttemptPort = port;
-        if (vm != null && isVMAlive()) {
+        String releasedNotice = "";
+        if (vm != null && isVMResponsive()) {
             if (host.equals(lastHost) && port == lastPort) {
                 lastConnectError = null;
                 return "Already connected to " + vm.name();
             }
             // Deliberate host/port change — release current session so the fresh attach below
-            // does not leak breakpoints / watchers / ObjectReferences across targets.
+            // does not leak breakpoints / watchers / ObjectReferences across targets. Snapshot the
+            // discarded-spec notice first so connect() does not silently drop them on the floor.
+            releasedNotice = describeReleasedSession();
             log.info("[JDI] Switching target from {}:{} to {}:{} — releasing current session",
                 lastHost, lastPort, host, port);
             cleanupSessionState();
         } else if (vm != null) {
             // Probe said dead but the field is still non-null — wipe stale session caches
             // before the fresh attach so they cannot leak across attachments.
+            releasedNotice = describeReleasedSession();
             log.info("[JDI] Clearing stale state from previous (dead) VM connection");
             cleanupSessionState();
         }
@@ -326,23 +383,55 @@ public class JDIConnectionService {
         lastPort = port;
         lastConnectError = null;
 
+        // Advance the event-history session epoch before any event of this attach is recorded. If a
+        // prior VM died and its events were preserved in the buffer (notifyVmDied keeps them), this
+        // new session's events get a distinct epoch so jdwp_get_events can segment old from new.
+        eventHistory.beginNewSession();
+
         eventListener.start(vm);
         // Arm the health watchdog. The attach round-trip itself counts as traffic, so the
         // monitor seeds lastTrafficAt to now and only escalates to an active probe if the
         // listener subsequently sees a full silence window.
         healthMonitor.start(vm);
 
-        return String.format("Connected to %s (version %s)", vm.name(), vm.version());
+        return releasedNotice + String.format("Connected to %s (version %s)", vm.name(), vm.version());
+    }
+
+    /**
+     * Builds the one-line "previous session released" notice that {@link #connect} prepends when it
+     * tears down a differing (or dead) target before a fresh attach. Returns the empty string when
+     * no breakpoints or watchers were set — there is then nothing the agent needs warning about, and
+     * connect()'s reply stays terse. When specs <em>were</em> cleared, the notice names the counts
+     * and points at {@code jdwp_reconnect} as the preserve-across-restart alternative.
+     *
+     * <p>Package-private rather than private: the notice is only emitted on a live-VM target-switch
+     * success path (which needs a real attach), so the only feasible unit test calls this directly.
+     */
+    String describeReleasedSession() {
+        final int breakpoints =
+            breakpointTracker.getAllBreakpoints().size() + breakpointTracker.getAllPendingBreakpoints().size()
+            + breakpointTracker.getAllExceptionBreakpoints().size() + breakpointTracker.getAllPendingExceptionBreakpoints().size()
+            + breakpointTracker.getAllFieldBreakpoints().size() + breakpointTracker.getAllPendingFieldBreakpoints().size();
+        final int watchers = watcherManager.getAllWatchers().size();
+        if (breakpoints + watchers == 0) {
+            return "";
+        }
+        final String previousTarget = lastHost != null ? String.format("%s:%d", lastHost, lastPort) : "previous target";
+        return String.format(
+            "Released previous session at %s — %d breakpoint(s), %d watcher(s) cleared. "
+            + "(To keep specs across a same-target restart, use jdwp_reconnect instead.)%n",
+            previousTarget, breakpoints, watchers);
     }
 
     /**
      * Read-only snapshot of the connection target used by {@code jdwp_diagnose}. The
-     * {@code connected} field runs a fresh liveness probe ({@code vm.name()}) on every call,
-     * so callers must not cache the returned status — the underlying VM can die between calls.
+     * {@code connected} field runs a fresh round-tripping liveness probe ({@link #isVMResponsive()})
+     * on every call, so callers must not cache the returned status — the underlying VM can die
+     * between calls.
      */
     public synchronized ConnectionStatus getConnectionStatus() {
         return new ConnectionStatus(
-            vm != null && isVMAlive(),
+            vm != null && isVMResponsive(),
             lastConnectAttemptHost,
             lastConnectAttemptPort,
             lastConnectAttempt,
@@ -393,16 +482,31 @@ public class JDIConnectionService {
     }
 
     /**
-     * Disconnects from the JDWP server. Also stops the event listener and resets the breakpoint tracker.
+     * Disconnects from the JDWP server. Also stops the event listener and clears all session state
+     * (breakpoints, watchers, marks, object cache, event history, reconnect seed). The returned
+     * {@link DisconnectResult} snapshots what was cleared <em>before</em> {@link #cleanupSessionState()}
+     * zeroes it, so the tool layer can report it to the agent and steer toward {@code jdwp_reconnect}
+     * when breakpoints/watchers were worth preserving.
      *
-     * @return status message ("Disconnected" or "Not connected")
+     * @return a {@link DisconnectResult} describing what was cleared; {@code wasConnected() == false}
+     *         when there was no live VM (a no-op)
      */
-    public synchronized String disconnect() {
+    public synchronized DisconnectResult disconnect() {
         if (vm == null) {
-            return "Not connected";
+            return DisconnectResult.notConnected();
         }
+        // Snapshot the state about to be wiped, before cleanupSessionState() zeroes it.
+        final DisconnectResult result = new DisconnectResult(
+            true, lastHost, lastPort,
+            breakpointTracker.getAllBreakpoints().size() + breakpointTracker.getAllPendingBreakpoints().size(),
+            breakpointTracker.getAllExceptionBreakpoints().size() + breakpointTracker.getAllPendingExceptionBreakpoints().size(),
+            breakpointTracker.getAllFieldBreakpoints().size() + breakpointTracker.getAllPendingFieldBreakpoints().size(),
+            watcherManager.getAllWatchers().size(),
+            markedInstances.size(),
+            objectCache.size(),
+            eventHistory.size());
         cleanupSessionState();
-        return "Disconnected";
+        return result;
     }
 
     /**
@@ -581,6 +685,9 @@ public class JDIConnectionService {
             throw e;
         }
         lastConnectError = null;
+        // Fresh attach → new session epoch (see connect()); the RECONNECT event recorded below and
+        // everything after it is tagged as this session, segmented from the dead VM's tail.
+        eventHistory.beginNewSession();
         eventListener.start(vm);
         healthMonitor.start(vm);
 
@@ -684,6 +791,52 @@ public class JDIConnectionService {
         int restoredExceptionTotal, int restoredFieldTotal,
         int watchersPreserved, int markedInstancesLost, int objectCacheLost
     ) {}
+
+    /**
+     * Structured outcome of {@link #disconnect()} so the {@code jdwp_disconnect} tool can tell the
+     * agent exactly what session state the call discarded — a vanished breakpoint set should never
+     * be a silent surprise — and nudge it toward {@code jdwp_reconnect} when specs worth keeping
+     * were cleared. Counts are snapshotted under the service monitor immediately before
+     * {@link #cleanupSessionState()} zeroes them, so they reflect what this call actually threw away.
+     * {@code wasConnected == false} is the no-op case (no live VM); all counts are then zero.
+     *
+     * @param wasConnected         {@code true} when a live VM was attached and state was cleared
+     * @param host                 last attached host ({@code null} only in the not-connected case)
+     * @param port                 last attached port ({@code 0} in the not-connected case)
+     * @param lineBreakpoints      line BPs discarded (active + deferred)
+     * @param exceptionBreakpoints exception BPs discarded (active + deferred)
+     * @param fieldBreakpoints     field watchpoints discarded (active + deferred)
+     * @param watchers             watchers discarded
+     * @param markedInstances      marked instances released
+     * @param objectCacheEntries   cached object references dropped
+     * @param eventHistoryEntries  event-history entries cleared
+     */
+    public record DisconnectResult(
+        boolean wasConnected,
+        @Nullable String host,
+        int port,
+        int lineBreakpoints,
+        int exceptionBreakpoints,
+        int fieldBreakpoints,
+        int watchers,
+        int markedInstances,
+        int objectCacheEntries,
+        int eventHistoryEntries
+    ) {
+        static DisconnectResult notConnected() {
+            return new DisconnectResult(false, null, 0, 0, 0, 0, 0, 0, 0, 0);
+        }
+
+        /** Total breakpoints across line/exception/field, active + deferred. */
+        public int totalBreakpoints() {
+            return lineBreakpoints + exceptionBreakpoints + fieldBreakpoints;
+        }
+
+        /** {@code true} when the call discarded anything an agent might miss. */
+        public boolean clearedAnything() {
+            return totalBreakpoints() + watchers + markedInstances + objectCacheEntries + eventHistoryEntries > 0;
+        }
+    }
 
     /**
      * Returns the connected VirtualMachine, auto-reconnecting if the connection has dropped.

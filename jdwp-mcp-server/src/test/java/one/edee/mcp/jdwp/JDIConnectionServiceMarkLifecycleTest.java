@@ -100,9 +100,9 @@ class JDIConnectionServiceMarkLifecycleTest {
 		JDIConnectionServiceTestSupport.setVm(service, vm);
 		JDIConnectionServiceTestSupport.setLastSuccessfulAttach(service, "127.0.0.1", 1);
 
-		final String result = service.disconnect();
+		final JDIConnectionService.DisconnectResult result = service.disconnect();
 
-		assertThat(result).isEqualTo("Disconnected");
+		assertThat(result.wasConnected()).isTrue();
 		assertThat(registry.list()).isEmpty();
 	}
 
@@ -117,9 +117,9 @@ class JDIConnectionServiceMarkLifecycleTest {
 			new WatcherManager(), new EvaluationGuard(), registry);
 		// VM is null (no setVm call).
 
-		final String result = service.disconnect();
+		final JDIConnectionService.DisconnectResult result = service.disconnect();
 
-		assertThat(result).isEqualTo("Not connected");
+		assertThat(result.wasConnected()).isFalse();
 		// disconnect() short-circuits when vm is null, so the registry should still hold the mark.
 		assertThat(registry.list()).hasSize(1);
 	}

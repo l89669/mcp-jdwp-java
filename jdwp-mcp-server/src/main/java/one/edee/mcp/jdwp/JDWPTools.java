@@ -26,6 +26,8 @@ import java.lang.reflect.Modifier;
 import java.net.SocketException;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -84,6 +86,15 @@ public class JDWPTools {
             + "|field\\s+\\S*?\\.([A-Za-z_][A-Za-z_0-9]*)\\s+is not visible"
             + "|([A-Za-z_][A-Za-z_0-9]*)\\s+is not visible"
     );
+    /**
+     * Renders an event timestamp as {@code HH:mm:ss.SSS} (UTC, to match the stored {@link Instant}).
+     * Used by the event listings. A formatter is length-safe where the old
+     * {@code instant.toString().substring(11, 23)} was not: a whole-second {@code Instant} prints
+     * without a fractional part (a 20-char string), and the fixed substring then threw
+     * {@code StringIndexOutOfBoundsException}, collapsing the whole listing into an error.
+     */
+    private static final DateTimeFormatter EVENT_TIME_FORMAT =
+        DateTimeFormatter.ofPattern("HH:mm:ss.SSS").withZone(ZoneOffset.UTC);
     private final JDIConnectionService jdiService;
     private final BreakpointTracker breakpointTracker;
     private final WatcherManager watcherManager;
@@ -316,20 +327,54 @@ public class JDWPTools {
         return null;
     }
 
+    /**
+     * Builds the error returned when a thread the caller wants to <em>inspect</em>
+     * ({@code jdwp_get_stack}, {@code jdwp_get_locals}) is not JDI-suspended. A thread parked on a
+     * Java monitor ({@link ThreadReference#THREAD_STATUS_MONITOR}) or inside {@code Object.wait()}
+     * ({@link ThreadReference#THREAD_STATUS_WAIT}) — the deadlock case — will never stop at a
+     * breakpoint on its own, so the bare "stop it at a breakpoint" advice is a dead end for exactly
+     * the situation where reading the stack matters most. Point at {@code jdwp_suspend_thread}, which
+     * freezes the thread where it stands so its frames and locals become readable. For any other
+     * not-suspended status fall back to the same freeze-it advice alongside the breakpoint hint.
+     *
+     * <p>This is for read-only inspection only. {@code jdwp_suspend_thread} makes a MONITOR/WAIT
+     * thread's frames inspectable, but it does <em>not</em> make {@code invokeMethod}-based tools
+     * (evaluate / to_string / assert) usable on it — those keep the {@link #checkSafeToInvoke} guard.
+     */
+    private static String notSuspendedForInspection(ThreadReference thread) {
+        final int status = thread.status();
+        final long id = thread.uniqueID();
+        if (status == ThreadReference.THREAD_STATUS_MONITOR || status == ThreadReference.THREAD_STATUS_WAIT) {
+            final String parked = status == ThreadReference.THREAD_STATUS_MONITOR
+                ? "blocked on a Java monitor"
+                : "inside Object.wait()";
+            return String.format(
+                "Error: Thread '%s' (#%d) is %s but not JDI-suspended — it will never stop at a "
+                + "breakpoint on its own, so it cannot be inspected as-is. Call jdwp_suspend_thread(%d) "
+                + "to freeze it where it stands, then retry. This is the deadlock-inspection path.",
+                thread.name(), id, parked, id);
+        }
+        return String.format(
+            "Error: Thread '%s' (#%d) is not suspended (status %s). Stop it at a breakpoint, or call "
+            + "jdwp_suspend_thread(%d) to freeze it where it is, then inspect.",
+            thread.name(), id, ThreadFormatting.formatStatus(status), id);
+    }
+
     @McpTool(description = "Connect to the JDWP server using configuration from .mcp.json")
     public String jdwp_connect() {
         final String host = "localhost";
         final int port = JVM_JDWP_PORT;
 
         try {
-            return jdiService.connect(host, port);
+            return jdiService.connect(host, port) + " Next: set breakpoints, then jdwp_resume_until_event.";
         } catch (Exception e) {
             return String.format("""
                     [ERROR] Connection failed to %s:%d
-                    
+
                     Make sure your JVM is running with JDWP enabled:
                       -agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:%d
-                    
+                    Run jdwp_diagnose to list local JVMs and their JDWP ports.
+
                     Original error: %s""",
                 host, port, port, e.getMessage()
             );
@@ -404,9 +449,43 @@ public class JDWPTools {
         return baseMessage + '\n' + renderLocalJvmsBlock(status, false);
     }
 
-    @McpTool(description = "Disconnect from the JDWP server")
+    @McpTool(description = "Disconnect from the JDWP server. Clears ALL session state — breakpoints, "
+        + "watchers, marks, object cache, event history — and the reconnect seed. To keep breakpoints/"
+        + "watchers across a VM restart, use jdwp_reconnect (same target, specs preserved) instead.")
     public String jdwp_disconnect() {
-        return jdiService.disconnect();
+        return formatDisconnectReport(jdiService.disconnect());
+    }
+
+    /**
+     * Renders {@link JDIConnectionService.DisconnectResult} for the agent: names every category of
+     * session state the disconnect discarded so a vanished breakpoint set is never a silent surprise,
+     * and — only when specs worth keeping were cleared — points at {@code jdwp_reconnect} as the
+     * preserve-across-restart alternative. The preservation hint is gated on breakpoints/watchers
+     * being present so a bookkeeping disconnect (nothing set, or only caches) stays terse. Mirrors
+     * {@link #formatReconnectReport} in structure.
+     */
+    private static String formatDisconnectReport(JDIConnectionService.DisconnectResult r) {
+        if (!r.wasConnected()) {
+            return "Not connected — nothing to disconnect.";
+        }
+        final String target = r.host() != null ? String.format("%s:%d", r.host(), r.port()) : "the target VM";
+        if (!r.clearedAnything()) {
+            return String.format("Disconnected from %s. No breakpoints, watchers or cached state had been set.", target);
+        }
+        final StringBuilder out = new StringBuilder();
+        out.append(String.format("Disconnected from %s. Cleared all session state:%n", target));
+        out.append(String.format("  - Breakpoints: %d (line %d, exception %d, field %d)%n",
+            r.totalBreakpoints(), r.lineBreakpoints(), r.exceptionBreakpoints(), r.fieldBreakpoints()));
+        out.append(String.format("  - Watchers: %d%n", r.watchers()));
+        out.append(String.format("  - Marked instances: %d%n", r.markedInstances()));
+        out.append(String.format("  - Event history: %d%n", r.eventHistoryEntries()));
+        out.append(String.format("  - Object cache: %d (+ classpath discovery cache)", r.objectCacheEntries()));
+        // Token-optimized preservation hint — only when specs the agent likely wanted to keep were lost.
+        if (r.totalBreakpoints() + r.watchers() > 0) {
+            out.append(String.format("%nTo keep breakpoints/watchers across a VM restart, use jdwp_reconnect "
+                + "(re-attaches to the same target, specs preserved) instead of disconnect."));
+        }
+        return out.toString();
     }
 
     @McpTool(description =
@@ -497,6 +576,7 @@ public class JDWPTools {
                 renderThreadsCompact(result, threads);
             }
 
+            result.append("\n→ jdwp_get_stack(id) for a suspended thread.");
             return result.toString();
         } catch (Exception e) {
             return "Error: " + e.getMessage();
@@ -569,6 +649,140 @@ public class JDWPTools {
         }
     }
 
+    @McpTool(description = "Dump the monitor lock graph: which threads are blocked on a Java monitor, who holds it, and any deadlock cycles. Use this for 'why is everything stuck?' / suspected deadlock. Takes a transient VM-wide suspend/resume snapshot — balanced, so threads return to their prior state and a genuine deadlock stays deadlocked (this is a read-only probe in practice). NOTE: only synchronized-monitor contention shows here; threads parked in Object.wait() or java.util.concurrent Locks do not. Follow up with jdwp_suspend_thread(id) then jdwp_get_stack(id) to inspect a member.")
+    public String jdwp_dump_locks(
+        @McpToolParam(required = false, description = "Include JVM/JDK/test-runner internal threads (default: false)") @Nullable Boolean includeSystemThreads) {
+        try {
+            final boolean includeSystem = includeSystemThreads != null && includeSystemThreads;
+            final VirtualMachine vm = jdiService.getVM();
+            if (!vm.canGetCurrentContendedMonitor()) {
+                return "Error: the target VM does not support contended-monitor inspection "
+                    + "(canGetCurrentContendedMonitor=false), so the lock graph cannot be built.";
+            }
+            final boolean canGetOwner = vm.canGetMonitorInfo();
+
+            // A consistent lock snapshot needs every thread JDI-suspended — currentContendedMonitor()
+            // throws on a running thread. vm.suspend()/resume() is balanced: a thread already parked
+            // at a breakpoint keeps its prior suspend count, and a monitor-blocked (deadlocked)
+            // thread stays blocked regardless, so this reads as a non-intrusive probe.
+            vm.suspend();
+            try {
+                return renderLockGraph(vm, includeSystem, canGetOwner);
+            } finally {
+                vm.resume();
+            }
+        } catch (Exception e) {
+            return "Error: " + e.getMessage();
+        }
+    }
+
+    /**
+     * One thread blocked trying to enter a monitor that another thread holds — the rows rendered by
+     * {@link #jdwp_dump_locks}.
+     */
+    private record BlockedRow(long threadId, String name, String status, String monitor, String heldBy) {
+    }
+
+    /**
+     * Builds the blocked-thread table and any deadlock cycles from a snapshot of a (suspended) VM.
+     * Each blocked thread contributes a wait-for edge to {@code threadId → owner-of-contended-monitor}
+     * only when the owner is readable; {@link DeadlockAnalyzer} then finds cycles among those edges.
+     */
+    private static String renderLockGraph(VirtualMachine vm, boolean includeSystem, boolean canGetOwner) {
+        final List<ThreadReference> all = vm.allThreads();
+        final Map<Long, String> namesById = new HashMap<>();
+        for (ThreadReference t : all) {
+            try {
+                namesById.put(t.uniqueID(), t.name());
+            } catch (Exception ignore) {
+                // Name unreadable on a dying thread — it stays addressable by ID below.
+            }
+        }
+
+        final List<DeadlockAnalyzer.WaitForEdge> edges = new ArrayList<>();
+        final List<BlockedRow> blocked = new ArrayList<>();
+        for (ThreadReference t : all) {
+            if (!includeSystem && ThreadFormatting.isJvmInternalThread(t)) {
+                continue;
+            }
+            final ObjectReference monitor;
+            try {
+                monitor = t.currentContendedMonitor();
+            } catch (IncompatibleThreadStateException | ObjectCollectedException e) {
+                continue; // thread resumed, or the monitor was GC'd, in the snapshot gap — skip it
+            }
+            if (monitor == null) {
+                continue; // not blocked on a synchronized monitor
+            }
+            ThreadReference owner = null;
+            if (canGetOwner) {
+                try {
+                    owner = monitor.owningThread();
+                } catch (IncompatibleThreadStateException ignore) {
+                    // Owner not suspended — leave it unknown rather than failing the whole dump.
+                }
+            }
+            final long tid = t.uniqueID();
+            final String heldBy;
+            if (owner == null) {
+                heldBy = canGetOwner
+                    ? "(no current owner — monitor held via wait/notify or just released)"
+                    : "(unknown — VM lacks canGetMonitorInfo)";
+            } else {
+                final long oid = owner.uniqueID();
+                heldBy = String.format("#%d %s", oid, namesById.getOrDefault(oid, "?"));
+                edges.add(new DeadlockAnalyzer.WaitForEdge(tid, oid));
+            }
+            blocked.add(new BlockedRow(tid, namesById.getOrDefault(tid, "?"),
+                ThreadFormatting.formatStatus(t.status()), describeMonitor(monitor), heldBy));
+        }
+
+        if (blocked.isEmpty()) {
+            return "No threads are currently blocked on a Java monitor.\n"
+                + "(A suspected hang may instead be parked in Object.wait() or a java.util.concurrent "
+                + "Lock — neither shows in the monitor graph. Check jdwp_get_threads for WAIT-status threads.)";
+        }
+
+        final StringBuilder out = new StringBuilder();
+        out.append(String.format("%d thread(s) blocked on a monitor:%n%n", blocked.size()));
+        for (BlockedRow r : blocked) {
+            out.append(String.format("  #%d %s [%s]%n      waiting on: %s%n      held by:    %s%n",
+                r.threadId(), r.name(), r.status(), r.monitor(), r.heldBy()));
+        }
+
+        final List<List<Long>> cycles = DeadlockAnalyzer.findDeadlockCycles(edges);
+        if (cycles.isEmpty()) {
+            out.append(String.format("%nNo deadlock cycle detected among blocked threads.%n"));
+        } else {
+            out.append(String.format("%n⚠ DEADLOCK — %d cycle(s) detected:%n", cycles.size()));
+            for (int i = 0; i < cycles.size(); i++) {
+                final List<Long> cycle = cycles.get(i);
+                final StringBuilder chain = new StringBuilder();
+                for (final long id : cycle) {
+                    chain.append(String.format("#%d %s → ", id, namesById.getOrDefault(id, "?")));
+                }
+                final long head = cycle.get(0); // close the loop back to the first member
+                chain.append(String.format("#%d %s", head, namesById.getOrDefault(head, "?")));
+                out.append(String.format("  %d. %s%n", i + 1, chain));
+            }
+        }
+        out.append("\n→ jdwp_suspend_thread(id) then jdwp_get_stack(id) to inspect a blocked thread "
+            + "(it will never stop at a breakpoint on its own).");
+        return out.toString();
+    }
+
+    /**
+     * Human-readable identity for a contended monitor object: its declared type plus JDI unique ID,
+     * e.g. {@code one.edee.Account@123}. Degrades to a placeholder if the object is unreadable.
+     */
+    private static String describeMonitor(ObjectReference monitor) {
+        try {
+            return String.format("%s@%d", monitor.referenceType().name(), monitor.uniqueID());
+        } catch (Exception e) {
+            return "monitor@?";
+        }
+    }
+
     @McpTool(description = "Get the call stack for a specific thread. Defaults to top 10 user frames; junit/surefire/reflection internals are collapsed unless you pass includeNoise=true or raise maxFrames.")
     public String jdwp_get_stack(
         @McpToolParam(description = "Thread unique ID") long threadId,
@@ -585,7 +799,7 @@ public class JDWPTools {
             }
 
             if (!thread.isSuspended()) {
-                return "Error: Thread is not suspended. Thread must be stopped at a breakpoint.";
+                return notSuspendedForInspection(thread);
             }
 
             final List<StackFrame> frames = thread.frames();
@@ -595,6 +809,7 @@ public class JDWPTools {
 
             appendUserFrames(result, frames, limit, includeNoiseFrames, "");
 
+            result.append("\n→ jdwp_get_locals(threadId, frameIndex) for a frame's variables.");
             return result.toString();
         } catch (Exception e) {
             return "Error: " + e.getMessage();
@@ -610,6 +825,10 @@ public class JDWPTools {
             final ThreadReference thread = findThread(vm, threadId);
             if (thread == null) {
                 return "Error: Thread not found with ID " + threadId;
+            }
+
+            if (!thread.isSuspended()) {
+                return notSuspendedForInspection(thread);
             }
 
             final StackFrame frame = thread.frame(frameIndex);
@@ -683,7 +902,11 @@ public class JDWPTools {
             if (staleVmHint != null) {
                 return staleVmHint;
             }
-            return jdiService.getObjectFields(objectId);
+            final String fields = jdiService.getObjectFields(objectId);
+            if (fields.startsWith("[ERROR]") || fields.startsWith("Error:")) {
+                return fields;
+            }
+            return fields + "\n→ drill Object#N with jdwp_get_fields(N) or jdwp_to_string(N).";
         } catch (Exception e) {
             return "Error: " + e.getMessage();
         }
@@ -991,13 +1214,13 @@ public class JDWPTools {
         try {
             final VirtualMachine vm = jdiService.getVM();
             vm.resume();
-            return "All threads resumed";
+            return "All threads resumed. To wait for the next event, use jdwp_resume_until_event.";
         } catch (Exception e) {
             return "Error: " + e.getMessage();
         }
     }
 
-    @McpTool(description = "Resume the VM and BLOCK until the next breakpoint, step, or exception event fires (or timeout). Returns the same info as jdwp_get_current_thread on success. Replaces the manual 'resume → poll → poll' choreography. Returns one of: 'Event fired ...' on a breakpoint/step/exception hit, '[TIMEOUT] ...' when the deadline expires, '[VM_DEATH] ...' when the target VM died/disconnected before any event, or 'Wait interrupted' on thread interruption.")
+    @McpTool(description = "Resume the VM and BLOCK until the next breakpoint, step, or exception event fires (or timeout). Returns the same info as jdwp_get_current_thread on success. Replaces the manual 'resume → poll → poll' choreography. Returns one of: 'Event fired ...' on a breakpoint/step/exception hit, '[TIMEOUT] ...' when the deadline expires, '[VM_DEATH] ...' when the target VM died/disconnected before any event, '[NO_EVENT] ...' when the wait was released without a stop — the message states whether the session is still armed (just call again) or was cleared (re-set breakpoints), or 'Wait interrupted' on thread interruption.")
     public String jdwp_resume_until_event(
         @McpToolParam(required = false, description = "Maximum wait time in milliseconds (default: 30000)") @Nullable Integer timeoutMs) {
         final int deadlineMs = (timeoutMs != null && timeoutMs > 0) ? timeoutMs : 30_000;
@@ -1049,7 +1272,39 @@ public class JDWPTools {
             }
 
             if (snapshot == null) {
-                return "Event fired but no breakpoint thread recorded (this should not happen — check the listener logs).";
+                // The wait was released but no suspending snapshot exists and the tail is not
+                // VM_DEATH. Two very different situations produce this, and a fixed message gets
+                // one of them wrong: (a) a concurrent jdwp_reset / jdwp_disconnect (both fire the
+                // latch to free waiters, then null the snapshot) or a listener teardown — the
+                // session is gone and re-waiting would burn the deadline; or (b) the latch was
+                // tripped by a NON-suspending wakeup (an early lifecycle event, a resumed
+                // non-breakpoint thread) while the VM is alive and every breakpoint is still
+                // armed — here re-setting breakpoints is wasted work and calling again just works.
+                // Probe liveness + the breakpoint registry and steer accordingly rather than
+                // always blaming a teardown.
+                boolean vmAlive;
+                try {
+                    vm.allThreads();           // cheap round-trip; throws if the connection is gone
+                    vmAlive = true;
+                } catch (Exception probe) {
+                    vmAlive = false;
+                }
+                final int armed = breakpointTracker.getAllBreakpoints().size()
+                    + breakpointTracker.getAllPendingBreakpoints().size()
+                    + breakpointTracker.getAllExceptionBreakpoints().size()
+                    + breakpointTracker.getAllFieldBreakpoints().size();
+                if (vmAlive && armed > 0) {
+                    return String.format("[NO_EVENT] The wait was released without a suspending event, but the VM "
+                        + "is still connected and %d breakpoint(s) are still armed — nothing was cleared. The latch "
+                        + "was tripped by a non-suspending wakeup (e.g. an early lifecycle event), not a stop. Just "
+                        + "call jdwp_resume_until_event again to keep waiting — do NOT re-set your breakpoints. If "
+                        + "this repeats, inspect jdwp_overview to confirm the breakpoint locations are reachable.",
+                        armed);
+                }
+                return "[NO_EVENT] The wait was released without a suspending event and no breakpoint context is "
+                    + "available. The debug session looks cleared — likely a concurrent jdwp_reset / jdwp_disconnect "
+                    + "or a listener teardown. Re-check state with jdwp_overview (or jdwp_diagnose if the connection "
+                    + "looks wrong), re-set your breakpoints, then call jdwp_resume_until_event again.";
             }
             final ThreadReference thread = snapshot.thread();
             // P3-1: append source location to the happy path. The previous "Event fired. Thread: …"
@@ -1598,7 +1853,7 @@ public class JDWPTools {
         } else {
             for (EventHistory.DebugEvent ev : recent) {
                 out.append(String.format("  [%s] %s (%s)%n",
-                    ev.type(), ev.summary(), ev.timestamp().toString().substring(11, 23)));
+                    ev.type(), ev.summary(), EVENT_TIME_FORMAT.format(ev.timestamp())));
             }
         }
 
@@ -1812,7 +2067,7 @@ public class JDWPTools {
             }
 
             thread.suspend();
-            return String.format("Thread %d (%s) suspended", threadId, thread.name());
+            return String.format("Thread %d (%s) suspended. Inspect with jdwp_get_stack.", threadId, thread.name());
         } catch (Exception e) {
             return "Error: " + e.getMessage();
         }
@@ -1832,7 +2087,7 @@ public class JDWPTools {
             }
 
             thread.resume();
-            return String.format("Thread %d (%s) resumed", threadId, thread.name());
+            return String.format("Thread %d (%s) resumed. Use jdwp_resume_until_event to wait for the next event.", threadId, thread.name());
         } catch (Exception e) {
             return "Error: " + e.getMessage();
         }
@@ -1890,7 +2145,7 @@ public class JDWPTools {
             final Value newValue = createJdiValue(vm, parsedValue, localVar.type());
             frame.setValue(localVar, newValue);
 
-            return String.format("Variable '%s' set to %s in frame %d of thread %d", varName, value, frameIndex, threadId);
+            return String.format("Variable '%s' set to %s in frame %d of thread %d. Next: jdwp_step_over or jdwp_resume to continue.", varName, value, frameIndex, threadId);
         } catch (ClassNotLoadedException notLoaded) {
             return String.format(
                 "Error setting variable: type '%s' is not yet loaded in the target VM, so JDI cannot validate the assignment. "
@@ -1928,7 +2183,7 @@ public class JDWPTools {
             final Value newValue = createJdiValue(vm, parsedValue, field.type());
             obj.setValue(field, newValue);
 
-            return String.format("Field '%s.%s' set to %s", obj.referenceType().name(), fieldName, value);
+            return String.format("Field '%s.%s' set to %s. Next: jdwp_step_over or jdwp_resume to continue.", obj.referenceType().name(), fieldName, value);
         } catch (Exception e) {
             return "Error setting field: " + e.getMessage();
         }
@@ -1999,6 +2254,30 @@ public class JDWPTools {
                 label, startLocation, thread.uniqueID(), thread.name());
         } catch (Exception e) {
             return "Error: " + e.getMessage();
+        }
+    }
+
+    /**
+     * Builds a "did you mean…" hint for a breakpoint that just deferred because its class isn't
+     * loaded. Scans the loaded classes for names resembling {@code className} (see
+     * {@link ClassNameMatcher}) and returns a one-line note, or {@code ""} when nothing is close.
+     * Best-effort: a misspelled fully-qualified name otherwise defers forever with no signal, so
+     * this is the cheap guard against that footgun — and it never fails a BP set if the lookup
+     * throws (e.g. the VM died between the deferral and this scan).
+     */
+    private String deferredClassSuggestion(VirtualMachine vm, String className) {
+        try {
+            final List<String> loaded = vm.allClasses().stream().map(ReferenceType::name).toList();
+            final List<String> suggestions = ClassNameMatcher.suggest(loaded, className, 3);
+            if (suggestions.isEmpty()) {
+                return "";
+            }
+            return String.format(
+                "%n  ⚠ No loaded class matches '%s'. Did you mean: %s ? "
+                + "(If the class genuinely hasn't loaded yet, ignore this.)",
+                className, String.join(", ", suggestions));
+        } catch (Exception e) {
+            return "";
         }
     }
 
@@ -2116,7 +2395,8 @@ public class JDWPTools {
 
                 return String.format("Breakpoint deferred for %s:%d (ID: %d, suspend: %s%s%s). " +
                         "Class not yet loaded — will activate automatically when the JVM loads it.",
-                    className, lineNumber, pendingId, policyLabel, conditionInfo, chainInfo);
+                    className, lineNumber, pendingId, policyLabel, conditionInfo, chainInfo)
+                    + deferredClassSuggestion(vm, className);
             }
 
             final ReferenceType refType = classes.get(0);
@@ -2160,6 +2440,17 @@ public class JDWPTools {
             return "Error: " + e.getMessage();
         }
     }
+
+    /**
+     * Appended to every logpoint confirmation (line / field / exception) so the agent knows where
+     * output lands and how to retrieve it. Logpoints never suspend and never push anything back into
+     * the agent's turn — so unlike a breakpoint there is no "Event fired" response to react to. The
+     * only way to see logpoint results is to pull the event log on demand. This single sentence makes
+     * the otherwise-implicit set → run → read chain explicit at the point the agent arms the logpoint.
+     */
+    private static final String LOGPOINT_READBACK_HINT =
+        " Each hit is appended to the event log the moment it fires (execution is never paused and "
+        + "nothing is pushed to you) — read the accumulated hits any time with jdwp_get_events.";
 
     @McpTool(description = "Set a logpoint (non-stopping breakpoint) that evaluates an expression and logs the result without pausing execution. Supports an optional condition — the expression is only logged when the condition evaluates to true. Both expression and condition support `{ block }` syntax for multi-statement. By default the logpoint is registered passively: if the class is not yet loaded, it is deferred via a ClassPrepareRequest and activates on natural load. Pass forceLoad=true to force the class load (runs `<clinit>`, may mask lazy-init diagnostics).")
     public String jdwp_set_logpoint(
@@ -2224,19 +2515,23 @@ public class JDWPTools {
                             }
                             return String.format("Logpoint set at %s:%d (ID: %d, expression: %s%s) " +
                                     "(bound by a concurrent activation path)",
-                                className, lineNumber, pendingId, expression, conditionInfo);
+                                className, lineNumber, pendingId, expression, conditionInfo)
+                                + LOGPOINT_READBACK_HINT;
                         }
                         // Won the promotion — emit the multi-location diagnostic for THIS bind. Same
                         // rationale as jdwp_set_breakpoint.
                         return String.format("Logpoint set at %s:%d (ID: %d, expression: %s%s%s)",
                             className, lineNumber, pendingId, expression, conditionInfo,
-                            multiLocationDiagnostic(pendingId, className, lineNumber, locations, boundLocation, "LP"));
+                            multiLocationDiagnostic(pendingId, className, lineNumber, locations, boundLocation, "LP"))
+                            + LOGPOINT_READBACK_HINT;
                     }
                 }
 
                 return String.format("Logpoint deferred for %s:%d (ID: %d, expression: %s%s). " +
                         "Class not yet loaded — will activate when the JVM loads it.",
-                    className, lineNumber, pendingId, expression, conditionInfo);
+                    className, lineNumber, pendingId, expression, conditionInfo)
+                    + deferredClassSuggestion(vm, className)
+                    + LOGPOINT_READBACK_HINT;
             }
 
             final ReferenceType refType = classes.get(0);
@@ -2259,7 +2554,8 @@ public class JDWPTools {
             // Diagnostic — see jdwp_set_breakpoint for the rationale.
             return String.format("Logpoint set at %s:%d (ID: %d, expression: %s%s%s)",
                 className, lineNumber, breakpointId, expression, conditionInfo,
-                multiLocationDiagnostic(breakpointId, className, lineNumber, locations, boundLocation, "LP"));
+                multiLocationDiagnostic(breakpointId, className, lineNumber, locations, boundLocation, "LP"))
+                + LOGPOINT_READBACK_HINT;
         } catch (AbsentInformationException e) {
             cleanupOrphanPendingBreakpoint(pendingIdForCleanup);
             return "Error: No line number information available. Compile with debug info (-g).";
@@ -2317,7 +2613,7 @@ public class JDWPTools {
             locations.size(), boundDesc, kind);
     }
 
-    @McpTool(description = "Clear a breakpoint by its synthetic ID (from jdwp_overview). Routes by kind: line, exception, and field breakpoints share one ID space.")
+    @McpTool(description = "Clear a breakpoint by its synthetic ID (from jdwp_overview). Routes by kind: line, exception, and field breakpoints share one ID space. After clearing mid-session, continue with jdwp_resume_until_event.")
     public String jdwp_clear_breakpoint(@McpToolParam(description = "Breakpoint ID to clear") int breakpointId) {
         try {
             // Distinguish "unknown" from "wrong kind" up-front. Cascade BEFORE removal so
@@ -2531,15 +2827,25 @@ public class JDWPTools {
             }
 
             final StringBuilder result = new StringBuilder();
-            result.append(String.format("Recent events (%d of %d total):\n\n", events.size(), eventHistory.size()));
+            result.append(String.format("Recent events (%d of %d total; current session s%d):\n\n",
+                events.size(), eventHistory.size(), eventHistory.currentEpoch()));
 
+            // Each line carries its session tag (sN); a divider is drawn whenever the epoch changes
+            // between consecutive events, so a VM_DEATH→RECONNECT boundary (events preserved across
+            // an auto-reconnect) reads as two distinct sessions rather than one confusing stream.
+            int prevEpoch = Integer.MIN_VALUE;
             for (int i = 0; i < events.size(); i++) {
                 final EventHistory.DebugEvent event = events.get(i);
-                result.append(String.format("%d. [%s] %s (%s)\n",
-                    i + 1, event.type(), event.summary(),
-                    event.timestamp().toString().substring(11, 23)));
+                if (i > 0 && event.sessionEpoch() != prevEpoch) {
+                    result.append(String.format("   ── session s%d (new VM attachment) ──%n", event.sessionEpoch()));
+                }
+                prevEpoch = event.sessionEpoch();
+                result.append(String.format("%d. [s%d] [%s] %s (%s)\n",
+                    i + 1, event.sessionEpoch(), event.type(), event.summary(),
+                    EVENT_TIME_FORMAT.format(event.timestamp())));
             }
 
+            result.append("\n→ jdwp_get_breakpoint_context for BREAKPOINT entries; logpoint/exception results are inline above.");
             return result.toString();
         } catch (Exception e) {
             return "Error: " + e.getMessage();
@@ -2676,7 +2982,9 @@ public class JDWPTools {
                     isLogpoint ? "log-only" : "suspend",
                     expressionLine,
                     conditionLine,
-                    chainInfo);
+                    chainInfo)
+                    + deferredClassSuggestion(vm, exceptionClass)
+                    + (isLogpoint ? LOGPOINT_READBACK_HINT : "");
             }
 
             // Create the exception request DISABLED, finish wiring it up (including the chain
@@ -2704,7 +3012,8 @@ public class JDWPTools {
                 isLogpoint ? "log-only" : "suspend",
                 expressionLine,
                 conditionLine,
-                chainInfo);
+                chainInfo)
+                + (isLogpoint ? LOGPOINT_READBACK_HINT : "");
         } catch (Exception e) {
             return "Error: " + e.getMessage();
         }
@@ -2876,7 +3185,9 @@ public class JDWPTools {
                         Class not yet loaded — will activate automatically when the JVM loads it.""",
                     pendingId, className, fieldName, watchMode.name().toLowerCase(Locale.ROOT),
                     isLogpoint ? "log-only" : "suspend",
-                    expressionLine, conditionLine, filterLine, chainInfo, excludeLine, objectFilterWarning);
+                    expressionLine, conditionLine, filterLine, chainInfo, excludeLine, objectFilterWarning)
+                    + deferredClassSuggestion(vm, className)
+                    + (isLogpoint ? LOGPOINT_READBACK_HINT : "");
             }
 
             // Resolve the field on the eagerly-loaded class. Ambiguous (declared on multiple types
@@ -2952,7 +3263,8 @@ public class JDWPTools {
                       Mode: %s (%s)%s%s%s%s%s""",
                 id, className, fieldName, watchMode.name().toLowerCase(Locale.ROOT),
                 isLogpoint ? "log-only" : "suspend",
-                expressionLine, conditionLine, filterLine, chainInfo, excludeLine);
+                expressionLine, conditionLine, filterLine, chainInfo, excludeLine)
+                + (isLogpoint ? LOGPOINT_READBACK_HINT : "");
         } catch (Exception e) {
             return "Error: " + e.getMessage();
         }
@@ -3027,7 +3339,7 @@ public class JDWPTools {
         final int total = activeBp + pendingBp + activeExBp + pendingExBp
             + activeFieldBp + pendingFieldBp + watchers + events;
         if (total == 0) {
-            return header + " Nothing was set.";
+            return header + " Nothing was set. Next: set breakpoints, then jdwp_resume_until_event.";
         }
         return String.format("""
                 %s
@@ -3038,7 +3350,8 @@ public class JDWPTools {
                   Event history cleared:         %d entries
                   Object cache cleared.""",
             header, activeBp, pendingBp, activeExBp, pendingExBp,
-            activeFieldBp, pendingFieldBp, watchers, events);
+            activeFieldBp, pendingFieldBp, watchers, events)
+            + " Next: set breakpoints, then jdwp_resume_until_event.";
     }
 
     // ========================================
@@ -3103,7 +3416,7 @@ public class JDWPTools {
                 return String.format("[ERROR] No mark named '%s'. "
                     + "Use jdwp_overview(types=\"mark\") to list current marks.", label);
             }
-            return String.format("✓ Removed mark $%s", label);
+            return String.format("✓ Removed mark $%s — jdwp_overview(types=\"mark\") for remaining marks.", label);
         } catch (Exception e) {
             return "Error: " + e.getMessage();
         }
@@ -3115,7 +3428,7 @@ public class JDWPTools {
         @McpToolParam(description = "New label (Java identifier, no $ sigil)") String newLabel) {
         try {
             markedInstances.rename(oldLabel, newLabel);
-            return String.format("✓ Renamed $%s -> $%s", oldLabel, newLabel);
+            return String.format("✓ Renamed $%s -> $%s — reference the new label as $%s in expressions, BPs, logpoints, watchers.", oldLabel, newLabel, newLabel);
         } catch (IllegalArgumentException notFound) {
             return "[ERROR] " + notFound.getMessage();
         } catch (IllegalStateException collision) {
@@ -3782,7 +4095,7 @@ public class JDWPTools {
         }
     }
 
-    @McpTool(description = "Get the thread ID of the current breakpoint")
+    @McpTool(description = "Get the thread ID of the current breakpoint. Prefer jdwp_get_breakpoint_context (thread+stack+locals+fields in one call).")
     public String jdwp_get_current_thread() {
         try {
             final BreakpointTracker.LastBreakpoint snapshot = breakpointTracker.getLastBreakpoint();
@@ -3886,6 +4199,7 @@ public class JDWPTools {
                 result.append(String.format("   Expression: %s\n\n", w.getExpression()));
             }
 
+            result.append("\n→ jdwp_evaluate_watchers(threadId, \"current_frame\", bpId) when the BP fires.");
             return result.toString();
 
         } catch (Exception e) {

@@ -1,0 +1,52 @@
+name: CI
+
+# Runs the unit-test suite on every push to main and on every pull request
+# targeting main, so regressions are caught on the server. release.yml only
+# fires on v* tags and never exercised ordinary commits — this is the missing
+# test gate. The genuine tests live in jdwp-mcp-server; jdwp-sandbox's
+# expected-to-fail "test flight" classes are skipped by the default
+# `./mvnw test`, so a healthy build stays green.
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+# Read-only: the test job never writes to the repo or touches releases.
+permissions:
+  contents: read
+
+# Cancel superseded runs for the same pull request; let main-branch runs finish
+# so every landed commit is verified end to end.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      # Actions pinned to SHA (same pins as release.yml) so a moved major-version
+      # tag can't pull in a malicious commit; the comment shows the tag at pin time.
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      # setup-java also writes a ~/.m2/toolchains.xml entry for this JDK, which
+      # satisfies the parent POM's maven-toolchains-plugin (<version>[21,)</version>,
+      # no vendor constraint). Java 21 matches release.yml; the reactor still
+      # targets Java 17 bytecode via maven-compiler-plugin <release>.
+      - name: Set up JDK 21
+        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654  # v5.2.0
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      # `./mvnw test` compiles the whole reactor — so NullAway / Error Prone run
+      # as a gate too — and runs the jdwp-mcp-server unit tests. jdwp-sandbox's
+      # deliberately-broken "test flight" classes are skipped by default.
+      - name: Build and test
+        run: ./mvnw --batch-mode --no-transfer-progress test
