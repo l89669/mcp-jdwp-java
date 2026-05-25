@@ -316,6 +316,39 @@ public class JDWPTools {
         return null;
     }
 
+    /**
+     * Builds the error returned when a thread the caller wants to <em>inspect</em>
+     * ({@code jdwp_get_stack}, {@code jdwp_get_locals}) is not JDI-suspended. A thread parked on a
+     * Java monitor ({@link ThreadReference#THREAD_STATUS_MONITOR}) or inside {@code Object.wait()}
+     * ({@link ThreadReference#THREAD_STATUS_WAIT}) — the deadlock case — will never stop at a
+     * breakpoint on its own, so the bare "stop it at a breakpoint" advice is a dead end for exactly
+     * the situation where reading the stack matters most. Point at {@code jdwp_suspend_thread}, which
+     * freezes the thread where it stands so its frames and locals become readable. For any other
+     * not-suspended status fall back to the same freeze-it advice alongside the breakpoint hint.
+     *
+     * <p>This is for read-only inspection only. {@code jdwp_suspend_thread} makes a MONITOR/WAIT
+     * thread's frames inspectable, but it does <em>not</em> make {@code invokeMethod}-based tools
+     * (evaluate / to_string / assert) usable on it — those keep the {@link #checkSafeToInvoke} guard.
+     */
+    private static String notSuspendedForInspection(ThreadReference thread) {
+        final int status = thread.status();
+        final long id = thread.uniqueID();
+        if (status == ThreadReference.THREAD_STATUS_MONITOR || status == ThreadReference.THREAD_STATUS_WAIT) {
+            final String parked = status == ThreadReference.THREAD_STATUS_MONITOR
+                ? "blocked on a Java monitor"
+                : "inside Object.wait()";
+            return String.format(
+                "Error: Thread '%s' (#%d) is %s but not JDI-suspended — it will never stop at a "
+                + "breakpoint on its own, so it cannot be inspected as-is. Call jdwp_suspend_thread(%d) "
+                + "to freeze it where it stands, then retry. This is the deadlock-inspection path.",
+                thread.name(), id, parked, id);
+        }
+        return String.format(
+            "Error: Thread '%s' (#%d) is not suspended (status %s). Stop it at a breakpoint, or call "
+            + "jdwp_suspend_thread(%d) to freeze it where it is, then inspect.",
+            thread.name(), id, ThreadFormatting.formatStatus(status), id);
+    }
+
     @McpTool(description = "Connect to the JDWP server using configuration from .mcp.json")
     public String jdwp_connect() {
         final String host = "localhost";
@@ -587,7 +620,7 @@ public class JDWPTools {
             }
 
             if (!thread.isSuspended()) {
-                return "Error: Thread is not suspended. Thread must be stopped at a breakpoint.";
+                return notSuspendedForInspection(thread);
             }
 
             final List<StackFrame> frames = thread.frames();
@@ -613,6 +646,10 @@ public class JDWPTools {
             final ThreadReference thread = findThread(vm, threadId);
             if (thread == null) {
                 return "Error: Thread not found with ID " + threadId;
+            }
+
+            if (!thread.isSuspended()) {
+                return notSuspendedForInspection(thread);
             }
 
             final StackFrame frame = thread.frame(frameIndex);
