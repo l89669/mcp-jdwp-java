@@ -2191,6 +2191,30 @@ public class JDWPTools {
         }
     }
 
+    /**
+     * Builds a "did you mean…" hint for a breakpoint that just deferred because its class isn't
+     * loaded. Scans the loaded classes for names resembling {@code className} (see
+     * {@link ClassNameMatcher}) and returns a one-line note, or {@code ""} when nothing is close.
+     * Best-effort: a misspelled fully-qualified name otherwise defers forever with no signal, so
+     * this is the cheap guard against that footgun — and it never fails a BP set if the lookup
+     * throws (e.g. the VM died between the deferral and this scan).
+     */
+    private String deferredClassSuggestion(VirtualMachine vm, String className) {
+        try {
+            final List<String> loaded = vm.allClasses().stream().map(ReferenceType::name).toList();
+            final List<String> suggestions = ClassNameMatcher.suggest(loaded, className, 3);
+            if (suggestions.isEmpty()) {
+                return "";
+            }
+            return String.format(
+                "%n  ⚠ No loaded class matches '%s'. Did you mean: %s ? "
+                + "(If the class genuinely hasn't loaded yet, ignore this.)",
+                className, String.join(", ", suggestions));
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
     @McpTool(description = "Set a breakpoint at a specific line in a class. Supports conditional breakpoints — conditions support `{ block }` syntax for multi-statement. By default the breakpoint is registered passively: if the class is not yet loaded, the BP is deferred via a ClassPrepareRequest and activates when the JVM loads the class on its own — same behaviour as IntelliJ / Eclipse / jdb. Pass forceLoad=true only when you need the breakpoint to bind immediately and accept that loading the class will run its `<clinit>` (early static init, eager dependency loads, masked lazy-load diagnostics).")
     public String jdwp_set_breakpoint(
         @McpToolParam(description = "Fully qualified class name (e.g. 'com.example.MyClass')") String className,
@@ -2305,7 +2329,8 @@ public class JDWPTools {
 
                 return String.format("Breakpoint deferred for %s:%d (ID: %d, suspend: %s%s%s). " +
                         "Class not yet loaded — will activate automatically when the JVM loads it.",
-                    className, lineNumber, pendingId, policyLabel, conditionInfo, chainInfo);
+                    className, lineNumber, pendingId, policyLabel, conditionInfo, chainInfo)
+                    + deferredClassSuggestion(vm, className);
             }
 
             final ReferenceType refType = classes.get(0);
@@ -2439,6 +2464,7 @@ public class JDWPTools {
                 return String.format("Logpoint deferred for %s:%d (ID: %d, expression: %s%s). " +
                         "Class not yet loaded — will activate when the JVM loads it.",
                     className, lineNumber, pendingId, expression, conditionInfo)
+                    + deferredClassSuggestion(vm, className)
                     + LOGPOINT_READBACK_HINT;
             }
 
@@ -2882,6 +2908,7 @@ public class JDWPTools {
                     expressionLine,
                     conditionLine,
                     chainInfo)
+                    + deferredClassSuggestion(vm, exceptionClass)
                     + (isLogpoint ? LOGPOINT_READBACK_HINT : "");
             }
 
@@ -3084,6 +3111,7 @@ public class JDWPTools {
                     pendingId, className, fieldName, watchMode.name().toLowerCase(Locale.ROOT),
                     isLogpoint ? "log-only" : "suspend",
                     expressionLine, conditionLine, filterLine, chainInfo, excludeLine, objectFilterWarning)
+                    + deferredClassSuggestion(vm, className)
                     + (isLogpoint ? LOGPOINT_READBACK_HINT : "");
             }
 
