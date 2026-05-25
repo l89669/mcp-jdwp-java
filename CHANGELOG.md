@@ -5,6 +5,62 @@ All notable changes to the `jdwp-debugging` plugin are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.7.0] — 2026-05-25
+
+### New — see the lock graph, not just the threads
+
+A 9-flight test-flight retrospective surfaced the same recurring friction:
+`jdwp_get_threads` tells you a thread is in `MONITOR` status, but not *what*
+it's blocked on or *who* holds the lock — so reconstructing a deadlock meant
+suspending each thread and reading locals by hand. The new tool answers it in
+one call, the natural sequel to 2.6.2's deadlock-inspection error message.
+
+- **`jdwp_dump_locks`** — takes a balanced VM-wide suspend/resume snapshot,
+  reads each thread's contended monitor and its owning thread, and prints the
+  blocked-thread table plus any **deadlock cycle** (e.g.
+  `transfer-A-to-B → transfer-B-to-A → …`). Cycle detection is a pure,
+  JDI-free `DeadlockAnalyzer`. The suspend/resume is balanced, so a genuine
+  deadlock stays put and a healthy VM is undisturbed; only synchronized-monitor
+  contention shows (not `Object.wait()` / `java.util.concurrent` Locks).
+  (resolves #23)
+
+### Fixed — a misspelled breakpoint class no longer defers in silence
+
+A breakpoint set on a fully-qualified class name that doesn't match anything
+(`Config` for `Configuration`) deferred forever, with a message
+indistinguishable from a genuinely not-yet-loaded class — a silent dead end
+that cost a flight ~13 wasted calls.
+
+- **Near-match class suggestions** — when a breakpoint defers because its class
+  isn't loaded, the response now scans the loaded classes for resembling names
+  (simple-name exact/prefix match + bounded edit distance) and appends a
+  *"did you mean…"* hint. Applies to line, logpoint, field, and exception
+  breakpoints; best-effort, never fails a breakpoint set. (resolves #24)
+- **Length-safe event timestamps** — the event listing formatted times with a
+  fixed `substring(11, 23)` that threw on a whole-second `Instant` (which prints
+  without a fraction), collapsing `jdwp_get_events` into an error. It now uses a
+  length-safe `HH:mm:ss.SSS` formatter.
+
+### Changed — event history is now segmented by session
+
+The `jdwp_get_events` log is deliberately preserved across a VM death (so the
+`VM_DEATH` and the events leading to it stay readable), but on an auto-reconnect
+to a relaunched target the old VM's events bled into the new session's stream
+with no way to tell them apart.
+
+- **Session-epoch tagging** — every event carries a monotonic session epoch,
+  bumped on each attach; `jdwp_get_events` shows a per-line `s1`/`s2` tag and a
+  divider at each new-VM boundary, so a death-then-reconnect reads as two clean
+  segments without discarding the pre-death evidence. (resolves #25)
+
+### Docs
+
+- **`java-debug` skill discoverability** — a deadlock recipe built around
+  `jdwp_dump_locks`; guidance to launch fast-finishing tests with `suspend=y` +
+  `jdwp_wait_for_attach` so the VM can't die before breakpoints are armed; and a
+  note that the event log survives a VM death (use `jdwp_clear_events` to start
+  clean). (resolves #26)
+
 ## [2.6.2] — 2026-05-25
 
 ### Fixed — inspecting a deadlocked thread now points the way
