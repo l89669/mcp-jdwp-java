@@ -5,6 +5,42 @@ All notable changes to the `jdwp-debugging` plugin are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.8.1] — 2026-05-25
+
+### Fixed — straight answers when evaluation can't see what it needs
+
+Two paths returned dead-ends that steered agents the wrong way.
+`jdwp_resume_until_event` could wake without a stop and flatly blame a concurrent
+`jdwp_reset` / `jdwp_disconnect` — telling you to re-arm breakpoints that were, in
+fact, still armed on a live VM. And any expression evaluated on a stack frame from
+a target compiled without a local-variable table failed with the opaque
+`Expression evaluation failed: null`, even when the expression touched no locals at
+all — the common case for field logpoints using only `$oldValue` / `$newValue`.
+Both now do the check they were skipping.
+
+- **`[NO_EVENT]` checks before it advises** — the no-stop branch now probes VM
+  liveness and the breakpoint registry. If the VM is alive with breakpoints still
+  armed, it says so and tells you to simply call again (do *not* re-arm); only a
+  genuinely cleared session gets the re-setup guidance. `[NO_EVENT]` is now also
+  listed in the tool's documented return values. (resolves #27)
+- **Expressions evaluate without a local-variable table** — a frame from a target
+  built without `-g:vars` (plain `javac`, `-g:none`, or a stripped release) no
+  longer aborts the whole evaluation. Locals are skipped when absent and the
+  expression runs against `this` + the synthetic bindings; an expression that
+  *does* name a missing local now gets a clear "cannot be resolved" compile error
+  instead of `null`. (resolves #29)
+
+### Docs — field watchpoints: what they catch, honestly
+
+- **Reflective writes are not caught — corrected** — `docs/breakpoints.md` claimed
+  a reflective `Field.set` / `Unsafe` write was "fully visible to a watchpoint",
+  contradicting the java-debug skill and the JVM itself. Verified live on JDK 17: a
+  modification watchpoint fires on constructor and direct assignments but stays
+  silent on a reflective `Field.set` of the same field. The docs now say so, drop a
+  test-flight spoiler, and add the reference-vs-contents distinction — a watchpoint
+  fires on the field's slot, not on in-place mutation of the object it references.
+  (resolves #28)
+
 ## [2.8.0] — 2026-05-25
 
 ### Fixed — disconnect no longer wipes your session in silence
