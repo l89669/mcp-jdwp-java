@@ -330,19 +330,23 @@ public class JDIConnectionService {
         lastConnectAttempt = Instant.now();
         lastConnectAttemptHost = host;
         lastConnectAttemptPort = port;
+        String releasedNotice = "";
         if (vm != null && isVMResponsive()) {
             if (host.equals(lastHost) && port == lastPort) {
                 lastConnectError = null;
                 return "Already connected to " + vm.name();
             }
             // Deliberate host/port change — release current session so the fresh attach below
-            // does not leak breakpoints / watchers / ObjectReferences across targets.
+            // does not leak breakpoints / watchers / ObjectReferences across targets. Snapshot the
+            // discarded-spec notice first so connect() does not silently drop them on the floor.
+            releasedNotice = describeReleasedSession();
             log.info("[JDI] Switching target from {}:{} to {}:{} — releasing current session",
                 lastHost, lastPort, host, port);
             cleanupSessionState();
         } else if (vm != null) {
             // Probe said dead but the field is still non-null — wipe stale session caches
             // before the fresh attach so they cannot leak across attachments.
+            releasedNotice = describeReleasedSession();
             log.info("[JDI] Clearing stale state from previous (dead) VM connection");
             cleanupSessionState();
         }
@@ -390,7 +394,33 @@ public class JDIConnectionService {
         // listener subsequently sees a full silence window.
         healthMonitor.start(vm);
 
-        return String.format("Connected to %s (version %s)", vm.name(), vm.version());
+        return releasedNotice + String.format("Connected to %s (version %s)", vm.name(), vm.version());
+    }
+
+    /**
+     * Builds the one-line "previous session released" notice that {@link #connect} prepends when it
+     * tears down a differing (or dead) target before a fresh attach. Returns the empty string when
+     * no breakpoints or watchers were set — there is then nothing the agent needs warning about, and
+     * connect()'s reply stays terse. When specs <em>were</em> cleared, the notice names the counts
+     * and points at {@code jdwp_reconnect} as the preserve-across-restart alternative.
+     *
+     * <p>Package-private rather than private: the notice is only emitted on a live-VM target-switch
+     * success path (which needs a real attach), so the only feasible unit test calls this directly.
+     */
+    String describeReleasedSession() {
+        final int breakpoints =
+            breakpointTracker.getAllBreakpoints().size() + breakpointTracker.getAllPendingBreakpoints().size()
+            + breakpointTracker.getAllExceptionBreakpoints().size() + breakpointTracker.getAllPendingExceptionBreakpoints().size()
+            + breakpointTracker.getAllFieldBreakpoints().size() + breakpointTracker.getAllPendingFieldBreakpoints().size();
+        final int watchers = watcherManager.getAllWatchers().size();
+        if (breakpoints + watchers == 0) {
+            return "";
+        }
+        final String previousTarget = lastHost != null ? String.format("%s:%d", lastHost, lastPort) : "previous target";
+        return String.format(
+            "Released previous session at %s — %d breakpoint(s), %d watcher(s) cleared. "
+            + "(To keep specs across a same-target restart, use jdwp_reconnect instead.)%n",
+            previousTarget, breakpoints, watchers);
     }
 
     /**
@@ -452,16 +482,31 @@ public class JDIConnectionService {
     }
 
     /**
-     * Disconnects from the JDWP server. Also stops the event listener and resets the breakpoint tracker.
+     * Disconnects from the JDWP server. Also stops the event listener and clears all session state
+     * (breakpoints, watchers, marks, object cache, event history, reconnect seed). The returned
+     * {@link DisconnectResult} snapshots what was cleared <em>before</em> {@link #cleanupSessionState()}
+     * zeroes it, so the tool layer can report it to the agent and steer toward {@code jdwp_reconnect}
+     * when breakpoints/watchers were worth preserving.
      *
-     * @return status message ("Disconnected" or "Not connected")
+     * @return a {@link DisconnectResult} describing what was cleared; {@code wasConnected() == false}
+     *         when there was no live VM (a no-op)
      */
-    public synchronized String disconnect() {
+    public synchronized DisconnectResult disconnect() {
         if (vm == null) {
-            return "Not connected";
+            return DisconnectResult.notConnected();
         }
+        // Snapshot the state about to be wiped, before cleanupSessionState() zeroes it.
+        final DisconnectResult result = new DisconnectResult(
+            true, lastHost, lastPort,
+            breakpointTracker.getAllBreakpoints().size() + breakpointTracker.getAllPendingBreakpoints().size(),
+            breakpointTracker.getAllExceptionBreakpoints().size() + breakpointTracker.getAllPendingExceptionBreakpoints().size(),
+            breakpointTracker.getAllFieldBreakpoints().size() + breakpointTracker.getAllPendingFieldBreakpoints().size(),
+            watcherManager.getAllWatchers().size(),
+            markedInstances.size(),
+            objectCache.size(),
+            eventHistory.size());
         cleanupSessionState();
-        return "Disconnected";
+        return result;
     }
 
     /**
@@ -746,6 +791,52 @@ public class JDIConnectionService {
         int restoredExceptionTotal, int restoredFieldTotal,
         int watchersPreserved, int markedInstancesLost, int objectCacheLost
     ) {}
+
+    /**
+     * Structured outcome of {@link #disconnect()} so the {@code jdwp_disconnect} tool can tell the
+     * agent exactly what session state the call discarded — a vanished breakpoint set should never
+     * be a silent surprise — and nudge it toward {@code jdwp_reconnect} when specs worth keeping
+     * were cleared. Counts are snapshotted under the service monitor immediately before
+     * {@link #cleanupSessionState()} zeroes them, so they reflect what this call actually threw away.
+     * {@code wasConnected == false} is the no-op case (no live VM); all counts are then zero.
+     *
+     * @param wasConnected         {@code true} when a live VM was attached and state was cleared
+     * @param host                 last attached host ({@code null} only in the not-connected case)
+     * @param port                 last attached port ({@code 0} in the not-connected case)
+     * @param lineBreakpoints      line BPs discarded (active + deferred)
+     * @param exceptionBreakpoints exception BPs discarded (active + deferred)
+     * @param fieldBreakpoints     field watchpoints discarded (active + deferred)
+     * @param watchers             watchers discarded
+     * @param markedInstances      marked instances released
+     * @param objectCacheEntries   cached object references dropped
+     * @param eventHistoryEntries  event-history entries cleared
+     */
+    public record DisconnectResult(
+        boolean wasConnected,
+        @Nullable String host,
+        int port,
+        int lineBreakpoints,
+        int exceptionBreakpoints,
+        int fieldBreakpoints,
+        int watchers,
+        int markedInstances,
+        int objectCacheEntries,
+        int eventHistoryEntries
+    ) {
+        static DisconnectResult notConnected() {
+            return new DisconnectResult(false, null, 0, 0, 0, 0, 0, 0, 0, 0);
+        }
+
+        /** Total breakpoints across line/exception/field, active + deferred. */
+        public int totalBreakpoints() {
+            return lineBreakpoints + exceptionBreakpoints + fieldBreakpoints;
+        }
+
+        /** {@code true} when the call discarded anything an agent might miss. */
+        public boolean clearedAnything() {
+            return totalBreakpoints() + watchers + markedInstances + objectCacheEntries + eventHistoryEntries > 0;
+        }
+    }
 
     /**
      * Returns the connected VirtualMachine, auto-reconnecting if the connection has dropped.

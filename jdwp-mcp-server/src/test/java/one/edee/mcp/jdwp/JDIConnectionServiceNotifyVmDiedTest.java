@@ -235,9 +235,9 @@ class JDIConnectionServiceNotifyVmDiedTest {
 			JDIConnectionServiceTestSupport.setVm(service, mock(VirtualMachine.class));
 			JDIConnectionServiceTestSupport.setLastSuccessfulAttach(service, "127.0.0.1", 1);
 
-			final String status = service.disconnect();
+			final JDIConnectionService.DisconnectResult status = service.disconnect();
 
-			assertThat(status).isEqualTo("Disconnected");
+			assertThat(status.wasConnected()).isTrue();
 			assertThatThrownBy(service::getVM)
 				.hasMessageContaining("jdwp_connect");
 		}

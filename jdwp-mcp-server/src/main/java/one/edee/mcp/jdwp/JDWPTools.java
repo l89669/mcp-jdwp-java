@@ -449,9 +449,43 @@ public class JDWPTools {
         return baseMessage + '\n' + renderLocalJvmsBlock(status, false);
     }
 
-    @McpTool(description = "Disconnect from the JDWP server")
+    @McpTool(description = "Disconnect from the JDWP server. Clears ALL session state — breakpoints, "
+        + "watchers, marks, object cache, event history — and the reconnect seed. To keep breakpoints/"
+        + "watchers across a VM restart, use jdwp_reconnect (same target, specs preserved) instead.")
     public String jdwp_disconnect() {
-        return jdiService.disconnect();
+        return formatDisconnectReport(jdiService.disconnect());
+    }
+
+    /**
+     * Renders {@link JDIConnectionService.DisconnectResult} for the agent: names every category of
+     * session state the disconnect discarded so a vanished breakpoint set is never a silent surprise,
+     * and — only when specs worth keeping were cleared — points at {@code jdwp_reconnect} as the
+     * preserve-across-restart alternative. The preservation hint is gated on breakpoints/watchers
+     * being present so a bookkeeping disconnect (nothing set, or only caches) stays terse. Mirrors
+     * {@link #formatReconnectReport} in structure.
+     */
+    private static String formatDisconnectReport(JDIConnectionService.DisconnectResult r) {
+        if (!r.wasConnected()) {
+            return "Not connected — nothing to disconnect.";
+        }
+        final String target = r.host() != null ? String.format("%s:%d", r.host(), r.port()) : "the target VM";
+        if (!r.clearedAnything()) {
+            return String.format("Disconnected from %s. No breakpoints, watchers or cached state had been set.", target);
+        }
+        final StringBuilder out = new StringBuilder();
+        out.append(String.format("Disconnected from %s. Cleared all session state:%n", target));
+        out.append(String.format("  - Breakpoints: %d (line %d, exception %d, field %d)%n",
+            r.totalBreakpoints(), r.lineBreakpoints(), r.exceptionBreakpoints(), r.fieldBreakpoints()));
+        out.append(String.format("  - Watchers: %d%n", r.watchers()));
+        out.append(String.format("  - Marked instances: %d%n", r.markedInstances()));
+        out.append(String.format("  - Event history: %d%n", r.eventHistoryEntries()));
+        out.append(String.format("  - Object cache: %d (+ classpath discovery cache)", r.objectCacheEntries()));
+        // Token-optimized preservation hint — only when specs the agent likely wanted to keep were lost.
+        if (r.totalBreakpoints() + r.watchers() > 0) {
+            out.append(String.format("%nTo keep breakpoints/watchers across a VM restart, use jdwp_reconnect "
+                + "(re-attaches to the same target, specs preserved) instead of disconnect."));
+        }
+        return out.toString();
     }
 
     @McpTool(description =
