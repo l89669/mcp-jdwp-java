@@ -604,6 +604,140 @@ public class JDWPTools {
         }
     }
 
+    @McpTool(description = "Dump the monitor lock graph: which threads are blocked on a Java monitor, who holds it, and any deadlock cycles. Use this for 'why is everything stuck?' / suspected deadlock. Takes a transient VM-wide suspend/resume snapshot — balanced, so threads return to their prior state and a genuine deadlock stays deadlocked (this is a read-only probe in practice). NOTE: only synchronized-monitor contention shows here; threads parked in Object.wait() or java.util.concurrent Locks do not. Follow up with jdwp_suspend_thread(id) then jdwp_get_stack(id) to inspect a member.")
+    public String jdwp_dump_locks(
+        @McpToolParam(required = false, description = "Include JVM/JDK/test-runner internal threads (default: false)") @Nullable Boolean includeSystemThreads) {
+        try {
+            final boolean includeSystem = includeSystemThreads != null && includeSystemThreads;
+            final VirtualMachine vm = jdiService.getVM();
+            if (!vm.canGetCurrentContendedMonitor()) {
+                return "Error: the target VM does not support contended-monitor inspection "
+                    + "(canGetCurrentContendedMonitor=false), so the lock graph cannot be built.";
+            }
+            final boolean canGetOwner = vm.canGetMonitorInfo();
+
+            // A consistent lock snapshot needs every thread JDI-suspended — currentContendedMonitor()
+            // throws on a running thread. vm.suspend()/resume() is balanced: a thread already parked
+            // at a breakpoint keeps its prior suspend count, and a monitor-blocked (deadlocked)
+            // thread stays blocked regardless, so this reads as a non-intrusive probe.
+            vm.suspend();
+            try {
+                return renderLockGraph(vm, includeSystem, canGetOwner);
+            } finally {
+                vm.resume();
+            }
+        } catch (Exception e) {
+            return "Error: " + e.getMessage();
+        }
+    }
+
+    /**
+     * One thread blocked trying to enter a monitor that another thread holds — the rows rendered by
+     * {@link #jdwp_dump_locks}.
+     */
+    private record BlockedRow(long threadId, String name, String status, String monitor, String heldBy) {
+    }
+
+    /**
+     * Builds the blocked-thread table and any deadlock cycles from a snapshot of a (suspended) VM.
+     * Each blocked thread contributes a wait-for edge to {@code threadId → owner-of-contended-monitor}
+     * only when the owner is readable; {@link DeadlockAnalyzer} then finds cycles among those edges.
+     */
+    private static String renderLockGraph(VirtualMachine vm, boolean includeSystem, boolean canGetOwner) {
+        final List<ThreadReference> all = vm.allThreads();
+        final Map<Long, String> namesById = new HashMap<>();
+        for (ThreadReference t : all) {
+            try {
+                namesById.put(t.uniqueID(), t.name());
+            } catch (Exception ignore) {
+                // Name unreadable on a dying thread — it stays addressable by ID below.
+            }
+        }
+
+        final List<DeadlockAnalyzer.WaitForEdge> edges = new ArrayList<>();
+        final List<BlockedRow> blocked = new ArrayList<>();
+        for (ThreadReference t : all) {
+            if (!includeSystem && ThreadFormatting.isJvmInternalThread(t)) {
+                continue;
+            }
+            final ObjectReference monitor;
+            try {
+                monitor = t.currentContendedMonitor();
+            } catch (IncompatibleThreadStateException | ObjectCollectedException e) {
+                continue; // thread resumed, or the monitor was GC'd, in the snapshot gap — skip it
+            }
+            if (monitor == null) {
+                continue; // not blocked on a synchronized monitor
+            }
+            ThreadReference owner = null;
+            if (canGetOwner) {
+                try {
+                    owner = monitor.owningThread();
+                } catch (IncompatibleThreadStateException ignore) {
+                    // Owner not suspended — leave it unknown rather than failing the whole dump.
+                }
+            }
+            final long tid = t.uniqueID();
+            final String heldBy;
+            if (owner == null) {
+                heldBy = canGetOwner
+                    ? "(no current owner — monitor held via wait/notify or just released)"
+                    : "(unknown — VM lacks canGetMonitorInfo)";
+            } else {
+                final long oid = owner.uniqueID();
+                heldBy = String.format("#%d %s", oid, namesById.getOrDefault(oid, "?"));
+                edges.add(new DeadlockAnalyzer.WaitForEdge(tid, oid));
+            }
+            blocked.add(new BlockedRow(tid, namesById.getOrDefault(tid, "?"),
+                ThreadFormatting.formatStatus(t.status()), describeMonitor(monitor), heldBy));
+        }
+
+        if (blocked.isEmpty()) {
+            return "No threads are currently blocked on a Java monitor.\n"
+                + "(A suspected hang may instead be parked in Object.wait() or a java.util.concurrent "
+                + "Lock — neither shows in the monitor graph. Check jdwp_get_threads for WAIT-status threads.)";
+        }
+
+        final StringBuilder out = new StringBuilder();
+        out.append(String.format("%d thread(s) blocked on a monitor:%n%n", blocked.size()));
+        for (BlockedRow r : blocked) {
+            out.append(String.format("  #%d %s [%s]%n      waiting on: %s%n      held by:    %s%n",
+                r.threadId(), r.name(), r.status(), r.monitor(), r.heldBy()));
+        }
+
+        final List<List<Long>> cycles = DeadlockAnalyzer.findDeadlockCycles(edges);
+        if (cycles.isEmpty()) {
+            out.append(String.format("%nNo deadlock cycle detected among blocked threads.%n"));
+        } else {
+            out.append(String.format("%n⚠ DEADLOCK — %d cycle(s) detected:%n", cycles.size()));
+            for (int i = 0; i < cycles.size(); i++) {
+                final List<Long> cycle = cycles.get(i);
+                final StringBuilder chain = new StringBuilder();
+                for (final long id : cycle) {
+                    chain.append(String.format("#%d %s → ", id, namesById.getOrDefault(id, "?")));
+                }
+                final long head = cycle.get(0); // close the loop back to the first member
+                chain.append(String.format("#%d %s", head, namesById.getOrDefault(head, "?")));
+                out.append(String.format("  %d. %s%n", i + 1, chain));
+            }
+        }
+        out.append("\n→ jdwp_suspend_thread(id) then jdwp_get_stack(id) to inspect a blocked thread "
+            + "(it will never stop at a breakpoint on its own).");
+        return out.toString();
+    }
+
+    /**
+     * Human-readable identity for a contended monitor object: its declared type plus JDI unique ID,
+     * e.g. {@code one.edee.Account@123}. Degrades to a placeholder if the object is unreadable.
+     */
+    private static String describeMonitor(ObjectReference monitor) {
+        try {
+            return String.format("%s@%d", monitor.referenceType().name(), monitor.uniqueID());
+        } catch (Exception e) {
+            return "monitor@?";
+        }
+    }
+
     @McpTool(description = "Get the call stack for a specific thread. Defaults to top 10 user frames; junit/surefire/reflection internals are collapsed unless you pass includeNoise=true or raise maxFrames.")
     public String jdwp_get_stack(
         @McpToolParam(description = "Thread unique ID") long threadId,

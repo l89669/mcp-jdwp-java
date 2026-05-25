@@ -99,6 +99,14 @@ A field has a value at one read site that doesn't match what was written, or a t
 5. `jdwp_resume_until_event` -> if the test passes now, the root cause is confirmed.
 6. Find and fix the actual write order in the source.
 
+### "Everything's stuck — is it a deadlock?"
+
+Threads hang, the test never completes, or `jdwp_get_threads` shows several threads in `MONITOR` status and you need to know what they're each waiting on.
+
+1. `jdwp_dump_locks()` — one call takes a transient VM-wide snapshot and prints which threads are blocked on a monitor, who holds each one, and any **deadlock cycle** (e.g. `transfer-A-to-B → transfer-B-to-A → transfer-A-to-B`). The suspend/resume is balanced, so a genuine deadlock stays put and a non-deadlocked VM is undisturbed.
+2. If a cycle is reported, `jdwp_suspend_thread(id)` a member, then `jdwp_get_stack(id)` to see the exact lock-acquisition line (the two members usually contend the same line in mirror order — the AB-BA signature).
+3. No cycle but threads blocked? The hang is a lock held by a *runnable* thread that's slow/looping, or — if `jdwp_dump_locks` shows nothing — the threads are parked in `Object.wait()` or a `java.util.concurrent` Lock, which monitor dumps don't cover. Fall back to `jdwp_get_threads` for `WAIT`-status threads.
+
 ### "Exception is buried under wrappers"
 
 Test shows `CompletionException("Async task failed")`, but the real cause is 3 frames deeper.
@@ -298,7 +306,7 @@ After any step, `jdwp_resume_until_event` blocks until the `STEP` event lands. T
 - **Don't step over more than ~3 lines in a row.** If you already know which line you want to inspect, put a breakpoint there and `jdwp_resume_until_event`. One round-trip beats N. The same goes for stepping through loop iterations — use a conditional breakpoint or logpoint.
 - **Don't catch `Throwable` or `Exception` "to be safe".** Target the specific exception type. Broad exception breakpoints fire on every JDK internal exception — extremely noisy and slow.
 - **Don't stop at the first wrapped exception.** The original throw site is almost always more informative. Set an exception BP on the inner type and re-run.
-- **Don't break right after `Thread.start()` for a concurrency bug.** The threads haven't raced, deadlocked, or lost an update yet — you'll stop too early and see nothing wrong. Set the breakpoint at the `join()` / assertion line instead: by the time the main thread parks there, the contended state has fully formed and `jdwp_get_threads` / `jdwp_get_stack` show the real `MONITOR` / `WAIT` standoff or the lost write.
+- **Don't break right after `Thread.start()` for a concurrency bug.** The threads haven't raced, deadlocked, or lost an update yet — you'll stop too early and see nothing wrong. Set the breakpoint at the `join()` / assertion line instead: by the time the main thread parks there, the contended state has fully formed and `jdwp_get_threads` / `jdwp_get_stack` — or `jdwp_dump_locks` for the wait-for graph and any deadlock cycle in one call — show the real `MONITOR` / `WAIT` standoff or the lost write.
 - **Don't pipe the launch command through `tail` / `head` in a background shell** (`mvn … 2>&1 | tail -3`). The truncation hides the Surefire summary you need to confirm a fix went green, and the background runner already captures the full stream — let it. If you only see truncated output, read `target/surefire-reports/*.txt` for the real result.
 
 ## Inspecting and clearing debug state
