@@ -140,6 +140,40 @@ class JDWPToolsResumeUntilEventVmDeathTest {
 		assertThat(result).startsWith("[NO_EVENT]");
 		assertThat(result).contains("jdwp_reset");
 		assertThat(result).contains("jdwp_resume_until_event");
+		// No breakpoints remain armed → this is the cleared-session variant, not the still-armed one.
+		assertThat(result).doesNotContain("still armed");
+	}
+
+	/**
+	 * Companion to the cleared-session branch. When the latch fired with no snapshot but the VM is
+	 * still alive AND breakpoints remain armed, the session was NOT cleared — a non-suspending
+	 * wakeup (an early lifecycle event, a resumed non-breakpoint thread) tripped the latch. The old
+	 * message blamed a concurrent {@code jdwp_reset} / {@code jdwp_disconnect} unconditionally and
+	 * told the caller to re-set breakpoints; that is wrong here and wastes work. The response must
+	 * instead report the live state and steer the caller to simply call again.
+	 */
+	@Test
+	@DisplayName("[NO_EVENT] reports 'still armed — just call again' when VM is alive with live BPs")
+	void shouldReportStillArmedWhenVmAliveAndBreakpointsRemain() throws Exception {
+		final VirtualMachine vm = mock(VirtualMachine.class);
+		when(jdiService.getVM()).thenReturn(vm);
+
+		final CountDownLatch latch = new CountDownLatch(1);
+		latch.countDown();
+		when(breakpointTracker.armNextEventLatch()).thenReturn(latch);
+		when(breakpointTracker.getLastBreakpoint()).thenReturn(null);
+		// vm.allThreads() returns an empty list by default (the mock is alive). A breakpoint is
+		// still registered, so the session was not torn down — the still-armed branch must win.
+		when(breakpointTracker.getAllBreakpoints())
+			.thenReturn(java.util.Map.of(1, mock(com.sun.jdi.request.BreakpointRequest.class)));
+
+		final String result = tools.jdwp_resume_until_event(1_000);
+
+		assertThat(result).startsWith("[NO_EVENT]");
+		assertThat(result).contains("still armed");
+		assertThat(result).contains("do NOT re-set");
+		assertThat(result).contains("jdwp_resume_until_event");
+		assertThat(result).doesNotContain("looks cleared");
 	}
 
 	/**

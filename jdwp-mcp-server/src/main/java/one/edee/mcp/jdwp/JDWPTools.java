@@ -1220,7 +1220,7 @@ public class JDWPTools {
         }
     }
 
-    @McpTool(description = "Resume the VM and BLOCK until the next breakpoint, step, or exception event fires (or timeout). Returns the same info as jdwp_get_current_thread on success. Replaces the manual 'resume → poll → poll' choreography. Returns one of: 'Event fired ...' on a breakpoint/step/exception hit, '[TIMEOUT] ...' when the deadline expires, '[VM_DEATH] ...' when the target VM died/disconnected before any event, or 'Wait interrupted' on thread interruption.")
+    @McpTool(description = "Resume the VM and BLOCK until the next breakpoint, step, or exception event fires (or timeout). Returns the same info as jdwp_get_current_thread on success. Replaces the manual 'resume → poll → poll' choreography. Returns one of: 'Event fired ...' on a breakpoint/step/exception hit, '[TIMEOUT] ...' when the deadline expires, '[VM_DEATH] ...' when the target VM died/disconnected before any event, '[NO_EVENT] ...' when the wait was released without a stop — the message states whether the session is still armed (just call again) or was cleared (re-set breakpoints), or 'Wait interrupted' on thread interruption.")
     public String jdwp_resume_until_event(
         @McpToolParam(required = false, description = "Maximum wait time in milliseconds (default: 30000)") @Nullable Integer timeoutMs) {
         final int deadlineMs = (timeoutMs != null && timeoutMs > 0) ? timeoutMs : 30_000;
@@ -1273,17 +1273,38 @@ public class JDWPTools {
 
             if (snapshot == null) {
                 // The wait was released but no suspending snapshot exists and the tail is not
-                // VM_DEATH. This is not a real stop: in practice the latch was tripped by a state
-                // change rather than a debug event — a concurrent jdwp_reset / jdwp_disconnect
-                // (both fire the latch to free waiters, then null the snapshot) or a listener
-                // teardown. The session no longer has the breakpoint that was being awaited, so
-                // re-waiting here would just burn the deadline; surface an actionable next step
-                // instead of the old "this should not happen" dead end.
+                // VM_DEATH. Two very different situations produce this, and a fixed message gets
+                // one of them wrong: (a) a concurrent jdwp_reset / jdwp_disconnect (both fire the
+                // latch to free waiters, then null the snapshot) or a listener teardown — the
+                // session is gone and re-waiting would burn the deadline; or (b) the latch was
+                // tripped by a NON-suspending wakeup (an early lifecycle event, a resumed
+                // non-breakpoint thread) while the VM is alive and every breakpoint is still
+                // armed — here re-setting breakpoints is wasted work and calling again just works.
+                // Probe liveness + the breakpoint registry and steer accordingly rather than
+                // always blaming a teardown.
+                boolean vmAlive;
+                try {
+                    vm.allThreads();           // cheap round-trip; throws if the connection is gone
+                    vmAlive = true;
+                } catch (Exception probe) {
+                    vmAlive = false;
+                }
+                final int armed = breakpointTracker.getAllBreakpoints().size()
+                    + breakpointTracker.getAllPendingBreakpoints().size()
+                    + breakpointTracker.getAllExceptionBreakpoints().size()
+                    + breakpointTracker.getAllFieldBreakpoints().size();
+                if (vmAlive && armed > 0) {
+                    return String.format("[NO_EVENT] The wait was released without a suspending event, but the VM "
+                        + "is still connected and %d breakpoint(s) are still armed — nothing was cleared. The latch "
+                        + "was tripped by a non-suspending wakeup (e.g. an early lifecycle event), not a stop. Just "
+                        + "call jdwp_resume_until_event again to keep waiting — do NOT re-set your breakpoints. If "
+                        + "this repeats, inspect jdwp_overview to confirm the breakpoint locations are reachable.",
+                        armed);
+                }
                 return "[NO_EVENT] The wait was released without a suspending event and no breakpoint context is "
-                    + "available. This usually means the debug session was cleared concurrently "
-                    + "(jdwp_reset / jdwp_disconnect) or the event listener was torn down. Re-check state with "
-                    + "jdwp_overview (or jdwp_diagnose if the connection looks wrong), re-set your breakpoints, "
-                    + "then call jdwp_resume_until_event again.";
+                    + "available. The debug session looks cleared — likely a concurrent jdwp_reset / jdwp_disconnect "
+                    + "or a listener teardown. Re-check state with jdwp_overview (or jdwp_diagnose if the connection "
+                    + "looks wrong), re-set your breakpoints, then call jdwp_resume_until_event again.";
             }
             final ThreadReference thread = snapshot.thread();
             // P3-1: append source location to the happy path. The previous "Event fired. Thread: …"
