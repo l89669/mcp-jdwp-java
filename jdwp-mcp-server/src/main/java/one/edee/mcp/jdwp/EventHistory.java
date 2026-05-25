@@ -41,17 +41,46 @@ public class EventHistory {
     private final Deque<DebugEvent> events = new ConcurrentLinkedDeque<>();
 
     /**
+     * The session epoch stamped onto newly recorded events. Bumped by {@link #beginNewSession()} on
+     * each successful VM attach. {@code volatile} for visibility to the listener thread; the
+     * increment has a single writer (it runs only under the connection-service monitor in
+     * {@link JDIConnectionService}), so a plain {@code ++} is safe.
+     */
+    private volatile int currentEpoch = 0;
+
+    /**
      * Appends an event and evicts the oldest entries until the buffer is at or below {@link #MAX_EVENTS}.
      * Non-blocking, and safe to call from any thread: most records come from the JDI event listener
      * thread ({@link JdiEventListener}), but MCP worker threads also record install-time diagnostics
      * (e.g. {@code BP_MULTI_LOCATION}, {@code RECONNECT}). The backing {@link ConcurrentLinkedDeque}
      * tolerates these concurrent producers.
+     *
+     * <p>Events arrive {@link DebugEvent#UNSTAMPED} (producers don't know the live epoch) and are
+     * stamped with {@link #currentEpoch} here, so a {@code VM_DEATH} preserved across an
+     * auto-reconnect stays tagged with the old session while the fresh session's events get the new
+     * epoch — letting {@code jdwp_get_events} segment them.
      */
     public void record(DebugEvent event) {
-        events.addLast(event);
+        final DebugEvent stamped = event.sessionEpoch() == DebugEvent.UNSTAMPED
+            ? event.withEpoch(currentEpoch)
+            : event;
+        events.addLast(stamped);
         while (events.size() > MAX_EVENTS) {
             events.pollFirst();
         }
+    }
+
+    /**
+     * Advances to a new session epoch and returns it. Called on each successful VM attach
+     * (connect / reconnect) so events recorded afterwards are tagged as a distinct session.
+     */
+    public int beginNewSession() {
+        return ++currentEpoch;
+    }
+
+    /** The session epoch currently stamped onto new events (0 before the first attach). */
+    public int currentEpoch() {
+        return currentEpoch;
     }
 
     /**
@@ -82,13 +111,26 @@ public class EventHistory {
      * The convenience constructors default `timestamp` to `Instant.now()` and (for the two-arg form)
      * `details` to an empty map.
      */
-    public record DebugEvent(Instant timestamp, String type, String summary, Map<String, String> details) {
+    public record DebugEvent(Instant timestamp, String type, String summary, Map<String, String> details, int sessionEpoch) {
+
+        /**
+         * Sentinel epoch for an event constructed by a producer that doesn't know the live session
+         * (the common case). {@link EventHistory#record} replaces it with the current epoch; a
+         * caller that already carries a real epoch (e.g. a re-stamped copy) is left untouched.
+         */
+        public static final int UNSTAMPED = -1;
+
         public DebugEvent(String type, String summary) {
-            this(Instant.now(), type, summary, Map.of());
+            this(Instant.now(), type, summary, Map.of(), UNSTAMPED);
         }
 
         public DebugEvent(String type, String summary, Map<String, String> details) {
-            this(Instant.now(), type, summary, details);
+            this(Instant.now(), type, summary, details, UNSTAMPED);
+        }
+
+        /** Returns a copy stamped with {@code epoch}; used by {@link EventHistory#record}. */
+        DebugEvent withEpoch(int epoch) {
+            return new DebugEvent(timestamp, type, summary, details, epoch);
         }
     }
 }

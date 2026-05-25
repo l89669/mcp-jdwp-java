@@ -379,6 +379,11 @@ public class JDIConnectionService {
         lastPort = port;
         lastConnectError = null;
 
+        // Advance the event-history session epoch before any event of this attach is recorded. If a
+        // prior VM died and its events were preserved in the buffer (notifyVmDied keeps them), this
+        // new session's events get a distinct epoch so jdwp_get_events can segment old from new.
+        eventHistory.beginNewSession();
+
         eventListener.start(vm);
         // Arm the health watchdog. The attach round-trip itself counts as traffic, so the
         // monitor seeds lastTrafficAt to now and only escalates to an active probe if the
@@ -635,6 +640,9 @@ public class JDIConnectionService {
             throw e;
         }
         lastConnectError = null;
+        // Fresh attach → new session epoch (see connect()); the RECONNECT event recorded below and
+        // everything after it is tagged as this session, segmented from the dead VM's tail.
+        eventHistory.beginNewSession();
         eventListener.start(vm);
         healthMonitor.start(vm);
 

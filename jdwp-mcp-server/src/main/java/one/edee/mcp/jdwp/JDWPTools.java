@@ -26,6 +26,8 @@ import java.lang.reflect.Modifier;
 import java.net.SocketException;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -84,6 +86,15 @@ public class JDWPTools {
             + "|field\\s+\\S*?\\.([A-Za-z_][A-Za-z_0-9]*)\\s+is not visible"
             + "|([A-Za-z_][A-Za-z_0-9]*)\\s+is not visible"
     );
+    /**
+     * Renders an event timestamp as {@code HH:mm:ss.SSS} (UTC, to match the stored {@link Instant}).
+     * Used by the event listings. A formatter is length-safe where the old
+     * {@code instant.toString().substring(11, 23)} was not: a whole-second {@code Instant} prints
+     * without a fractional part (a 20-char string), and the fixed substring then threw
+     * {@code StringIndexOutOfBoundsException}, collapsing the whole listing into an error.
+     */
+    private static final DateTimeFormatter EVENT_TIME_FORMAT =
+        DateTimeFormatter.ofPattern("HH:mm:ss.SSS").withZone(ZoneOffset.UTC);
     private final JDIConnectionService jdiService;
     private final BreakpointTracker breakpointTracker;
     private final WatcherManager watcherManager;
@@ -1787,7 +1798,7 @@ public class JDWPTools {
         } else {
             for (EventHistory.DebugEvent ev : recent) {
                 out.append(String.format("  [%s] %s (%s)%n",
-                    ev.type(), ev.summary(), ev.timestamp().toString().substring(11, 23)));
+                    ev.type(), ev.summary(), EVENT_TIME_FORMAT.format(ev.timestamp())));
             }
         }
 
@@ -2761,13 +2772,22 @@ public class JDWPTools {
             }
 
             final StringBuilder result = new StringBuilder();
-            result.append(String.format("Recent events (%d of %d total):\n\n", events.size(), eventHistory.size()));
+            result.append(String.format("Recent events (%d of %d total; current session s%d):\n\n",
+                events.size(), eventHistory.size(), eventHistory.currentEpoch()));
 
+            // Each line carries its session tag (sN); a divider is drawn whenever the epoch changes
+            // between consecutive events, so a VM_DEATH→RECONNECT boundary (events preserved across
+            // an auto-reconnect) reads as two distinct sessions rather than one confusing stream.
+            int prevEpoch = Integer.MIN_VALUE;
             for (int i = 0; i < events.size(); i++) {
                 final EventHistory.DebugEvent event = events.get(i);
-                result.append(String.format("%d. [%s] %s (%s)\n",
-                    i + 1, event.type(), event.summary(),
-                    event.timestamp().toString().substring(11, 23)));
+                if (i > 0 && event.sessionEpoch() != prevEpoch) {
+                    result.append(String.format("   ── session s%d (new VM attachment) ──%n", event.sessionEpoch()));
+                }
+                prevEpoch = event.sessionEpoch();
+                result.append(String.format("%d. [s%d] [%s] %s (%s)\n",
+                    i + 1, event.sessionEpoch(), event.type(), event.summary(),
+                    EVENT_TIME_FORMAT.format(event.timestamp())));
             }
 
             result.append("\n→ jdwp_get_breakpoint_context for BREAKPOINT entries; logpoint/exception results are inline above.");

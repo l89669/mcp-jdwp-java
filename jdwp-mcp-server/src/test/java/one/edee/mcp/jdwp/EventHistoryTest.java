@@ -124,4 +124,53 @@ class EventHistoryTest {
 
 		assertThat(event.details()).containsExactlyInAnyOrderEntriesOf(details);
 	}
+
+	@Test
+	@DisplayName("a freshly constructed DebugEvent is UNSTAMPED until recorded")
+	void shouldConstructUnstamped() {
+		assertThat(new EventHistory.DebugEvent("STEP", "x").sessionEpoch())
+			.isEqualTo(EventHistory.DebugEvent.UNSTAMPED);
+	}
+
+	@Test
+	@DisplayName("record stamps the current session epoch onto the event")
+	void shouldStampCurrentEpochOnRecord() {
+		EventHistory history = new EventHistory();
+		assertThat(history.currentEpoch()).isZero();
+
+		history.record(new EventHistory.DebugEvent("VM_START", "s0 event"));
+		assertThat(history.getRecent(1).get(0).sessionEpoch()).isZero();
+	}
+
+	@Test
+	@DisplayName("beginNewSession increments the epoch and tags only events recorded afterwards")
+	void shouldSegmentEventsBySession() {
+		EventHistory history = new EventHistory();
+		history.record(new EventHistory.DebugEvent("EXCEPTION", "old-vm"));
+
+		assertThat(history.beginNewSession()).isEqualTo(1);
+		assertThat(history.currentEpoch()).isEqualTo(1);
+		history.record(new EventHistory.DebugEvent("BREAKPOINT", "new-vm"));
+
+		List<EventHistory.DebugEvent> recent = history.getRecent(10);
+		assertThat(recent).hasSize(2);
+		// the pre-attach event keeps the old epoch; the post-attach event carries the new one
+		assertThat(recent.get(0).summary()).isEqualTo("old-vm");
+		assertThat(recent.get(0).sessionEpoch()).isZero();
+		assertThat(recent.get(1).summary()).isEqualTo("new-vm");
+		assertThat(recent.get(1).sessionEpoch()).isEqualTo(1);
+	}
+
+	@Test
+	@DisplayName("an already-stamped event is not re-stamped on record")
+	void shouldNotRestampAlreadyStampedEvent() {
+		EventHistory history = new EventHistory();
+		history.beginNewSession(); // currentEpoch = 1
+		EventHistory.DebugEvent preStamped =
+			new EventHistory.DebugEvent("BREAKPOINT", "explicit").withEpoch(7);
+
+		history.record(preStamped);
+
+		assertThat(history.getRecent(1).get(0).sessionEpoch()).isEqualTo(7);
+	}
 }
