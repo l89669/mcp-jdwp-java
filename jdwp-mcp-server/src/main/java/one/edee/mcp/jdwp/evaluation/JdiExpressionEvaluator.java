@@ -317,16 +317,30 @@ public class JdiExpressionEvaluator {
             values.add(thisObject);
         }
 
-        for (LocalVariable var : frame.visibleVariables()) {
-            // Filter out synthetic `this$N` outer-class references emitted by `javac` for inner classes:
-            // they live in a different package than the wrapper class and so cannot be addressed from
-            // inside it. The `isArgument()` allowance is defensive — a real argument named `this$N`
-            // would be unusual but is technically valid bytecode.
-            if (var.isArgument() || !var.name().startsWith("this$")) {
-                final String typeName = resolveLocalVarType(var, wrapperPackage);
-                variables.add(new ContextVariable(var.name(), typeName));
-                values.add(frame.getValue(var));
+        // Enumerate locals defensively. A target compiled without a local-variable table
+        // (`javac` default, or an explicit `-g:none` / debug-info-stripped release build) makes
+        // frame.visibleVariables() throw AbsentInformationException — with a null message. Letting
+        // that abort the whole evaluation is wrong: an expression that names only `_this` and the
+        // synthetic bindings ($oldValue/$newValue/$object/$exception/$mark…) needs no locals at all,
+        // yet would fail with an opaque "Expression evaluation failed: null". Skip locals instead;
+        // the expression still compiles against this + the synthetics, and an expression that *does*
+        // reference a now-absent local gets a clear "X cannot be resolved" compile error rather than
+        // a null.
+        try {
+            for (LocalVariable var : frame.visibleVariables()) {
+                // Filter out synthetic `this$N` outer-class references emitted by `javac` for inner classes:
+                // they live in a different package than the wrapper class and so cannot be addressed from
+                // inside it. The `isArgument()` allowance is defensive — a real argument named `this$N`
+                // would be unusual but is technically valid bytecode.
+                if (var.isArgument() || !var.name().startsWith("this$")) {
+                    final String typeName = resolveLocalVarType(var, wrapperPackage);
+                    variables.add(new ContextVariable(var.name(), typeName));
+                    values.add(frame.getValue(var));
+                }
             }
+        } catch (AbsentInformationException noLocals) {
+            log.debug("[Evaluator] No local-variable table on the firing frame (target compiled "
+                + "without -g:vars?) — evaluating with `this` + synthetic bindings only.");
         }
 
         // Synthetic bindings are appended last so they appear after the real locals in the wrapper
@@ -973,7 +987,11 @@ public class JdiExpressionEvaluator {
             if (e instanceof RuntimeException && e.getCause() instanceof JdiEvaluationException jdiEx) {
                 throw jdiEx;
             }
-            throw new JdiEvaluationException("Expression evaluation failed: " + e.getMessage(), e);
+            // Never render "Expression evaluation failed: null". A null-message exception (e.g. a
+            // bare AbsentInformationException or NPE) used to surface as a dead-end "null"; fall back
+            // to the exception's simple class name so the cause is always identifiable.
+            final String cause = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
+            throw new JdiEvaluationException("Expression evaluation failed: " + cause, e);
         } finally {
             evaluationGuard.exit(guardedThreadId);
         }
