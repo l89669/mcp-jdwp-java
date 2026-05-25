@@ -5,6 +5,34 @@ All notable changes to the `jdwp-debugging` plugin are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.6.2] — 2026-05-25
+
+### Fixed — inspecting a deadlocked thread now points the way
+
+A thread blocked on a monitor or parked in `Object.wait()` that you did not
+stop at a breakpoint reports `Suspended: no` and never halts on its own — the
+classic deadlock case. `jdwp_get_stack` answered that with a dead-end *"Thread
+must be stopped at a breakpoint"*, and `jdwp_get_locals` had no suspend check at
+all and leaked a raw `IncompatibleThreadStateException`. Both pointed away from
+the one tool that actually helps: `jdwp_suspend_thread`, which freezes the
+thread in place so its frames and locals become readable.
+
+- **Actionable not-suspended error** — `jdwp_get_stack` and `jdwp_get_locals`
+  now detect a MONITOR/WAIT thread that isn't JDI-suspended and name
+  `jdwp_suspend_thread(id)` as the deadlock-inspection path (and `get_locals`
+  gained the suspend check it was missing). The invoke-family tools
+  (`evaluate_expression` / `to_string` / `assert_expression`) keep their
+  existing guard — suspending such a thread makes it *inspectable*, not
+  *invocable*. (resolves #22)
+
+### Docs
+
+- **Two `java-debug` skill notes from a live test-flight retro** — how to read a
+  deadlocked thread (`jdwp_suspend_thread` it first), and the reminder that
+  `jdwp_disconnect` does not stop the target JVM: the JVM owns its JDWP port, so
+  a target with live non-daemon threads keeps the port bound after you
+  disconnect — kill the lingering process before relaunching on the same port.
+
 ## [2.6.1] — 2026-05-24
 
 ### Fixed — connect / diagnose no longer alias a dead VM
