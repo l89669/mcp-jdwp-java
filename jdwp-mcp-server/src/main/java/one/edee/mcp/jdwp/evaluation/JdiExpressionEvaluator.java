@@ -1126,13 +1126,18 @@ public class JdiExpressionEvaluator {
     /**
      * Configures the compiler with the target JVM's classpath. Skips if already configured for the
      * current connection. Automatically reconfigures after a disconnect/reconnect cycle (detected
-     * via null JDK path) and clears the compilation cache on reconfiguration because stale bytecode
-     * may reference classes from a previous connection. Must be called BEFORE any expression
-     * evaluation to avoid nested JDI calls.
+     * via null JDK path): clears the compilation cache AND resets the compiler config because stale
+     * bytecode and a stale classpath may reference classes from a previous connection. Must be
+     * called BEFORE any expression evaluation to avoid nested JDI calls.
      *
      * @param suspendedThread a thread already suspended at a breakpoint (REQUIRED)
+     * @throws JdiEvaluationException if classpath/JDK discovery fails for the current connection;
+     *                                the message is actionable and is surfaced to the user as an
+     *                                evaluation error or a {@code LOGPOINT_ERROR} event rather than
+     *                                left to manifest as a cryptic downstream JDT diagnostic
      */
-    public synchronized void configureCompilerClasspath(ThreadReference suspendedThread) {
+    public synchronized void configureCompilerClasspath(ThreadReference suspendedThread)
+        throws JdiEvaluationException {
         // Self-healing: if JDK path is already set, classpath is already configured for this connection
         if (jdiConnectionService.getDiscoveredJdkPath() != null) {
             return;
@@ -1145,36 +1150,69 @@ public class JdiExpressionEvaluator {
         final long guardedThreadId = suspendedThread.uniqueID();
         evaluationGuard.enter(guardedThreadId);
         try {
-            // New connection or reconnect — clear stale compilation cache
+            // A null discovered-JDK path means either first use on this connection or a
+            // post-reconnect cache wipe. Either way, any compiler state left over from a previous
+            // connection now points at the wrong target VM. Clear BOTH the compilation cache and
+            // the compiler config before rediscovering: if discovery then fails, compile() refuses
+            // with a clear "not configured" error instead of silently emitting bytecode resolved
+            // against the previous target's classpath.
             compilationCache.clear();
+            compiler.reset();
 
             final long startTime = System.currentTimeMillis();
 
-            try {
-                final String classpath = jdiConnectionService.discoverClasspath(suspendedThread);
-                final String jdkPath = jdiConnectionService.getDiscoveredJdkPath();
+            // discoverClasspath swallows its own failures (JdkNotFoundException, classloader-walk
+            // errors) and signals them by returning null / leaving the JDK path unset. Translate
+            // that into an actionable exception rather than returning silently — otherwise the
+            // caller proceeds to compile() and the user only sees a raw JDT diagnostic (e.g.
+            // "io cannot be resolved") with no hint that the real cause was a failed discovery.
+            final String classpath = jdiConnectionService.discoverClasspath(suspendedThread);
+            final String jdkPath = jdiConnectionService.getDiscoveredJdkPath();
 
-                if (jdkPath == null) {
-                    log.error("[Evaluator] JDK path not discovered, cannot configure compiler");
-                    return;
-                }
-
-                final int version = jdiConnectionService.getTargetMajorVersion();
-                if (classpath != null && !classpath.isEmpty()) {
-                    compiler.configure(jdkPath, classpath, version);
-
-                    final long elapsed = System.currentTimeMillis() - startTime;
-                    log.info("[Evaluator] Compiler configured in {}ms", elapsed);
-                } else {
-                    log.error("[Evaluator] Failed to discover classpath, expression evaluation may fail for application classes");
-                }
-
-            } catch (Exception e) {
-                final long elapsed = System.currentTimeMillis() - startTime;
-                log.error("[Evaluator] Error configuring classpath after {}ms", elapsed, e);
+            if (jdkPath == null) {
+                throw new JdiEvaluationException(
+                    "Classpath discovery failed for the current connection: no local JDK matching "
+                        + "the target VM could be located, so application types cannot be resolved. "
+                        + "Check the server log (search '[JDI]') for the underlying cause.");
             }
+            if (classpath == null || classpath.isEmpty()) {
+                throw new JdiEvaluationException(
+                    "Classpath discovery failed for the current connection: the target VM classpath "
+                        + "could not be determined, so application types cannot be resolved. "
+                        + "Check the server log (search '[JDI]') for the underlying cause.");
+            }
+
+            final int version = jdiConnectionService.getTargetMajorVersion();
+            compiler.configure(jdkPath, classpath, version);
+            log.info("[Evaluator] Compiler configured in {}ms", System.currentTimeMillis() - startTime);
         } finally {
             evaluationGuard.exit(guardedThreadId);
+        }
+    }
+
+    /**
+     * Best-effort pre-warm of the compiler classpath at the first thread suspension, so the agent's
+     * first {@code evaluate_expression} (or the first logpoint/condition hit) does not pay the
+     * one-time classpath discovery cost — which can take 1-3s while it walks the target VM's
+     * classloader hierarchy via {@code invokeMethod} — on the critical path. Discovery is paid once
+     * per connection; subsequent calls short-circuit on the cached JDK path.
+     * <p>
+     * Unlike {@link #configureCompilerClasspath}, this NEVER throws: it is invoked from the JDI
+     * event listener while a thread is parked for inspection, and a warming failure must not disrupt
+     * the breakpoint flow. Any failure is logged at debug and left for the real evaluation call to
+     * re-attempt and surface with a precise error.
+     *
+     * @param suspendedThread a thread already suspended at a breakpoint/step/exception/watchpoint
+     */
+    public void prewarmClasspath(ThreadReference suspendedThread) {
+        if (jdiConnectionService.getDiscoveredJdkPath() != null) {
+            return;
+        }
+        try {
+            configureCompilerClasspath(suspendedThread);
+        } catch (Exception e) {
+            log.debug("[Evaluator] Classpath pre-warm failed (will retry on first evaluation): {}",
+                e.getMessage());
         }
     }
 
