@@ -340,23 +340,38 @@ public class JdiEventListener {
                     }
                 }
                 boolean shouldSuspend = false;
+                // First thread parked for inspection in this set; used to pre-warm the compiler
+                // classpath once the loop has recorded the hit (see the prewarm call below).
+                ThreadReference warmThread = null;
 
                 for (Event event : eventSet) {
                     if (event instanceof BreakpointEvent bpEvent) {
                         if (handleBreakpointEvent(bpEvent)) {
                             shouldSuspend = true;
+                            if (warmThread == null) {
+                                warmThread = bpEvent.thread();
+                            }
                         }
                     } else if (event instanceof StepEvent stepEvent) {
                         if (handleStepEvent(stepEvent)) {
                             shouldSuspend = true;
+                            if (warmThread == null) {
+                                warmThread = stepEvent.thread();
+                            }
                         }
                     } else if (event instanceof ExceptionEvent exEvent) {
                         if (handleExceptionEvent(exEvent)) {
                             shouldSuspend = true;
+                            if (warmThread == null) {
+                                warmThread = exEvent.thread();
+                            }
                         }
                     } else if (event instanceof WatchpointEvent wpEvent) {
                         if (handleWatchpointEvent(wpEvent)) {
                             shouldSuspend = true;
+                            if (warmThread == null) {
+                                warmThread = wpEvent.thread();
+                            }
                         }
                     } else if (event instanceof ClassPrepareEvent cpEvent) {
                         handleClassPrepareEvent(cpEvent);
@@ -376,7 +391,20 @@ public class JdiEventListener {
                     }
                 }
 
-                if (!shouldSuspend) {
+                if (shouldSuspend) {
+                    // The set stays parked for inspection. Pre-warm the compiler classpath now, on
+                    // the first suspending thread, so the agent's first evaluate_expression (or the
+                    // first logpoint/condition hit) does not pay the one-time ~1-3s discovery cost on
+                    // its critical path. Runs only on the first stop per connection — thereafter the
+                    // discovered JDK path short-circuits prewarmClasspath. Never throws (warming
+                    // failures are logged and retried by the real evaluation call). It is safe to
+                    // drive invokeMethod from here for the same reason logpoint evaluation is: the
+                    // prohibition is on event-dispatch callbacks, not on invocations made while the
+                    // listener processes a drained event.
+                    if (warmThread != null) {
+                        expressionEvaluator.prewarmClasspath(warmThread);
+                    }
+                } else {
                     eventSet.resume();
                 }
             } catch (InterruptedException e) {

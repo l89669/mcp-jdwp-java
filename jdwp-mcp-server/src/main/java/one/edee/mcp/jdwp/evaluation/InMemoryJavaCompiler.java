@@ -106,6 +106,21 @@ public class InMemoryJavaCompiler {
     }
 
     /**
+     * Returns the compiler to its unconfigured state, dropping the JDK path and classpath set by
+     * {@link #configure} and restoring the default target version. Called on disconnect/reconnect:
+     * the discovered classpath belongs to one specific target VM, so leftover config from a previous
+     * connection must not survive. Without this, a post-reconnect discovery failure would leave
+     * {@link #jdkPath} non-null and {@link #compile} would silently emit bytecode resolved against
+     * the previous target's classpath; after a reset, {@link #compile} instead throws the
+     * "not configured" error until {@link #configure} runs again for the new connection.
+     */
+    public synchronized void reset() {
+        this.jdkPath = null;
+        this.classpath = null;
+        this.targetMajorVersion = 8;
+    }
+
+    /**
      * Compiles `sourceCode` into bytecode for `className`. The returned map is keyed by fully qualified
      * class name and includes any inner/anonymous classes JDT emits.
      *
