@@ -5,6 +5,38 @@ All notable changes to the `jdwp-debugging` plugin are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.8.2] — 2026-05-26
+
+### Fixed — expression evaluation no longer stalls or misleads after a reconnect
+
+Every evaluated expression, logpoint, conditional breakpoint and watcher compiles
+against the target VM's classpath, which the server discovers once per connection
+and caches. Three rough edges in that lifecycle made failures slow and confusing —
+most visibly after a disconnect/reconnect cycle, where the first evaluation could
+fail with a cryptic `io cannot be resolved` and no hint as to why. The warming,
+caching and failure-reporting paths are now tightened.
+
+- **First stop pre-warms the classpath** — the one-time discovery (it walks the
+  target's classloader hierarchy and can take 1–3 s) now runs on the first
+  suspending breakpoint / step / exception / watchpoint instead of lazily on your
+  first `jdwp_evaluate_expression` or logpoint hit. The cost is paid predictably at
+  the first stop rather than on the critical path of the first evaluation.
+- **Reconnect no longer compiles against the old target** — the compiler's
+  classpath is reset on reconnect. Previously a failed re-discovery left the
+  previous target's classpath in place, so expressions could silently compile
+  against stale classes.
+- **Discovery failures say so** — when the classpath / JDK can't be discovered, the
+  evaluation now fails with an actionable message ("Classpath discovery failed …
+  application types cannot be resolved") instead of surfacing a bare JDT diagnostic
+  like `io cannot be resolved`. Logpoints record the same as a `LOGPOINT_ERROR`.
+  (resolves #30)
+
+### Docs — README rewritten newbie-first
+
+- **README restructured for first-time readers** — reordered to lead with what the
+  plugin is and how to attach to a JVM before the deeper material, and fact-checked
+  against the source so the tool list and behavior descriptions match what ships.
+
 ## [2.8.1] — 2026-05-25
 
 ### Fixed — straight answers when evaluation can't see what it needs
