@@ -9,7 +9,7 @@ An Claude Code plugin and **MCP server** that gives Claude Code a debugger.
 - Read **and** write: mutate locals, set fields at the breakpoint
 - Pure STDIO → no daemon, no extra port, no GUI
 
-**46 tools** + 2 MCP resources:
+**47 tools** + 2 MCP resources:
 
 <div class="chips">
   <span class="chip accent">breakpoints</span>
