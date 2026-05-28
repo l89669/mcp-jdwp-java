@@ -47,12 +47,13 @@ public class ProcessBuilderMavenRunner implements LocalProjectClasspathProvider.
     /** Upper bound on captured child stdout/stderr included in the WARN log on failure. */
     private static final int STDOUT_CAPTURE_BYTES = 64 * 1024;
     /**
-     * Walk cap for the classpath-file harvester: the provider's filesystem scan depth ({@code 5})
-     * plus two — covering {@code <module>/target/.jdwp-mcp-classpath} for modules sitting at the
-     * scan boundary. Keeping it relative to the scan depth (rather than a magic literal) keeps the
-     * two limits coupled: a future bump to one is mirrored in the other.
+     * Walk cap for the classpath-file harvester: the provider's filesystem scan depth plus two —
+     * covering {@code <module>/target/.jdwp-mcp-classpath} for modules sitting at the scan boundary
+     * (the file is two segments — {@code target/.jdwp-mcp-classpath} — below the module dir). Derived
+     * from {@link LocalProjectClasspathProvider#MAX_SCAN_DEPTH} at compile time so a future bump to
+     * the scan depth is mirrored here automatically rather than silently dropping boundary modules.
      */
-    private static final int HARVEST_MAX_DEPTH = 7;
+    private static final int HARVEST_MAX_DEPTH = LocalProjectClasspathProvider.MAX_SCAN_DEPTH + 2;
     private static final Logger log = LoggerFactory.getLogger(ProcessBuilderMavenRunner.class);
 
     /** Seam for the actual process execution; replaced in tests to drive timeout / failure paths. */
@@ -228,7 +229,10 @@ public class ProcessBuilderMavenRunner implements LocalProjectClasspathProvider.
             try (var in = process.getInputStream()) {
                 final byte[] buf = new byte[4096];
                 int n;
-                while ((n = in.read(buf)) > 0) {
+                // `!= -1` (not `> 0`): EOF is the only loop-exit. A spurious zero-length read must
+                // keep draining, or the child could block on a full stdout pipe — the exact hang
+                // this drainer exists to prevent.
+                while ((n = in.read(buf)) != -1) {
                     synchronized (capturedLock) {
                         if (captured.size() < STDOUT_CAPTURE_BYTES) {
                             captured.write(buf, 0, Math.min(n, STDOUT_CAPTURE_BYTES - captured.size()));

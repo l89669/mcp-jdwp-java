@@ -416,4 +416,64 @@ class JDWPToolsDiagnoseTest {
 		assertThat(result).contains("Override env: JDWP_EXTRA_CLASSPATH (set, no entries)");
 		assertThat(result).doesNotContain("Override env: JDWP_EXTRA_CLASSPATH (unset)");
 	}
+
+	/**
+	 * Cold-cache three-way env state. The warm-cache tests above exercise {@code renderEnvState}'s
+	 * {@code breakdown != null} branch (entry count from the breakdown). This pins the COLD branch —
+	 * where the renderer must answer from {@link LocalProjectClasspathProvider#envOverrideHasEntries()}
+	 * by parsing the env var directly, WITHOUT triggering discovery. The cache is deliberately left
+	 * cold (no {@code discoverWithBreakdown()} call), so the "not yet computed" hint must appear
+	 * alongside the correct marker. Without this, the entire reason {@code envOverrideHasEntries()}
+	 * exists in the diagnose path would be untested.
+	 */
+	@Test
+	@DisplayName("cold cache: renders '(set)' from envOverrideHasEntries() without triggering discovery")
+	void shouldRenderSetOnColdCacheWhenEnvHasEntries() {
+		when(jdiService.getConnectionStatus()).thenReturn(new JDIConnectionService.ConnectionStatus(
+			false, null, 0, null, null
+		));
+		final Path cwd = Path.of(System.getProperty("user.dir"));
+		final LocalProjectClasspathProvider stub = new LocalProjectClasspathProvider(
+			cwd,
+			name -> "JDWP_EXTRA_CLASSPATH".equals(name)
+				? "/opt/extra1.jar" + java.io.File.pathSeparator + "/opt/extra2.jar"
+				: null,
+			(command, workingDirectory, timeoutSeconds) -> List.of()
+		);
+		// Cache intentionally NOT warmed — peekCachedBreakdown() returns null in the renderer.
+		final JDWPTools toolsWithStub = JDWPToolsTestSupport.newTools(
+			jdiService, new BreakpointTracker(), new WatcherManager(),
+			mock(JdiExpressionEvaluator.class), new EventHistory(), new EvaluationGuard(),
+			discovery, stub);
+
+		final String result = toolsWithStub.jdwp_diagnose(null);
+
+		assertThat(result).contains("not yet computed");
+		assertThat(result).contains("Override env: JDWP_EXTRA_CLASSPATH (set)");
+	}
+
+	@Test
+	@DisplayName("cold cache: renders '(set, no entries)' from envOverrideHasEntries() for a blank env")
+	void shouldRenderSetNoEntriesOnColdCacheWhenEnvIsBlank() {
+		when(jdiService.getConnectionStatus()).thenReturn(new JDIConnectionService.ConnectionStatus(
+			false, null, 0, null, null
+		));
+		final Path cwd = Path.of(System.getProperty("user.dir"));
+		final LocalProjectClasspathProvider stub = new LocalProjectClasspathProvider(
+			cwd,
+			name -> "JDWP_EXTRA_CLASSPATH".equals(name) ? "   " : null,
+			(command, workingDirectory, timeoutSeconds) -> List.of()
+		);
+		// Cache intentionally NOT warmed — exercises the cold envOverrideHasEntries() fallback.
+		final JDWPTools toolsWithStub = JDWPToolsTestSupport.newTools(
+			jdiService, new BreakpointTracker(), new WatcherManager(),
+			mock(JdiExpressionEvaluator.class), new EventHistory(), new EvaluationGuard(),
+			discovery, stub);
+
+		final String result = toolsWithStub.jdwp_diagnose(null);
+
+		assertThat(result).contains("not yet computed");
+		assertThat(result).contains("Override env: JDWP_EXTRA_CLASSPATH (set, no entries)");
+		assertThat(result).doesNotContain("Override env: JDWP_EXTRA_CLASSPATH (unset)");
+	}
 }

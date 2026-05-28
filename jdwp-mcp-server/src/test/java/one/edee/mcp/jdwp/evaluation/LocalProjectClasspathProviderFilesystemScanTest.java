@@ -169,6 +169,58 @@ class LocalProjectClasspathProviderFilesystemScanTest {
 	}
 
 	/**
+	 * Symlink-safety, deeper case: a symlinked {@code target/} directory must NOT be followed. This
+	 * is distinct from {@link #shouldNotFollowSymlinkedDirectoriesDuringScan} (which symlinks a whole
+	 * module): here the module dir is real but its {@code target} child is a symlink to a build tree
+	 * outside the project. A naive {@code dir.resolve("target/classes")} probe with NOFOLLOW_LINKS
+	 * only guards the final {@code classes} component and would still resolve through the linked
+	 * {@code target}, pulling external classes onto the compile classpath. The scan must probe
+	 * {@code target} itself with NOFOLLOW first and reject it when it is a link.
+	 */
+	@Test
+	@org.junit.jupiter.api.condition.EnabledOnOs({
+		org.junit.jupiter.api.condition.OS.LINUX,
+		org.junit.jupiter.api.condition.OS.MAC
+	})
+	@DisplayName("does not follow a symlinked target/ directory")
+	void shouldNotFollowSymlinkedTargetDirectory(@TempDir Path tmp) throws Exception {
+		// A build tree OUTSIDE the project root holding the classes we must NOT reach.
+		final Path outside = Files.createTempDirectory("jdwp-mcp-outside-target-");
+		try {
+			Files.createDirectories(outside.resolve("classes"));
+			Files.createDirectories(outside.resolve("test-classes"));
+
+			// A real module directory whose `target` is a SYMLINK to the outside build tree.
+			final Path module = tmp.resolve("linked-target-module");
+			Files.createDirectories(module);
+			Files.createSymbolicLink(module.resolve("target"), outside);
+
+			// A real (non-symlinked) module for sanity — proves the scan still works.
+			Files.createDirectories(tmp.resolve("real-module/target/classes"));
+
+			final LocalProjectClasspathProvider provider = new LocalProjectClasspathProvider(
+				tmp, envName -> null, (cmd, cwd, t) -> List.of()
+			);
+
+			final Set<String> entries = provider.discover();
+
+			assertThat(entries)
+				.contains(tmp.resolve("real-module/target/classes").toString())
+				.as("a symlinked target/ must not be followed — symlink-not-followed invariant")
+				.doesNotContain(
+					module.resolve("target/classes").toString(),
+					module.resolve("target/test-classes").toString(),
+					outside.resolve("classes").toString(),
+					outside.resolve("test-classes").toString());
+		} finally {
+			// Manual cleanup since the outside dir is not @TempDir-managed.
+			Files.deleteIfExists(outside.resolve("classes"));
+			Files.deleteIfExists(outside.resolve("test-classes"));
+			Files.deleteIfExists(outside);
+		}
+	}
+
+	/**
 	 * The scanner skips nested {@code target/} directories — once we enter a {@code target/} we
 	 * never recurse into a {@code target/foo/target/classes}. Anything nested inside the build
 	 * output belongs to Maven and must not contribute to the project's source classpath.

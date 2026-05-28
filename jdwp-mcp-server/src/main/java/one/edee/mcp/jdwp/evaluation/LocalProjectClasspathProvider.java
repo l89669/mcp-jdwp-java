@@ -52,7 +52,9 @@ public class LocalProjectClasspathProvider {
      * Filesystem-scan depth cap. Five levels covers reactor / module / sub-module layouts without
      * walking into Node / Gradle / IDE caches that an unbounded walk would otherwise stat-flood.
      */
-    private static final int MAX_SCAN_DEPTH = 5;
+    // Package-private (not private) so ProcessBuilderMavenRunner.HARVEST_MAX_DEPTH can derive from
+    // it at compile time, keeping the harvester's walk depth genuinely coupled to the scan depth.
+    static final int MAX_SCAN_DEPTH = 5;
     /**
      * Cold-cache {@code mvn} may download dependencies on first run, which routinely takes 1-3
      * minutes on a fresh machine. 180s covers the common case; a real timeout still logs a clear
@@ -403,13 +405,22 @@ public class LocalProjectClasspathProvider {
         }
         // At each directory, probe for target/classes and target/test-classes BEFORE recursing — we
         // want a module's classes whether or not it has child modules.
-        final Path classes = dir.resolve("target/classes");
-        if (Files.isDirectory(classes, LinkOption.NOFOLLOW_LINKS)) {
-            entries.add(classes.toString());
-        }
-        final Path testClasses = dir.resolve("target/test-classes");
-        if (Files.isDirectory(testClasses, LinkOption.NOFOLLOW_LINKS)) {
-            entries.add(testClasses.toString());
+        // NOFOLLOW_LINKS only governs the FINAL path component, so a single two-segment resolve like
+        // dir.resolve("target/classes") would still follow a symlinked `target` — defeating the
+        // invariant. Probe `target` itself first: isDirectory(NOFOLLOW) is false for a symlink, so a
+        // linked `target` (pointing at a tree outside the project) is rejected here. Only once it is
+        // confirmed to be a real directory do we resolve its leaves, where NOFOLLOW then guards the
+        // last component (`classes` / `test-classes`).
+        final Path target = dir.resolve("target");
+        if (Files.isDirectory(target, LinkOption.NOFOLLOW_LINKS)) {
+            final Path classes = target.resolve("classes");
+            if (Files.isDirectory(classes, LinkOption.NOFOLLOW_LINKS)) {
+                entries.add(classes.toString());
+            }
+            final Path testClasses = target.resolve("test-classes");
+            if (Files.isDirectory(testClasses, LinkOption.NOFOLLOW_LINKS)) {
+                entries.add(testClasses.toString());
+            }
         }
         if (depth == MAX_SCAN_DEPTH) {
             return;
