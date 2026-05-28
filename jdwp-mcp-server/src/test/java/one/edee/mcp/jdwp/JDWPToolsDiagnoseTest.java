@@ -4,6 +4,7 @@ import one.edee.mcp.jdwp.discovery.JdwpEndpoint;
 import one.edee.mcp.jdwp.discovery.JvmDescriptor;
 import one.edee.mcp.jdwp.discovery.JvmDiscoveryService;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
+import one.edee.mcp.jdwp.evaluation.LocalProjectClasspathProvider;
 import one.edee.mcp.jdwp.watchers.WatcherManager;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -11,6 +12,7 @@ import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
 
+import java.nio.file.Path;
 import java.time.Instant;
 import java.util.List;
 
@@ -260,5 +262,218 @@ class JDWPToolsDiagnoseTest {
 		verify(discovery).confirmAll(Mockito.anyList(), hostCaptor.capture(), portCaptor.capture());
 		assertThat(hostCaptor.getValue()).isEqualTo("10.0.0.5");
 		assertThat(portCaptor.getValue()).isEqualTo(5050);
+	}
+
+	/**
+	 * The local-classpath section answers two questions an agent asks when expression evaluation
+	 * fails with "X cannot be resolved": (1) did the MCP server pick up the local project's
+	 * classes/jars? and (2) which source(s) contributed? The test pins a stub provider with a known
+	 * breakdown so we can assert the exact formatted output without shelling out to Maven.
+	 */
+	@Test
+	@DisplayName("local-classpath section renders header + per-source breakdown + env state (unset)")
+	void shouldRenderLocalClasspathSectionWithUnsetEnv() {
+		when(jdiService.getConnectionStatus()).thenReturn(new JDIConnectionService.ConnectionStatus(
+			false, null, 0, null, null
+		));
+		final Path cwd = Path.of(System.getProperty("user.dir"));
+		final LocalProjectClasspathProvider stub = new LocalProjectClasspathProvider(
+			cwd,
+			name -> null,
+			(command, workingDirectory, timeoutSeconds) -> List.of(
+				"/tmp/dep-a.jar", "/tmp/dep-b.jar", "/tmp/dep-c.jar"
+			)
+		);
+		// Warm the breakdown cache so the diagnose path's non-blocking peek has something to render.
+		// Production warming happens on the first expression-evaluation flow, not on the diagnose
+		// path itself — see renderLocalClasspathBlock for why the diagnose call never blocks.
+		stub.discoverWithBreakdown();
+		final JDWPTools toolsWithStub = JDWPToolsTestSupport.newTools(
+			jdiService, new BreakpointTracker(), new WatcherManager(),
+			mock(JdiExpressionEvaluator.class), new EventHistory(), new EvaluationGuard(),
+			discovery, stub);
+
+		final String result = toolsWithStub.jdwp_diagnose(null);
+
+		assertThat(result).contains("Local project classpath");
+		assertThat(result).contains("(read from cache; populated on first expression evaluation)");
+		assertThat(result).contains("CWD: " + cwd);
+		// The stub forces Maven to contribute 3 jars; filesystem and env may legitimately add
+		// entries from the running build's tree but the maven count must be exactly 3.
+		assertThat(result).containsPattern("Sources: env-override=0, filesystem=\\d+, maven=3");
+		assertThat(result).containsPattern("Total local entries: \\d+");
+		assertThat(result).contains("Override env: JDWP_EXTRA_CLASSPATH (unset)");
+	}
+
+	/**
+	 * Complementary case: when {@code JDWP_EXTRA_CLASSPATH} is set in the process environment, the
+	 * diagnose output must say so. We don't poke {@link System#getenv} — the stub provider takes a
+	 * lookup function so we can flip the bit cleanly. The env contribution count must reflect the
+	 * stub's payload.
+	 */
+	@Test
+	@DisplayName("local-classpath section reflects JDWP_EXTRA_CLASSPATH when set")
+	void shouldRenderLocalClasspathSectionWithSetEnv() {
+		when(jdiService.getConnectionStatus()).thenReturn(new JDIConnectionService.ConnectionStatus(
+			false, null, 0, null, null
+		));
+		final Path cwd = Path.of(System.getProperty("user.dir"));
+		final LocalProjectClasspathProvider stub = new LocalProjectClasspathProvider(
+			cwd,
+			name -> "JDWP_EXTRA_CLASSPATH".equals(name)
+				? "/opt/extra1.jar" + java.io.File.pathSeparator + "/opt/extra2.jar"
+				: null,
+			(command, workingDirectory, timeoutSeconds) -> List.of()
+		);
+		// Warm the cache so the non-blocking peek in the diagnose path has data to render.
+		stub.discoverWithBreakdown();
+		final JDWPTools toolsWithStub = JDWPToolsTestSupport.newTools(
+			jdiService, new BreakpointTracker(), new WatcherManager(),
+			mock(JdiExpressionEvaluator.class), new EventHistory(), new EvaluationGuard(),
+			discovery, stub);
+
+		final String result = toolsWithStub.jdwp_diagnose(null);
+
+		assertThat(result).contains("Local project classpath");
+		assertThat(result).containsPattern("Sources: env-override=2, filesystem=\\d+, maven=0");
+		// Env state is read by the diagnose path from the same provider (or System.getenv) — when
+		// the provider says the env contributed >0 entries, the marker must read "(set)".
+		assertThat(result).contains("Override env: JDWP_EXTRA_CLASSPATH (set)");
+	}
+
+	/**
+	 * The diagnose path must never block on a cold local-classpath cache. When the provider has
+	 * never run discovery the renderer must call {@code peekCachedBreakdown()} (non-blocking),
+	 * print a "not yet computed; will populate after first expression evaluation" hint, and return.
+	 * Discovery happens organically when expression evaluation needs it.
+	 */
+	@Test
+	@DisplayName("does not block on a cold local-classpath cache — renders a 'not yet computed' hint instead")
+	void shouldRenderLocalClasspathSectionWithoutBlockingOnColdCache() {
+		when(jdiService.getConnectionStatus()).thenReturn(new JDIConnectionService.ConnectionStatus(
+			false, null, 0, null, null
+		));
+		final Path cwd = Path.of(System.getProperty("user.dir"));
+		// Slow provider — sleeps 2s inside the Maven runner. If diagnose blocks, the call exceeds
+		// the 500ms budget; the fix path skips discovery entirely.
+		final LocalProjectClasspathProvider slowStub = new LocalProjectClasspathProvider(
+			cwd,
+			name -> null,
+			(command, workingDirectory, timeoutSeconds) -> {
+				try { Thread.sleep(2000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+				return List.of("/m2/slow.jar");
+			}
+		);
+		// The CWD is the project root (which has a real pom.xml), so the slow Maven runner WOULD be
+		// triggered if diagnose ran a full discovery. The point of this test is that it doesn't:
+		// the diagnose path peeks the cold cache and renders "not yet computed", never invoking
+		// the runner. If the fast path regresses, the slow stub's 2s sleep blows the 500ms budget
+		// below.
+		final JDWPTools toolsWithSlowStub = JDWPToolsTestSupport.newTools(
+			jdiService, new BreakpointTracker(), new WatcherManager(),
+			mock(JdiExpressionEvaluator.class), new EventHistory(), new EvaluationGuard(),
+			discovery, slowStub);
+
+		final long start = System.nanoTime();
+		final String result = toolsWithSlowStub.jdwp_diagnose(null);
+		final long elapsedMs = (System.nanoTime() - start) / 1_000_000L;
+
+		assertThat(result).contains("Local project classpath");
+		assertThat(result).contains("not yet computed");
+		assertThat(elapsedMs)
+			.as("diagnose must not block on cold-cache Maven discovery")
+			.isLessThan(500L);
+	}
+
+	/**
+	 * When {@code JDWP_EXTRA_CLASSPATH} is set in the environment but parses to zero entries (all
+	 * blank tokens), the diagnose line must read {@code (set, no entries)} — not {@code (unset)},
+	 * which is indistinguishable from a truly absent env var. Three-way state:
+	 * {@code (unset)} / {@code (set, no entries)} / {@code (set)}.
+	 */
+	@Test
+	@DisplayName("renders '(set, no entries)' when JDWP_EXTRA_CLASSPATH is set but parses to zero entries")
+	void shouldRenderSetNoEntriesWhenEnvIsSetButBlank() {
+		when(jdiService.getConnectionStatus()).thenReturn(new JDIConnectionService.ConnectionStatus(
+			false, null, 0, null, null
+		));
+		final Path cwd = Path.of(System.getProperty("user.dir"));
+		final LocalProjectClasspathProvider stub = new LocalProjectClasspathProvider(
+			cwd,
+			name -> "JDWP_EXTRA_CLASSPATH".equals(name) ? "" : null,
+			(command, workingDirectory, timeoutSeconds) -> List.of()
+		);
+		// Warm the cache so the diagnose path can see the 0-entry breakdown and distinguish
+		// "set but empty" from "unset" in its render.
+		stub.discoverWithBreakdown();
+		final JDWPTools toolsWithStub = JDWPToolsTestSupport.newTools(
+			jdiService, new BreakpointTracker(), new WatcherManager(),
+			mock(JdiExpressionEvaluator.class), new EventHistory(), new EvaluationGuard(),
+			discovery, stub);
+
+		final String result = toolsWithStub.jdwp_diagnose(null);
+
+		assertThat(result).contains("Override env: JDWP_EXTRA_CLASSPATH (set, no entries)");
+		assertThat(result).doesNotContain("Override env: JDWP_EXTRA_CLASSPATH (unset)");
+	}
+
+	/**
+	 * Cold-cache three-way env state. The warm-cache tests above exercise {@code renderEnvState}'s
+	 * {@code breakdown != null} branch (entry count from the breakdown). This pins the COLD branch —
+	 * where the renderer must answer from {@link LocalProjectClasspathProvider#envOverrideHasEntries()}
+	 * by parsing the env var directly, WITHOUT triggering discovery. The cache is deliberately left
+	 * cold (no {@code discoverWithBreakdown()} call), so the "not yet computed" hint must appear
+	 * alongside the correct marker. Without this, the entire reason {@code envOverrideHasEntries()}
+	 * exists in the diagnose path would be untested.
+	 */
+	@Test
+	@DisplayName("cold cache: renders '(set)' from envOverrideHasEntries() without triggering discovery")
+	void shouldRenderSetOnColdCacheWhenEnvHasEntries() {
+		when(jdiService.getConnectionStatus()).thenReturn(new JDIConnectionService.ConnectionStatus(
+			false, null, 0, null, null
+		));
+		final Path cwd = Path.of(System.getProperty("user.dir"));
+		final LocalProjectClasspathProvider stub = new LocalProjectClasspathProvider(
+			cwd,
+			name -> "JDWP_EXTRA_CLASSPATH".equals(name)
+				? "/opt/extra1.jar" + java.io.File.pathSeparator + "/opt/extra2.jar"
+				: null,
+			(command, workingDirectory, timeoutSeconds) -> List.of()
+		);
+		// Cache intentionally NOT warmed — peekCachedBreakdown() returns null in the renderer.
+		final JDWPTools toolsWithStub = JDWPToolsTestSupport.newTools(
+			jdiService, new BreakpointTracker(), new WatcherManager(),
+			mock(JdiExpressionEvaluator.class), new EventHistory(), new EvaluationGuard(),
+			discovery, stub);
+
+		final String result = toolsWithStub.jdwp_diagnose(null);
+
+		assertThat(result).contains("not yet computed");
+		assertThat(result).contains("Override env: JDWP_EXTRA_CLASSPATH (set)");
+	}
+
+	@Test
+	@DisplayName("cold cache: renders '(set, no entries)' from envOverrideHasEntries() for a blank env")
+	void shouldRenderSetNoEntriesOnColdCacheWhenEnvIsBlank() {
+		when(jdiService.getConnectionStatus()).thenReturn(new JDIConnectionService.ConnectionStatus(
+			false, null, 0, null, null
+		));
+		final Path cwd = Path.of(System.getProperty("user.dir"));
+		final LocalProjectClasspathProvider stub = new LocalProjectClasspathProvider(
+			cwd,
+			name -> "JDWP_EXTRA_CLASSPATH".equals(name) ? "   " : null,
+			(command, workingDirectory, timeoutSeconds) -> List.of()
+		);
+		// Cache intentionally NOT warmed — exercises the cold envOverrideHasEntries() fallback.
+		final JDWPTools toolsWithStub = JDWPToolsTestSupport.newTools(
+			jdiService, new BreakpointTracker(), new WatcherManager(),
+			mock(JdiExpressionEvaluator.class), new EventHistory(), new EvaluationGuard(),
+			discovery, stub);
+
+		final String result = toolsWithStub.jdwp_diagnose(null);
+
+		assertThat(result).contains("not yet computed");
+		assertThat(result).contains("Override env: JDWP_EXTRA_CLASSPATH (set, no entries)");
+		assertThat(result).doesNotContain("Override env: JDWP_EXTRA_CLASSPATH (unset)");
 	}
 }

@@ -10,6 +10,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
+import java.io.File;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
@@ -67,6 +68,13 @@ public class JdiExpressionEvaluator {
     private final InMemoryJavaCompiler compiler;
     private final JDIConnectionService jdiConnectionService;
     private final EvaluationGuard evaluationGuard;
+    /**
+     * Additive local-project classpath. Unioned with the remote classloader-discovered classpath in
+     * {@link #configureCompilerClasspath} to fill gaps the remote walk cannot see (Tomcat / Spring
+     * Boot dev-tools / custom URLClassLoaders that hide their JARs from {@code getURLs()}). Reset
+     * on every reconnect so a new connection sees the current project layout.
+     */
+    private final LocalProjectClasspathProvider localClasspathProvider;
 
     /**
      * Compilation cache. Key is `contextSignature + "###" + expression`, so two frames with the
@@ -76,14 +84,26 @@ public class JdiExpressionEvaluator {
      */
     private final Map<String, CachedCompilation> compilationCache = new ConcurrentHashMap<>();
 
+    /**
+     * Whether the (potentially Maven-blocking) local-project classpath has already been merged into
+     * the compiler config for the current connection. Distinct from "JDK path discovered": the
+     * best-effort {@link #prewarmClasspath} warms only the remote classpath + JDK detection and
+     * leaves this {@code false}, so the first real evaluation still completes the local merge.
+     * Reset to {@code false} on the reconnect edge (null JDK path) alongside the other caches.
+     * Guarded by the {@code synchronized} monitor of {@link #configureCompilerClasspath}.
+     */
+    private boolean localClasspathMerged = false;
+
     public JdiExpressionEvaluator(
         InMemoryJavaCompiler compiler,
         JDIConnectionService jdiConnectionService,
-        EvaluationGuard evaluationGuard
+        EvaluationGuard evaluationGuard,
+        LocalProjectClasspathProvider localClasspathProvider
     ) {
         this.compiler = compiler;
         this.jdiConnectionService = jdiConnectionService;
         this.evaluationGuard = evaluationGuard;
+        this.localClasspathProvider = localClasspathProvider;
     }
 
     /**
@@ -841,10 +861,10 @@ public class JdiExpressionEvaluator {
         // Refuse to define classes into restricted JDK packages — `java.*` is enforced by the JVM
         // itself, the rest are flagged here so we get a clean log message rather than a runtime
         // SecurityException far from the decision site.
-        if (pkg.isEmpty() || pkg.startsWith("java.") || pkg.equals("java")
-            || pkg.startsWith("javax.") || pkg.equals("javax")
-            || pkg.startsWith("sun.") || pkg.equals("sun")
-            || pkg.startsWith("jdk.") || pkg.equals("jdk")) {
+        if (pkg.isEmpty() || pkg.startsWith("java.") || "java".equals(pkg)
+            || pkg.startsWith("javax.") || "javax".equals(pkg)
+            || pkg.startsWith("sun.") || "sun".equals(pkg)
+            || pkg.startsWith("jdk.") || "jdk".equals(pkg)) {
             return DEFAULT_EVALUATION_PACKAGE;
         }
         return pkg;
@@ -1124,11 +1144,14 @@ public class JdiExpressionEvaluator {
     }
 
     /**
-     * Configures the compiler with the target JVM's classpath. Skips if already configured for the
-     * current connection. Automatically reconfigures after a disconnect/reconnect cycle (detected
-     * via null JDK path): clears the compilation cache AND resets the compiler config because stale
-     * bytecode and a stale classpath may reference classes from a previous connection. Must be
-     * called BEFORE any expression evaluation to avoid nested JDI calls.
+     * Configures the compiler with the target JVM's classpath, including the local-project classpath
+     * fallback. Skips if already fully configured for the current connection. Automatically
+     * reconfigures after a disconnect/reconnect cycle (detected via null JDK path): clears the
+     * compilation cache AND resets the compiler config because stale bytecode and a stale classpath
+     * may reference classes from a previous connection. Also resets the
+     * {@link LocalProjectClasspathProvider} cache on the same edge so a reconnect into a different
+     * working directory sees the new project layout. Must be called BEFORE any expression evaluation
+     * to avoid nested JDI calls.
      *
      * @param suspendedThread a thread already suspended at a breakpoint (REQUIRED)
      * @throws JdiEvaluationException if classpath/JDK discovery fails for the current connection;
@@ -1138,8 +1161,33 @@ public class JdiExpressionEvaluator {
      */
     public synchronized void configureCompilerClasspath(ThreadReference suspendedThread)
         throws JdiEvaluationException {
-        // Self-healing: if JDK path is already set, classpath is already configured for this connection
-        if (jdiConnectionService.getDiscoveredJdkPath() != null) {
+        configureCompilerClasspath(suspendedThread, true);
+    }
+
+    /**
+     * Worker for {@link #configureCompilerClasspath(ThreadReference)} and {@link #prewarmClasspath}.
+     *
+     * <p>{@code includeLocal} controls whether the local-project classpath fallback (env override +
+     * filesystem scan + Maven {@code dependency:build-classpath}) is merged in. The real evaluation
+     * paths pass {@code true}; the speculative {@link #prewarmClasspath} — which runs on the JDI
+     * event-listener thread the instant a breakpoint hits, before the user has asked for anything —
+     * passes {@code false}. The local fallback can shell out to Maven with a multi-minute timeout, so
+     * paying it on the event-listener thread would block event processing (and every other breakpoint)
+     * for minutes even if the user never evaluates an expression. Prewarm therefore warms only the
+     * remote classpath + JDK detection, and {@link #localClasspathMerged} stays {@code false} so the
+     * first actual evaluation/logpoint/condition completes the local merge.
+     *
+     * @param suspendedThread a thread already suspended at a breakpoint (REQUIRED)
+     * @param includeLocal    whether to merge the (possibly Maven-blocking) local-project classpath
+     */
+    private synchronized void configureCompilerClasspath(ThreadReference suspendedThread, boolean includeLocal)
+        throws JdiEvaluationException {
+        final boolean jdkReady = jdiConnectionService.getDiscoveredJdkPath() != null;
+        // Self-healing short-circuit. The remote classpath + JDK are warm once the JDK path is set,
+        // which is all a prewarm (includeLocal=false) cares about. A real evaluation additionally
+        // needs the local fallback merged — so it only short-circuits once localClasspathMerged is
+        // true, otherwise it falls through to complete the merge prewarm deliberately skipped.
+        if (jdkReady && (!includeLocal || localClasspathMerged)) {
             return;
         }
 
@@ -1156,8 +1204,18 @@ public class JdiExpressionEvaluator {
             // the compiler config before rediscovering: if discovery then fails, compile() refuses
             // with a clear "not configured" error instead of silently emitting bytecode resolved
             // against the previous target's classpath.
-            compilationCache.clear();
-            compiler.reset();
+            // The local-classpath provider lives in the same Spring singleton and may hold a
+            // memoised view of a *previous* connection's project layout — reset it on the same
+            // connection-lifecycle edge so the next discover() sees the current CWD/env/Maven view.
+            // Guard on !jdkReady: when we fall through here with the JDK already discovered (a real
+            // evaluation finishing the merge a prewarm deferred), the remote discovery is still valid
+            // and must NOT be wiped.
+            if (!jdkReady) {
+                compilationCache.clear();
+                compiler.reset();
+                localClasspathProvider.reset();
+                localClasspathMerged = false;
+            }
 
             final long startTime = System.currentTimeMillis();
 
@@ -1166,7 +1224,7 @@ public class JdiExpressionEvaluator {
             // that into an actionable exception rather than returning silently — otherwise the
             // caller proceeds to compile() and the user only sees a raw JDT diagnostic (e.g.
             // "io cannot be resolved") with no hint that the real cause was a failed discovery.
-            final String classpath = jdiConnectionService.discoverClasspath(suspendedThread);
+            final String remoteClasspath = jdiConnectionService.discoverClasspath(suspendedThread);
             final String jdkPath = jdiConnectionService.getDiscoveredJdkPath();
 
             if (jdkPath == null) {
@@ -1175,15 +1233,53 @@ public class JdiExpressionEvaluator {
                         + "the target VM could be located, so application types cannot be resolved. "
                         + "Check the server log (search '[JDI]') for the underlying cause.");
             }
-            if (classpath == null || classpath.isEmpty()) {
+
+            // Local classpath augments — does NOT replace — the remote one. The union goes
+            // [remote..., local-only...] so live target VM entries continue to win on JDT
+            // resolution; local entries only fill gaps the remote walk could not see (Tomcat /
+            // Spring Boot / custom URLClassLoaders that hide their JARs from getURLs()).
+            // Resolution order: ECJ scans the classpath left-to-right (InMemoryJavaCompiler
+            // passes the joined string as `-classpath`), so a class present in BOTH a remote and
+            // a stale local entry binds against the remote definition first — desired behaviour
+            // for the source/binary-drift risk.
+            final long mergeStart = System.currentTimeMillis();
+            // includeLocal=false (prewarm) skips the local provider entirely — it can shell out to
+            // Maven with a multi-minute timeout, which must never run on the JDI event-listener
+            // thread. The first real evaluation re-enters with includeLocal=true and completes the
+            // merge below.
+            final Set<String> localEntries = includeLocal ? localClasspathProvider.discover() : Set.of();
+            final String mergedClasspath = mergeClasspaths(remoteClasspath, localEntries);
+            // Report three numbers so an operator can see overlap explicitly:
+            // remote + local are the raw source counts; merged is the deduped union actually
+            // handed to the compiler. Some local entries may overlap with remote (live target VM
+            // and local project share JARs) — the overlap shows up as "merged < remote + local".
+            final int remoteCount = countEntries(remoteClasspath);
+            final int mergedCount = countEntries(mergedClasspath);
+            log.info("[LocalClasspath] Merged classpath: {} remote + {} local entries → {} merged in {}ms"
+                    + (includeLocal ? "" : " (prewarm — local fallback deferred to first evaluation)"),
+                remoteCount, localEntries.size(), mergedCount,
+                System.currentTimeMillis() - mergeStart);
+
+            if (mergedClasspath.isEmpty()) {
                 throw new JdiEvaluationException(
-                    "Classpath discovery failed for the current connection: the target VM classpath "
-                        + "could not be determined, so application types cannot be resolved. "
-                        + "Check the server log (search '[JDI]') for the underlying cause.");
+                    "Classpath discovery failed for the current connection: neither the target VM "
+                        + "classloader hierarchy nor the local project yielded any classpath entries. "
+                        + "The MCP server was launched from the directory '"
+                        + Objects.toString(System.getProperty("user.dir"), "<unknown>") + "'. "
+                        + "Either (a) restart the server from a directory containing a Maven project "
+                        + "(pom.xml + target/classes), or (b) set the JDWP_EXTRA_CLASSPATH environment "
+                        + "variable to a colon/semicolon-separated list of jars and class directories. "
+                        + "Run jdwp_diagnose to inspect what was scanned, and check the server log for "
+                        + "'[LocalClasspath]' and '[Discoverer]' entries.");
             }
 
             final int version = jdiConnectionService.getTargetMajorVersion();
-            compiler.configure(jdkPath, classpath, version);
+            compiler.configure(jdkPath, mergedClasspath, version);
+            // Mark the local fallback merged only on the real-evaluation path. A prewarm leaves this
+            // false so the first actual evaluation falls through the short-circuit and merges it.
+            if (includeLocal) {
+                localClasspathMerged = true;
+            }
             log.info("[Evaluator] Compiler configured in {}ms", System.currentTimeMillis() - startTime);
         } finally {
             evaluationGuard.exit(guardedThreadId);
@@ -1193,9 +1289,16 @@ public class JdiExpressionEvaluator {
     /**
      * Best-effort pre-warm of the compiler classpath at the first thread suspension, so the agent's
      * first {@code evaluate_expression} (or the first logpoint/condition hit) does not pay the
-     * one-time classpath discovery cost — which can take 1-3s while it walks the target VM's
+     * one-time remote classpath discovery cost — which can take 1-3s while it walks the target VM's
      * classloader hierarchy via {@code invokeMethod} — on the critical path. Discovery is paid once
      * per connection; subsequent calls short-circuit on the cached JDK path.
+     * <p>
+     * Warms ONLY the remote classpath + JDK detection (it passes {@code includeLocal=false}). The
+     * local-project fallback is deliberately NOT run here: it can shell out to Maven with a
+     * multi-minute timeout, and this method runs on the JDI event-listener thread the moment a
+     * breakpoint hits — blocking that thread on Maven would stall event processing (and every other
+     * breakpoint) for minutes even if the user never evaluates anything. The first real evaluation
+     * completes the local merge via {@link #configureCompilerClasspath(ThreadReference)}.
      * <p>
      * Unlike {@link #configureCompilerClasspath}, this NEVER throws: it is invoked from the JDI
      * event listener while a thread is parked for inspection, and a warming failure must not disrupt
@@ -1209,11 +1312,100 @@ public class JdiExpressionEvaluator {
             return;
         }
         try {
-            configureCompilerClasspath(suspendedThread);
+            configureCompilerClasspath(suspendedThread, false);
         } catch (Exception e) {
             log.debug("[Evaluator] Classpath pre-warm failed (will retry on first evaluation): {}",
                 e.getMessage());
         }
+    }
+
+    /**
+     * Unions the remote-discovered classpath (target VM) with the local-project entries, deduping
+     * while preserving insertion order so remote entries appear first. Putting remote entries first
+     * ensures JDT binds against the live target's definition when the same class also appears in a
+     * (possibly stale) local entry.
+     *
+     * <p>Splits the remote string via {@link #splitRemoteClasspath} so a single-entry Windows path
+     * like {@code "C:\foo"} stays intact rather than being shredded on the colon.
+     *
+     * @param remote remote-discovered classpath joined by the target VM's path separator;
+     *               {@code null}, empty, and blank are tolerated
+     * @param local  local-project entries in insertion order (typically from
+     *               {@link LocalProjectClasspathProvider#discover()})
+     * @return single string joined by the host {@link File#pathSeparator}, suitable to hand directly
+     *         to the in-memory compiler's {@code -classpath} argument
+     */
+    private static String mergeClasspaths(@Nullable String remote, Set<String> local) {
+        final Set<String> union = new LinkedHashSet<>();
+        if (remote != null && !remote.isEmpty()) {
+            for (String entry : splitRemoteClasspath(remote)) {
+                final String trimmed = entry.trim();
+                if (!trimmed.isEmpty()) {
+                    union.add(trimmed);
+                }
+            }
+        }
+        union.addAll(local);
+        return String.join(File.pathSeparator, union);
+    }
+
+    /**
+     * Counts the non-blank entries in a classpath string, reusing {@link #splitRemoteClasspath}'s
+     * separator heuristic. Used purely for the INFO log line summarising the merge result — the
+     * value never drives control flow.
+     *
+     * <p>Caveat: {@code mergeClasspaths} always joins with the host {@link File#pathSeparator},
+     * whereas this re-detects the separator from content. In the same-OS case (the only one that
+     * actually compiles — a Windows target's paths don't resolve on a Unix host and vice-versa)
+     * the two agree. In a hypothetical cross-OS mix the logged count can under-report; that is an
+     * accepted cosmetic imprecision, not a correctness issue.
+     */
+    private static int countEntries(@Nullable String classpath) {
+        if (classpath == null || classpath.isEmpty()) {
+            return 0;
+        }
+        int count = 0;
+        for (String e : splitRemoteClasspath(classpath)) {
+            if (!e.trim().isEmpty()) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    /**
+     * Splits a remote classpath into entries. Three cases:
+     * <ol>
+     *   <li>Contains {@code ;} — Windows-style classpath, split on {@code ;}.</li>
+     *   <li>Looks like a single Windows path ({@code <letter>:\...}) — treat as one entry.</li>
+     *   <li>Otherwise — Unix-style classpath, split on {@code :}.</li>
+     * </ol>
+     */
+    private static String[] splitRemoteClasspath(String classpath) {
+        if (classpath.contains(";")) {
+            return classpath.split(";", -1);
+        }
+        if (looksLikeSingleWindowsPath(classpath)) {
+            return new String[] { classpath };
+        }
+        return classpath.split(":", -1);
+    }
+
+    /**
+     * Heuristic: {@code true} when {@code value} starts with {@code <letter>:\} or {@code <letter>:/},
+     * indicating a single Windows path that must not be split on {@code :}. Multi-entry Windows
+     * classpaths contain {@code ;} and are filtered by the caller before this check runs.
+     *
+     * <p><b>Limitation.</b> A Unix-style classpath whose first entry happens to look like a Windows
+     * drive prefix (vanishingly unlikely in practice) would be misclassified as a single entry. This
+     * tradeoff is accepted because the alternative — host-OS sniffing — fails when the MCP server
+     * and target VM run on different operating systems.
+     */
+    private static boolean looksLikeSingleWindowsPath(String value) {
+        return value.length() >= 3
+            && Character.isLetter(value.charAt(0))
+            && value.charAt(1) == ':'
+            && (value.charAt(2) == '\\' || value.charAt(2) == '/');
     }
 
     /**

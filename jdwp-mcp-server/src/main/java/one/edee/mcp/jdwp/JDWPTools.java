@@ -7,6 +7,7 @@ import one.edee.mcp.jdwp.discovery.DiagnoseReportRenderer;
 import one.edee.mcp.jdwp.discovery.JvmDescriptor;
 import one.edee.mcp.jdwp.discovery.JvmDiscoveryService;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
+import one.edee.mcp.jdwp.evaluation.LocalProjectClasspathProvider;
 import one.edee.mcp.jdwp.marks.MarkInfo;
 import one.edee.mcp.jdwp.marks.MarkedInstanceRegistry;
 import one.edee.mcp.jdwp.watchers.Watcher;
@@ -109,13 +110,24 @@ public class JDWPTools {
      * status). Lifecycle is owned by {@link JDIConnectionService}; this class only reads snapshots.
      */
     private final JdiHealthMonitor healthMonitor;
+    /**
+     * Local-project classpath fallback. Surfaced through {@code jdwp_diagnose} so operators can
+     * see which sources (env override / filesystem / Maven) contributed to the additive classpath
+     * fed into expression evaluation. Memoised per JDI connection; the diagnose path reads the
+     * cached breakdown via {@link LocalProjectClasspathProvider#peekCachedBreakdown()} and never
+     * triggers discovery itself — discovery happens organically on the first expression
+     * evaluation. When the cache is cold the diagnose section prints a "not yet computed" hint
+     * instead of blocking.
+     */
+    private final LocalProjectClasspathProvider localClasspathProvider;
 
     public JDWPTools(JDIConnectionService jdiService, BreakpointTracker breakpointTracker,
                      WatcherManager watcherManager, JdiExpressionEvaluator expressionEvaluator,
                      EventHistory eventHistory, EvaluationGuard evaluationGuard,
                      JvmDiscoveryService jvmDiscoveryService,
                      MarkedInstanceRegistry markedInstances,
-                     JdiHealthMonitor healthMonitor) {
+                     JdiHealthMonitor healthMonitor,
+                     LocalProjectClasspathProvider localClasspathProvider) {
         this.jdiService = jdiService;
         this.breakpointTracker = breakpointTracker;
         this.watcherManager = watcherManager;
@@ -125,6 +137,7 @@ public class JDWPTools {
         this.jvmDiscoveryService = jvmDiscoveryService;
         this.markedInstances = markedInstances;
         this.healthMonitor = healthMonitor;
+        this.localClasspathProvider = localClasspathProvider;
     }
 
     /**
@@ -1690,8 +1703,69 @@ public class JDWPTools {
             out.append('\n').append(buildDiagnosticReport(false, null));
         }
 
+        // Local project classpath section: shows which entries the additive fallback contributed
+        // to expression evaluation. Independent of connection state so operators can sanity-check
+        // their CWD even before attaching. NON-BLOCKING: reads only the cached breakdown via
+        // peekCachedBreakdown(); never triggers a Maven invocation. When the cache is cold the
+        // block prints a "not yet computed" hint and discovery happens on the first eval.
+        out.append(renderLocalClasspathBlock());
+
         out.append(renderLocalJvmsBlock(status, inspectAll));
         return out.toString();
+    }
+
+    /**
+     * Renders the "Local project classpath" diagnose section. NON-BLOCKING by design — calls into
+     * {@link LocalProjectClasspathProvider#peekCachedBreakdown()} so the report never waits on a
+     * cold-cache Maven invocation (which can take up to ~3 min). When the cache is cold the block
+     * prints a "not yet computed" hint; the breakdown populates organically the next time
+     * expression evaluation runs.
+     *
+     * <p>The env-state line is three-way:
+     * {@code (unset)} when the variable is absent, {@code (set, no entries)} when present but
+     * blank, and {@code (set)} when present with at least one entry. This distinction matters to
+     * operators who have set the variable but see it rendered as if absent.
+     */
+    private String renderLocalClasspathBlock() {
+        final StringBuilder out = new StringBuilder("\n▸ Local project classpath\n");
+        out.append("  (read from cache; populated on first expression evaluation)\n");
+        try {
+            final LocalProjectClasspathProvider.Breakdown breakdown =
+                localClasspathProvider.peekCachedBreakdown();
+            out.append("  CWD: ").append(localClasspathProvider.getWorkingDirectory()).append('\n');
+            out.append("  pom.xml: ").append(localClasspathProvider.hasPomAtRoot() ? "yes" : "no").append('\n');
+            final String envState = renderEnvState(breakdown);
+            if (breakdown == null) {
+                out.append("  (not yet computed; will populate on first expression evaluation)\n");
+                out.append("  Override env: JDWP_EXTRA_CLASSPATH ").append(envState).append('\n');
+            } else {
+                out.append("  Sources: env-override=").append(breakdown.envOverride())
+                    .append(", filesystem=").append(breakdown.filesystem())
+                    .append(", maven=").append(breakdown.maven()).append('\n');
+                out.append("  Total local entries: ").append(breakdown.all().size()).append('\n');
+                out.append("  Override env: JDWP_EXTRA_CLASSPATH ").append(envState).append('\n');
+            }
+        } catch (Exception e) {
+            log.warn("Local classpath discovery failed during diagnose", e);
+            out.append("  (local classpath discovery failed: ").append(e.getMessage()).append(")\n");
+        }
+        return out.toString();
+    }
+
+    /**
+     * Resolves the three-way env-state marker rendered after {@code JDWP_EXTRA_CLASSPATH}. When the
+     * cache is warm ({@code breakdown != null}) the entry-count from the breakdown is authoritative;
+     * when cold we still answer correctly by parsing the env var directly via
+     * {@link LocalProjectClasspathProvider#envOverrideHasEntries()} — no discovery triggered.
+     */
+    private String renderEnvState(LocalProjectClasspathProvider.@Nullable Breakdown breakdown) {
+        if (!localClasspathProvider.isEnvOverrideSet()) {
+            return "(unset)";
+        }
+        final boolean hasEntries = breakdown != null
+            ? breakdown.envOverride() > 0
+            : localClasspathProvider.envOverrideHasEntries();
+        return hasEntries ? "(set)" : "(set, no entries)";
     }
 
     /**

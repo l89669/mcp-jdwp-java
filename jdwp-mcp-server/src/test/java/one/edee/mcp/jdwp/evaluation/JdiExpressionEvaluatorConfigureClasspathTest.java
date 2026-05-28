@@ -13,7 +13,6 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
-import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -22,7 +21,7 @@ import static org.mockito.Mockito.when;
  * {@link JdiExpressionEvaluator#configureCompilerClasspath(ThreadReference)} and
  * {@link JdiExpressionEvaluator#prewarmClasspath(ThreadReference)}.
  *
- * <p>Covers the fixes for the classpath-warming lifecycle (GH #30): a failed discovery must reset
+ * <p>Covers the classpath-warming lifecycle contract: a failed discovery must reset
  * the compiler (so no stale config survives), surface an actionable exception from the strict path,
  * and stay silent on the best-effort pre-warm path.
  */
@@ -37,7 +36,12 @@ class JdiExpressionEvaluatorConfigureClasspathTest {
 	void setUp() {
 		compiler = mock(InMemoryJavaCompiler.class);
 		jdiService = mock(JDIConnectionService.class);
-		evaluator = new JdiExpressionEvaluator(compiler, jdiService, new EvaluationGuard());
+		// No-op local-classpath provider — these tests only care about the remote-side reset/configure
+		// semantics; LocalProjectClasspathProviderTestSupport supplies a provider that never touches
+		// the real environment, filesystem, or Maven.
+		evaluator = new JdiExpressionEvaluator(
+			compiler, jdiService, new EvaluationGuard(),
+			LocalProjectClasspathProviderTestSupport.noOpProvider());
 		thread = mock(ThreadReference.class);
 		when(thread.uniqueID()).thenReturn(42L);
 	}
@@ -69,16 +73,53 @@ class JdiExpressionEvaluatorConfigureClasspathTest {
 	}
 
 	@Test
-	@DisplayName("Already-configured connection short-circuits without touching the compiler")
+	@DisplayName("A completed full configure short-circuits a second call without re-discovering")
 	void shouldShortCircuitWhenAlreadyConfigured() throws Exception {
-		// A non-null discovered JDK path means the connection is already configured.
-		when(jdiService.getDiscoveredJdkPath()).thenReturn("/opt/jdk");
+		// First call: discovery succeeds and the local fallback is merged → the connection is fully
+		// configured. A non-null JDK path alone is NOT enough to short-circuit a real evaluation now
+		// (prewarm leaves it set with the local fallback still pending); only a completed full
+		// configure is. Drive one full configure, then assert the second call does nothing.
+		when(jdiService.getDiscoveredJdkPath()).thenReturn(null, "/opt/jdk");
+		when(jdiService.discoverClasspath(thread)).thenReturn("/app/classes");
+		when(jdiService.getTargetMajorVersion()).thenReturn(21);
+
+		evaluator.configureCompilerClasspath(thread);
+		org.mockito.Mockito.clearInvocations(compiler, jdiService);
 
 		evaluator.configureCompilerClasspath(thread);
 
 		verify(compiler, never()).reset();
 		verify(compiler, never()).configure(any(), any(), org.mockito.ArgumentMatchers.anyInt());
 		verify(jdiService, never()).discoverClasspath(any());
+	}
+
+	@Test
+	@DisplayName("prewarm warms remote+JDK but defers local merge; first real eval completes it")
+	void prewarmDefersLocalMergeUntilFirstEvaluation() throws Exception {
+		// prewarm runs on the JDI event-listener thread and must never invoke the local provider
+		// (which can shell out to Maven for minutes). It warms only remote discovery + JDK detection;
+		// the first real configureCompilerClasspath then completes the local merge.
+		final LocalProjectClasspathProvider local = mock(LocalProjectClasspathProvider.class);
+		when(local.discover()).thenReturn(java.util.Set.of("/local/a"));
+		final JdiExpressionEvaluator deferEvaluator = new JdiExpressionEvaluator(
+			compiler, jdiService, new EvaluationGuard(), local);
+
+		// prewarm reads the JDK path twice before discovery (outer guard + inner gate); both see
+		// null, then discovery sets it for every subsequent read.
+		when(jdiService.getDiscoveredJdkPath()).thenReturn(null, null, "/opt/jdk");
+		when(jdiService.discoverClasspath(thread)).thenReturn("/app/classes");
+		when(jdiService.getTargetMajorVersion()).thenReturn(21);
+
+		deferEvaluator.prewarmClasspath(thread);
+
+		// Remote discovery happened; the (potentially Maven-shelling) local discover() was NOT run
+		// during prewarm. The cheap cache reset() may still fire on the fresh-connection edge.
+		verify(jdiService).discoverClasspath(thread);
+		verify(local, never()).discover();
+
+		// First real evaluation falls through the JDK-path short-circuit and merges the local fallback.
+		deferEvaluator.configureCompilerClasspath(thread);
+		verify(local).discover();
 	}
 
 	@Test

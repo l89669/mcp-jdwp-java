@@ -74,6 +74,31 @@ Walks the target VM's classloader hierarchy to collect all JARs. The initial `ja
 
 Each URL is dereferenced to its path string and added to the deduplicated list. The result is cached in `JDIConnectionService.cachedClasspath`. See [memory-and-references.md](memory-and-references.md) § 9 for the allocation behaviour during the walk (transient mirrors, not cached).
 
+### `LocalProjectClasspathProvider` — local-project classpath fallback
+
+The remote classloader walk above is the source of truth, but it does not see everything. Tomcat's `WebappClassLoaderBase`, Spring Boot's `LaunchedClassLoader` / dev-tools `RestartClassLoader`, and arbitrary user-written `URLClassLoader`s hide their JARs from `getURLs()` or expose them only behind reflection — so JDT can fail to resolve types that are clearly visible to the running application. To plug those gaps, `LocalProjectClasspathProvider` (Spring singleton in the `evaluation/` package) computes a second, additive classpath from the **MCP server's own working directory** and `JdiExpressionEvaluator.configureCompilerClasspath` unions it with the remote-discovered one before handing the result to `InMemoryJavaCompiler.configure`.
+
+**Three sources, composed in order:**
+
+1. **`JDWP_EXTRA_CLASSPATH` env var** — colon/semicolon-separated (parsed with `File.pathSeparator`) list of jars and class directories. Explicit override for cases the other sources can't reach (e.g. a JAR installed outside the project, or a vendor build artefact).
+2. **Filesystem scan** — walks the CWD up to depth 5 looking for `target/classes` and `target/test-classes` directories. Multi-module reactors are covered without the provider needing to parse a `pom.xml`.
+3. **Maven `dependency:build-classpath`** — for each detected module, invokes `./mvnw dependency:build-classpath -Dmdep.outputFile=target/.jdwp-mcp-classpath` (preferring `./mvnw` over `mvn`) and harvests the printed list. Synchronous, capped at 180 seconds, output captured into a 64 KB buffer so failures are diagnosable.
+
+**Union order matters.** The merge in `configureCompilerClasspath` is `[remote..., local-only...]` (de-duplicated, host `File.pathSeparator` as the joiner). JDT resolves types left-to-right, so a class present in BOTH a remote entry and a stale local copy binds against the remote definition first — the live target VM always wins on resolution. The local entries are reachable only as a fallback for classes the remote view did not provide.
+
+**Limitations.**
+
+- **Source/binary drift.** If the local checkout is on a different commit than the running target, the *remote* definition still wins because of merge order — but any class missing from the remote view binds against whatever the local jar contains. Rebuild locally to align if eval results look stale.
+- **Gradle is not supported in v1.** Only Maven layouts contribute via the Maven source; Gradle projects fall back to filesystem scan + env-override only.
+- **First call is slow, but never on the event thread.** Cold-cache Maven takes 1–3 minutes; the result is memoized for the JDI connection's lifetime and invalidated on the same edges that reset `InMemoryJavaCompiler` (disconnect / first use of a fresh connection). The speculative `prewarmClasspath` — which fires on the JDI event-listener thread the instant a breakpoint hits — warms **only** the remote classpath + JDK detection and skips the local provider entirely, so a Maven shell-out can never stall event processing for a user who never evaluates anything. The local fallback (including Maven) is paid lazily on the **first actual evaluation / logpoint / condition**, on the MCP worker thread.
+- **No targeted-module mode.** All modules detected in the reactor union into one classpath; the provider does not try to match the breakpoint frame back to its owning module.
+
+**Inspection.** `jdwp_diagnose` shows a `Local project classpath` block listing the CWD, whether a `pom.xml` was found, a per-source breakdown (`env-override=N, filesystem=N, maven=N`), the total entry count, and whether the env-var override is set. The provider also logs every step under the `[LocalClasspath]` prefix — `INFO` for source contributions and timings, `WARN` for Maven non-zero exits / timeouts / malformed env values, `DEBUG` for per-entry tracing and Maven stdout on failure.
+
+**How to disable.** Don't set `JDWP_EXTRA_CLASSPATH` AND launch the MCP server from a directory that has no `pom.xml` and no `target/classes` under it (e.g. `/tmp`). With all three sources silent, the merged classpath is identical to the remote-discovered one.
+
+If both sides come up empty, `configureCompilerClasspath` throws a `JdiEvaluationException` that names the server's CWD and the two recovery levers (restart from a Maven project, or set `JDWP_EXTRA_CLASSPATH`).
+
 ### `JdkDiscoveryService`
 
 Locates a local JDK matching the target JVM's major version. JDT needs `--system <jdkPath>` to resolve `java.*` system classes. Search strategy:

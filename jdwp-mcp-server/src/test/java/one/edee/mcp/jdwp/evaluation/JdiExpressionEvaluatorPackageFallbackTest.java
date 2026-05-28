@@ -47,7 +47,9 @@ class JdiExpressionEvaluatorPackageFallbackTest {
 	void setUp() throws Exception {
 		compiler = mock(InMemoryJavaCompiler.class);
 		final JDIConnectionService jdiService = mock(JDIConnectionService.class);
-		evaluator = new JdiExpressionEvaluator(compiler, jdiService, new EvaluationGuard());
+		evaluator = new JdiExpressionEvaluator(
+			compiler, jdiService, new EvaluationGuard(),
+			LocalProjectClasspathProviderTestSupport.noOpProvider());
 		// Compiler is mocked — echo back the requested class name so the bytecode lookup hits.
 		when(compiler.compile(anyString(), anyString()))
 			.thenAnswer(inv -> Map.of(inv.getArgument(0, String.class), new byte[]{1, 2, 3}));
