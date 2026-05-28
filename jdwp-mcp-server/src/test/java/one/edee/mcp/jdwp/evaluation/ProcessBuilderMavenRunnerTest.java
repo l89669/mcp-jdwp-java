@@ -225,6 +225,32 @@ class ProcessBuilderMavenRunnerTest {
 	}
 
 	/**
+	 * Deep-reactor regression: a module discovered at the filesystem scan's depth boundary (5 levels
+	 * below {@code workingDirectory}) puts its {@code target/.jdwp-mcp-classpath} two more levels
+	 * down — total depth 7. A shallower harvest cap silently drops Maven-resolved dependencies for
+	 * legitimate reactor layouts.
+	 */
+	@Test
+	@DisplayName("harvests .jdwp-mcp-classpath at reactor-boundary depth (module at scan depth 5 → file at depth 7)")
+	void shouldHarvestOutputFileAtReactorBoundaryDepth(@TempDir Path tmp) throws Exception {
+		// Path: <tmp>/a/b/c/d/e/target/.jdwp-mcp-classpath
+		// Counting from <tmp> as depth 0: a=1, b=2, c=3, d=4, e=5 (matches MAX_SCAN_DEPTH=5),
+		// target=6, file=7. The harvest cap must reach depth 7.
+		final Path boundaryModule = tmp.resolve("a/b/c/d/e/target");
+		Files.createDirectories(boundaryModule);
+		Files.writeString(boundaryModule.resolve(".jdwp-mcp-classpath"),
+			String.join(java.io.File.pathSeparator, "/m2/deep.jar"));
+
+		final ProcessBuilderMavenRunner runner = new ProcessBuilderMavenRunner(req -> 0);
+
+		final List<String> result = runner.run(List.of("echo"), tmp, 10);
+
+		assertThat(result)
+			.as("Maven output at <root>/a/b/c/d/e/target/.jdwp-mcp-classpath must be reachable — depth 7")
+			.containsExactly("/m2/deep.jar");
+	}
+
+	/**
 	 * On Windows the wrapper script is {@code mvnw.cmd}, not {@code mvnw}. The provider must probe
 	 * for both, preferring {@code mvnw} (Unix) when present and falling back to {@code mvnw.cmd} on
 	 * Windows hosts. This test is meaningful only on a real Windows runner — the

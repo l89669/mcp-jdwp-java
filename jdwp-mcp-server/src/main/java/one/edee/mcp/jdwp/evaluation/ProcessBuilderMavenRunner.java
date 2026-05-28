@@ -46,6 +46,13 @@ public class ProcessBuilderMavenRunner implements LocalProjectClasspathProvider.
     private static final String OUTPUT_FILE_NAME = ".jdwp-mcp-classpath";
     /** Upper bound on captured child stdout/stderr included in the WARN log on failure. */
     private static final int STDOUT_CAPTURE_BYTES = 64 * 1024;
+    /**
+     * Walk cap for the classpath-file harvester: the provider's filesystem scan depth ({@code 5})
+     * plus two — covering {@code <module>/target/.jdwp-mcp-classpath} for modules sitting at the
+     * scan boundary. Keeping it relative to the scan depth (rather than a magic literal) keeps the
+     * two limits coupled: a future bump to one is mirrored in the other.
+     */
+    private static final int HARVEST_MAX_DEPTH = 7;
     private static final Logger log = LoggerFactory.getLogger(ProcessBuilderMavenRunner.class);
 
     /** Seam for the actual process execution; replaced in tests to drive timeout / failure paths. */
@@ -88,8 +95,13 @@ public class ProcessBuilderMavenRunner implements LocalProjectClasspathProvider.
     }
 
     /**
-     * Walks {@code root} (depth 5, covering {@code <root>/<group>/<module>/target/<file>}) for
-     * Maven-written classpath files and aggregates their entries.
+     * Walks {@code root} for Maven-written classpath files and aggregates their entries.
+     *
+     * <p><b>Depth.</b> The walk's max depth is {@link #HARVEST_MAX_DEPTH} (= filesystem-scan depth
+     * + 2), so a module discovered at the scan boundary still has its {@code target/<file>}
+     * reachable. Counting from the root, {@code <root>/a/b/c/d/e/target/.jdwp-mcp-classpath} is
+     * seven levels deep; the previous fixed depth of 5 would silently drop reactor modules at the
+     * deeper boundary even though the scan correctly discovered them.
      *
      * <p><b>File-safety invariant.</b> A candidate file is accepted ONLY if BOTH conditions hold:
      * its direct parent directory is named {@code target}, AND no ancestor directory between
@@ -107,7 +119,7 @@ public class ProcessBuilderMavenRunner implements LocalProjectClasspathProvider.
      */
     private static List<String> harvestOutputFiles(Path root) throws IOException {
         final Set<String> entries = new LinkedHashSet<>();
-        Files.walkFileTree(root, EnumSet.noneOf(FileVisitOption.class), 5, new SimpleFileVisitor<Path>() {
+        Files.walkFileTree(root, EnumSet.noneOf(FileVisitOption.class), HARVEST_MAX_DEPTH, new SimpleFileVisitor<Path>() {
             @Override
             public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
                 // Don't skip the root itself even if its name happens to match a SKIP_DIR.

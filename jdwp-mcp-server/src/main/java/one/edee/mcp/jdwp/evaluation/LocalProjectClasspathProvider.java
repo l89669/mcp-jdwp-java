@@ -151,7 +151,11 @@ public class LocalProjectClasspathProvider {
      * duplicating the path logic.
      */
     public boolean hasPomAtRoot() {
-        return Files.isRegularFile(workingDirectory.resolve("pom.xml"));
+        // NOFOLLOW_LINKS: the provider's invariant is "symlinks are never followed". A symlinked
+        // pom.xml could redirect Maven discovery at an arbitrary tree on the host filesystem; we
+        // treat it as "no pom" so the Maven source is skipped, matching how the filesystem scan
+        // treats symlinked target/classes directories.
+        return Files.isRegularFile(workingDirectory.resolve("pom.xml"), LinkOption.NOFOLLOW_LINKS);
     }
 
     /**
@@ -233,12 +237,17 @@ public class LocalProjectClasspathProvider {
         cachedBreakdown = breakdown;
         if (entries.isEmpty()) {
             // Required by the logging policy: ONE INFO line on empty result explaining the why.
+            // NOFOLLOW_LINKS on every probe — keep the diagnostic readout consistent with the
+            // "symlinks not followed" invariant used by every other filesystem probe in this class.
+            final boolean pomPresent =
+                Files.isRegularFile(workingDirectory.resolve("pom.xml"), LinkOption.NOFOLLOW_LINKS);
             log.info("[LocalClasspath] discover() found 0 entries — env={}, fs={}, maven={} (cwd={}, pom.xml={})",
                 envLookup.apply(ENV_NAME) == null ? "unset" : "set-but-empty",
-                Files.isDirectory(workingDirectory.resolve("target")) ? "target/-present" : "no-target/",
-                Files.isRegularFile(workingDirectory.resolve("pom.xml")) ? "pom-present" : "no-pom",
+                Files.isDirectory(workingDirectory.resolve("target"), LinkOption.NOFOLLOW_LINKS)
+                    ? "target/-present" : "no-target/",
+                pomPresent ? "pom-present" : "no-pom",
                 workingDirectory,
-                Files.isRegularFile(workingDirectory.resolve("pom.xml")));
+                pomPresent);
         }
         return breakdown;
     }
@@ -259,7 +268,10 @@ public class LocalProjectClasspathProvider {
      * outcome (added &gt; 0, added == 0, failure) so operators see one line per discovery.
      */
     private void addMavenDependencies(Set<String> entries) {
-        if (!Files.isRegularFile(workingDirectory.resolve("pom.xml"))) {
+        // NOFOLLOW_LINKS: same invariant as hasPomAtRoot — a symlinked pom.xml must not trigger
+        // Maven discovery, because Maven would resolve the link and pull dependencies from a tree
+        // outside the configured workingDirectory.
+        if (!Files.isRegularFile(workingDirectory.resolve("pom.xml"), LinkOption.NOFOLLOW_LINKS)) {
             log.debug("[LocalClasspath] No pom.xml under {} — skipping Maven source", workingDirectory);
             return;
         }

@@ -146,6 +146,44 @@ class LocalProjectClasspathProviderMavenTest {
 	 * sync, broken build) — the provider must still invoke Maven (it's the runner's job to deal
 	 * with the failure) and tolerate an empty result list without throwing.
 	 */
+	/**
+	 * Symlink-safety: a {@code pom.xml} that is itself a symbolic link must NOT trigger Maven
+	 * discovery. Maven would resolve the link and pull dependencies from the linked target, which
+	 * may live outside the configured working directory — the provider's documented invariant is
+	 * "symlinks are never followed".
+	 */
+	@Test
+	@org.junit.jupiter.api.condition.EnabledOnOs({
+		org.junit.jupiter.api.condition.OS.LINUX,
+		org.junit.jupiter.api.condition.OS.MAC
+	})
+	@DisplayName("skips Maven when pom.xml at the working directory is a symlink")
+	void shouldSkipMavenWhenPomXmlIsSymlink(@TempDir Path tmp) throws Exception {
+		// Real pom in a sibling directory; the provider's working directory holds a SYMLINK to it.
+		final Path realPomDir = tmp.resolve("real-project");
+		Files.createDirectories(realPomDir);
+		Files.writeString(realPomDir.resolve("pom.xml"), "<project/>");
+
+		final Path workDir = tmp.resolve("workdir");
+		Files.createDirectories(workDir);
+		Files.createSymbolicLink(workDir.resolve("pom.xml"), realPomDir.resolve("pom.xml"));
+
+		final AtomicReference<Boolean> invoked = new AtomicReference<>(false);
+		final LocalProjectClasspathProvider provider = new LocalProjectClasspathProvider(
+			workDir, envName -> null,
+			(cmd, cwd, t) -> { invoked.set(true); return List.of(); }
+		);
+
+		provider.discover();
+
+		assertThat(invoked.get())
+			.as("Symlinked pom.xml must not trigger Maven — symlinks-not-followed invariant")
+			.isFalse();
+		assertThat(provider.hasPomAtRoot())
+			.as("hasPomAtRoot() must also report false for a symlinked pom.xml — same invariant")
+			.isFalse();
+	}
+
 	@Test
 	@DisplayName("invokes Maven when pom.xml is present even if empty; tolerates empty result list")
 	void shouldInvokeMavenWhenPomXmlIsEmpty(@TempDir Path tmp) throws Exception {

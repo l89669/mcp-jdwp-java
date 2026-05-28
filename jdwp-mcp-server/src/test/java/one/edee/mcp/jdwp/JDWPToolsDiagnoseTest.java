@@ -364,7 +364,11 @@ class JDWPToolsDiagnoseTest {
 				return List.of("/m2/slow.jar");
 			}
 		);
-		// Write a pom.xml-like fixture into a fresh temp dir so the slow Maven path is even reached.
+		// The CWD is the project root (which has a real pom.xml), so the slow Maven runner WOULD be
+		// triggered if diagnose ran a full discovery. The point of this test is that it doesn't:
+		// the diagnose path peeks the cold cache and renders "not yet computed", never invoking
+		// the runner. If the fast path regresses, the slow stub's 2s sleep blows the 500ms budget
+		// below.
 		final JDWPTools toolsWithSlowStub = JDWPToolsTestSupport.newTools(
 			jdiService, new BreakpointTracker(), new WatcherManager(),
 			mock(JdiExpressionEvaluator.class), new EventHistory(), new EvaluationGuard(),
