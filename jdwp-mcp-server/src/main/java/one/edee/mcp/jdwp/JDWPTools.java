@@ -7,6 +7,7 @@ import one.edee.mcp.jdwp.discovery.DiagnoseReportRenderer;
 import one.edee.mcp.jdwp.discovery.JvmDescriptor;
 import one.edee.mcp.jdwp.discovery.JvmDiscoveryService;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
+import one.edee.mcp.jdwp.evaluation.LocalProjectClasspathProvider;
 import one.edee.mcp.jdwp.marks.MarkInfo;
 import one.edee.mcp.jdwp.marks.MarkedInstanceRegistry;
 import one.edee.mcp.jdwp.watchers.Watcher;
@@ -109,13 +110,21 @@ public class JDWPTools {
      * status). Lifecycle is owned by {@link JDIConnectionService}; this class only reads snapshots.
      */
     private final JdiHealthMonitor healthMonitor;
+    /**
+     * Local-project classpath fallback. Surfaced through {@code jdwp_diagnose} so operators can
+     * see which sources (env override / filesystem / Maven) contributed to the additive classpath
+     * fed into expression evaluation. Memoized per JDI connection; the diagnose call may trigger
+     * the first (slow) discovery if no expression has been evaluated yet.
+     */
+    private final LocalProjectClasspathProvider localClasspathProvider;
 
     public JDWPTools(JDIConnectionService jdiService, BreakpointTracker breakpointTracker,
                      WatcherManager watcherManager, JdiExpressionEvaluator expressionEvaluator,
                      EventHistory eventHistory, EvaluationGuard evaluationGuard,
                      JvmDiscoveryService jvmDiscoveryService,
                      MarkedInstanceRegistry markedInstances,
-                     JdiHealthMonitor healthMonitor) {
+                     JdiHealthMonitor healthMonitor,
+                     LocalProjectClasspathProvider localClasspathProvider) {
         this.jdiService = jdiService;
         this.breakpointTracker = breakpointTracker;
         this.watcherManager = watcherManager;
@@ -125,6 +134,7 @@ public class JDWPTools {
         this.jvmDiscoveryService = jvmDiscoveryService;
         this.markedInstances = markedInstances;
         this.healthMonitor = healthMonitor;
+        this.localClasspathProvider = localClasspathProvider;
     }
 
     /**
@@ -1690,7 +1700,60 @@ public class JDWPTools {
             out.append('\n').append(buildDiagnosticReport(false, null));
         }
 
+        // Local project classpath section: shows which entries the additive fallback contributed
+        // to expression evaluation. Independent of connection state so operators can sanity-check
+        // their CWD even before attaching. May trigger the first (cold-cache, slow) discovery —
+        // intentional; the header explicitly warns about the latency.
+        out.append(renderLocalClasspathBlock());
+
         out.append(renderLocalJvmsBlock(status, inspectAll));
+        return out.toString();
+    }
+
+    /**
+     * Renders the "Local project classpath" diagnose section. NON-BLOCKING by design — calls into
+     * {@link LocalProjectClasspathProvider#peekCachedBreakdown()} so the report never waits on a
+     * cold-cache Maven invocation (which can take up to ~3 min). When the cache is cold the block
+     * prints a "not yet computed" hint; the breakdown populates organically the next time
+     * expression evaluation runs.
+     *
+     * <p>The env-state line is three-way:
+     * {@code (unset)} when the variable is absent, {@code (set, no entries)} when present but
+     * blank, and {@code (set)} when present with at least one entry. This distinction matters to
+     * operators who have set the variable but see it rendered as if absent.
+     */
+    private String renderLocalClasspathBlock() {
+        final StringBuilder out = new StringBuilder("\n▸ Local project classpath\n");
+        out.append("  (computed once per JDI connection; first call may take up to 3 min on cold Maven cache)\n");
+        try {
+            final LocalProjectClasspathProvider.Breakdown breakdown =
+                localClasspathProvider.peekCachedBreakdown();
+            out.append("  CWD: ").append(localClasspathProvider.getWorkingDirectory()).append('\n');
+            out.append("  pom.xml: ").append(localClasspathProvider.hasPomAtRoot() ? "yes" : "no").append('\n');
+            final boolean envSet = localClasspathProvider.isEnvOverrideSet();
+            if (breakdown == null) {
+                out.append("  (not yet computed; will populate on first expression evaluation)\n");
+                final String envState = envSet ? "(set)" : "(unset)";
+                out.append("  Override env: JDWP_EXTRA_CLASSPATH ").append(envState).append('\n');
+            } else {
+                final String envState;
+                if (!envSet) {
+                    envState = "(unset)";
+                } else if (breakdown.envOverride() > 0) {
+                    envState = "(set)";
+                } else {
+                    envState = "(set, no entries)";
+                }
+                out.append("  Sources: env-override=").append(breakdown.envOverride())
+                    .append(", filesystem=").append(breakdown.filesystem())
+                    .append(", maven=").append(breakdown.maven()).append('\n');
+                out.append("  Total local entries: ").append(breakdown.all().size()).append('\n');
+                out.append("  Override env: JDWP_EXTRA_CLASSPATH ").append(envState).append('\n');
+            }
+        } catch (Exception e) {
+            log.warn("Local classpath discovery failed during diagnose", e);
+            out.append("  (local classpath discovery failed: ").append(e.getMessage()).append(")\n");
+        }
         return out.toString();
     }
 

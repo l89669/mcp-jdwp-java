@@ -2,8 +2,12 @@ package one.edee.mcp.jdwp;
 
 import one.edee.mcp.jdwp.discovery.JvmDiscoveryService;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
+import one.edee.mcp.jdwp.evaluation.LocalProjectClasspathProvider;
 import one.edee.mcp.jdwp.marks.MarkedInstanceRegistry;
 import one.edee.mcp.jdwp.watchers.WatcherManager;
+
+import java.nio.file.Path;
+import java.util.List;
 
 import static org.mockito.Mockito.mock;
 
@@ -45,7 +49,21 @@ final class JDWPToolsTestSupport {
 			new EvaluationGuard(),
 			mock(JvmDiscoveryService.class),
 			new MarkedInstanceRegistry(),
-			new JdiHealthMonitor()
+			new JdiHealthMonitor(),
+			defaultEmptyClasspathProvider()
+		);
+	}
+
+	/**
+	 * Builds a deterministic {@link LocalProjectClasspathProvider} that never shells out to Maven
+	 * or scans the filesystem. Used as the default for tests that do not exercise the local
+	 * classpath surface — keeps the diagnose path fast and reproducible.
+	 */
+	static LocalProjectClasspathProvider defaultEmptyClasspathProvider() {
+		return new LocalProjectClasspathProvider(
+			Path.of(System.getProperty("user.dir")),
+			name -> null,
+			(command, workingDirectory, timeoutSeconds) -> List.of()
 		);
 	}
 
@@ -72,7 +90,37 @@ final class JDWPToolsTestSupport {
 			evaluationGuard,
 			jvmDiscoveryService,
 			new MarkedInstanceRegistry(),
-			new JdiHealthMonitor()
+			new JdiHealthMonitor(),
+			defaultEmptyClasspathProvider()
+		);
+	}
+
+	/**
+	 * Overload that accepts a caller-supplied {@link LocalProjectClasspathProvider} — needed by
+	 * tests that verify the local-classpath diagnose section. Defaults the other "extra" seams
+	 * (MarkedInstanceRegistry, JdiHealthMonitor) to fresh instances.
+	 */
+	static JDWPTools newTools(
+		JDIConnectionService jdiService,
+		BreakpointTracker breakpointTracker,
+		WatcherManager watcherManager,
+		JdiExpressionEvaluator expressionEvaluator,
+		EventHistory eventHistory,
+		EvaluationGuard evaluationGuard,
+		JvmDiscoveryService jvmDiscoveryService,
+		LocalProjectClasspathProvider localClasspathProvider
+	) {
+		return new JDWPTools(
+			jdiService,
+			breakpointTracker,
+			watcherManager,
+			expressionEvaluator,
+			eventHistory,
+			evaluationGuard,
+			jvmDiscoveryService,
+			new MarkedInstanceRegistry(),
+			new JdiHealthMonitor(),
+			localClasspathProvider
 		);
 	}
 
@@ -99,7 +147,8 @@ final class JDWPToolsTestSupport {
 			evaluationGuard,
 			jvmDiscoveryService,
 			markedInstances,
-			new JdiHealthMonitor()
+			new JdiHealthMonitor(),
+			defaultEmptyClasspathProvider()
 		);
 	}
 
@@ -127,7 +176,8 @@ final class JDWPToolsTestSupport {
 			evaluationGuard,
 			jvmDiscoveryService,
 			markedInstances,
-			healthMonitor
+			healthMonitor,
+			defaultEmptyClasspathProvider()
 		);
 	}
 }

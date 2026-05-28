@@ -41,7 +41,9 @@ class JdiExpressionEvaluatorGetDeclaredTypeTest {
 	void setUp() {
 		InMemoryJavaCompiler compiler = mock(InMemoryJavaCompiler.class);
 		JDIConnectionService jdiService = mock(JDIConnectionService.class);
-		evaluator = new JdiExpressionEvaluator(compiler, jdiService, new EvaluationGuard());
+		evaluator = new JdiExpressionEvaluator(
+			compiler, jdiService, new EvaluationGuard(),
+			LocalProjectClasspathProviderTestSupport.noOpProvider());
 	}
 
 	@Nested

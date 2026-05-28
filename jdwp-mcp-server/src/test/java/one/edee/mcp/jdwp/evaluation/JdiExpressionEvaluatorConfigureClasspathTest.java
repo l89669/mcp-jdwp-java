@@ -13,7 +13,6 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
-import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -22,7 +21,7 @@ import static org.mockito.Mockito.when;
  * {@link JdiExpressionEvaluator#configureCompilerClasspath(ThreadReference)} and
  * {@link JdiExpressionEvaluator#prewarmClasspath(ThreadReference)}.
  *
- * <p>Covers the fixes for the classpath-warming lifecycle (GH #30): a failed discovery must reset
+ * <p>Covers the classpath-warming lifecycle contract: a failed discovery must reset
  * the compiler (so no stale config survives), surface an actionable exception from the strict path,
  * and stay silent on the best-effort pre-warm path.
  */
@@ -37,7 +36,12 @@ class JdiExpressionEvaluatorConfigureClasspathTest {
 	void setUp() {
 		compiler = mock(InMemoryJavaCompiler.class);
 		jdiService = mock(JDIConnectionService.class);
-		evaluator = new JdiExpressionEvaluator(compiler, jdiService, new EvaluationGuard());
+		// No-op local-classpath provider — these tests only care about the remote-side reset/configure
+		// semantics; LocalProjectClasspathProviderTestSupport supplies a provider that never touches
+		// the real environment, filesystem, or Maven.
+		evaluator = new JdiExpressionEvaluator(
+			compiler, jdiService, new EvaluationGuard(),
+			LocalProjectClasspathProviderTestSupport.noOpProvider());
 		thread = mock(ThreadReference.class);
 		when(thread.uniqueID()).thenReturn(42L);
 	}
