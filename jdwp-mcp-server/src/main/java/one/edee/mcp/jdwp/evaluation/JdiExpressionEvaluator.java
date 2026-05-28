@@ -1350,9 +1350,15 @@ public class JdiExpressionEvaluator {
     }
 
     /**
-     * Counts the non-blank entries in a remote-discovered classpath string. Used purely for the
-     * INFO log line that summarises the merge result. Honours the same single-entry Windows
-     * heuristic as {@link #mergeClasspaths} so the two stay in lockstep.
+     * Counts the non-blank entries in a classpath string, reusing {@link #splitRemoteClasspath}'s
+     * separator heuristic. Used purely for the INFO log line summarising the merge result — the
+     * value never drives control flow.
+     *
+     * <p>Caveat: {@code mergeClasspaths} always joins with the host {@link File#pathSeparator},
+     * whereas this re-detects the separator from content. In the same-OS case (the only one that
+     * actually compiles — a Windows target's paths don't resolve on a Unix host and vice-versa)
+     * the two agree. In a hypothetical cross-OS mix the logged count can under-report; that is an
+     * accepted cosmetic imprecision, not a correctness issue.
      */
     private static int countEntries(@Nullable String classpath) {
         if (classpath == null || classpath.isEmpty()) {

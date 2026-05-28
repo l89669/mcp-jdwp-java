@@ -19,6 +19,7 @@ import java.util.EnumSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
 
@@ -317,17 +318,19 @@ public class ProcessBuilderMavenRunner implements LocalProjectClasspathProvider.
             // (timeout or interrupt path) is trying to prevent.
             process.destroyForcibly();
         }
-        for (ProcessHandle h : tree) {
-            try {
-                h.onExit().get(2, TimeUnit.SECONDS);
-            } catch (Exception ignored) {
-                // Best-effort — we already issued destroyForcibly; nothing more to do here.
-            }
+        // Confirm the whole tree actually exited, but bound the TOTAL wait — not 2s PER handle.
+        // A Maven reactor can fork several surefire/exec helpers; awaiting them serially would be
+        // O(N) × 2s and could blow past the caller's cleanup budget. Combine every exit future
+        // (descendants + root) and wait once, so worst-case stays ~2s regardless of tree width.
+        final CompletableFuture<?>[] exits = new CompletableFuture<?>[tree.size() + 1];
+        for (int i = 0; i < tree.size(); i++) {
+            exits[i] = tree.get(i).onExit();
         }
+        exits[tree.size()] = process.onExit();
         try {
-            process.onExit().get(2, TimeUnit.SECONDS);
+            CompletableFuture.allOf(exits).get(2, TimeUnit.SECONDS);
         } catch (Exception ignored) {
-            // Same as above.
+            // Best-effort — we already issued destroyForcibly on every process; nothing more to do.
         }
     }
 

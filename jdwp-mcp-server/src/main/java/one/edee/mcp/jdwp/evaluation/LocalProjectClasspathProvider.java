@@ -7,6 +7,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.io.File;
+import java.io.UncheckedIOException;
 import java.nio.file.AccessDeniedException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
@@ -440,6 +441,17 @@ public class LocalProjectClasspathProvider {
             // Permission denied on a single directory is expected (CI agents, restricted dev envs).
             // Log at WARN so an operator sees it once, but never abort the whole scan.
             log.warn("[LocalClasspath] Permission denied listing {} — skipping subtree", dir);
+        } catch (UncheckedIOException e) {
+            // Files.list() is lazy: a permission failure hit while ITERATING entries (inside the
+            // terminal forEach) surfaces as UncheckedIOException wrapping the real IOException, not
+            // as a bare AccessDeniedException. Unwrap so a denied subtree still gets the accurate
+            // "permission denied" message rather than the generic catch-all below.
+            if (e.getCause() instanceof AccessDeniedException) {
+                log.warn("[LocalClasspath] Permission denied listing {} — skipping subtree", dir);
+            } else {
+                log.warn("[LocalClasspath] Could not list {}: {}: {}",
+                    dir, e.getClass().getSimpleName(), e.getMessage());
+            }
         } catch (Exception e) {
             // Any other failure on a single directory is unexpected — log it visibly. We do NOT
             // throw: a partial classpath is better than no classpath, and the agent will see the
