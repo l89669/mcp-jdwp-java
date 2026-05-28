@@ -19,6 +19,14 @@ import static org.assertj.core.api.Assertions.assertThat;
 class LocalProjectClasspathProviderEnvOverrideTest {
 
 	private static final String SEP = java.io.File.pathSeparator;
+	/**
+	 * Guaranteed-non-existent working directory so the depth-5 filesystem scan short-circuits at the
+	 * first {@code isDirectory} probe. A relative {@code /tmp/no-such-project} would be unreliable on
+	 * hosts where that path happens to exist (or where {@code /tmp} contains
+	 * {@code target/classes} subtrees from unrelated tooling).
+	 */
+	private static final Path NONEXISTENT_CWD =
+		Path.of("/nonexistent/jdwp-mcp-env-test-" + java.util.UUID.randomUUID());
 
 	@Test
 	@DisplayName("parses File.pathSeparator-delimited env var into insertion-ordered entries")
@@ -27,7 +35,7 @@ class LocalProjectClasspathProviderEnvOverrideTest {
 		// Splitting on `[;:]` is broken on Windows because `C:\foo` contains a colon — the env
 		// var is parsed by the MCP server on the HOST OS, so the host separator is the right one.
 		final LocalProjectClasspathProvider provider = new LocalProjectClasspathProvider(
-			Path.of("/tmp/no-such-project"),
+			NONEXISTENT_CWD,
 			envName -> "JDWP_EXTRA_CLASSPATH".equals(envName)
 				? "/opt/libs/a.jar" + SEP + "/opt/libs/b.jar" + SEP + "/srv/classes"
 				: null,
@@ -45,7 +53,7 @@ class LocalProjectClasspathProviderEnvOverrideTest {
 	@DisplayName("returns empty set when env var is an empty string")
 	void shouldReturnEmptySetWhenEnvVarIsEmpty() {
 		final LocalProjectClasspathProvider provider = new LocalProjectClasspathProvider(
-			Path.of("/tmp/no-such-project"),
+			NONEXISTENT_CWD,
 			envName -> "",
 			(cmd, cwd, timeoutSeconds) -> List.of()
 		);
@@ -57,7 +65,7 @@ class LocalProjectClasspathProviderEnvOverrideTest {
 	@DisplayName("returns empty set when env lookup returns null (unset)")
 	void shouldReturnEmptySetWhenEnvVarIsUnset() {
 		final LocalProjectClasspathProvider provider = new LocalProjectClasspathProvider(
-			Path.of("/tmp/no-such-project"),
+			NONEXISTENT_CWD,
 			envName -> null,
 			(cmd, cwd, timeoutSeconds) -> List.of()
 		);
@@ -69,7 +77,7 @@ class LocalProjectClasspathProviderEnvOverrideTest {
 	@DisplayName("trims whitespace around entries and drops empty/blank tokens")
 	void shouldTrimWhitespaceAndDropBlankEntries() {
 		final LocalProjectClasspathProvider provider = new LocalProjectClasspathProvider(
-			Path.of("/tmp/no-such-project"),
+			NONEXISTENT_CWD,
 			envName -> "  /a.jar  " + SEP + SEP + "  /b.jar ",
 			(cmd, cwd, timeoutSeconds) -> List.of()
 		);
@@ -87,7 +95,7 @@ class LocalProjectClasspathProviderEnvOverrideTest {
 	@DisplayName("breakdown reports zero env-override entries when env is set but only blanks")
 	void shouldReportZeroEnvEntriesWhenEnvIsBlanksOnly() {
 		final LocalProjectClasspathProvider provider = new LocalProjectClasspathProvider(
-			Path.of("/tmp/no-such-project"),
+			NONEXISTENT_CWD,
 			envName -> "   " + SEP + " " + SEP + "  ",
 			(cmd, cwd, timeoutSeconds) -> List.of()
 		);

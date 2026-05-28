@@ -28,11 +28,13 @@ class ProcessBuilderMavenRunnerTest {
 		// parent directory is named `target/`. Maven writes there because mdep.outputFile is
 		// `target/.jdwp-mcp-classpath`. Anything else is NOT ours and must be ignored.
 		Files.createDirectories(tmp.resolve("target"));
+		// Use File.pathSeparator (':' on Unix, ';' on Windows) so the fixture matches what the
+		// harvester actually splits on; a hard-coded ':' breaks the test on Windows runners.
 		Files.writeString(tmp.resolve("target/.jdwp-mcp-classpath"),
-			"/m2/foo.jar:/m2/bar.jar");
+			String.join(java.io.File.pathSeparator, "/m2/foo.jar", "/m2/bar.jar"));
 		Files.createDirectories(tmp.resolve("module-a/target"));
 		Files.writeString(tmp.resolve("module-a/target/.jdwp-mcp-classpath"),
-			"/m2/baz.jar:/m2/foo.jar"); // overlap — must dedupe
+			String.join(java.io.File.pathSeparator, "/m2/baz.jar", "/m2/foo.jar")); // overlap — must dedupe
 
 		// SAFETY: a file with the same name OUTSIDE a target/ dir (e.g. left over from a previous
 		// buggy run, or a name collision with something the user has) MUST be ignored.
@@ -89,12 +91,17 @@ class ProcessBuilderMavenRunnerTest {
 	 * {@link #shouldDestroyOwnedProcessTreeOnTimeout} below using the production code path.
 	 */
 	@Test
+	@org.junit.jupiter.api.condition.EnabledOnOs({
+		org.junit.jupiter.api.condition.OS.LINUX,
+		org.junit.jupiter.api.condition.OS.MAC
+	})
 	@DisplayName("run() does NOT destroy unrelated sibling subprocesses when the executor throws InterruptedException")
 	void shouldNotOverkillUnrelatedSubprocessesOnInterrupt(@TempDir Path tmp) throws Exception {
 		Files.createDirectories(tmp.resolve("target"));
 
 		// Sibling: a subprocess started by "some other component" before run() is invoked. It
-		// must survive run()'s cleanup — that's the invariant Copilot flagged.
+		// must survive run()'s cleanup — process ownership is scoped to the executor. Uses
+		// `sleep` so the test is Unix-only — guarded by @EnabledOnOs above.
 		final Process sibling = new ProcessBuilder("sleep", "5").redirectErrorStream(true).start();
 		try {
 			final ProcessBuilderMavenRunner runner = new ProcessBuilderMavenRunner(req -> {
