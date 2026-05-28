@@ -8,16 +8,19 @@ import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.FileVisitOption;
+import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
-import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
+import java.util.EnumSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
-import java.util.stream.Stream;
 
 /**
  * Production {@link LocalProjectClasspathProvider.MavenRunner} that shells out to {@code mvn} (or
@@ -89,84 +92,98 @@ public class ProcessBuilderMavenRunner implements LocalProjectClasspathProvider.
      * Maven-written classpath files and aggregates their entries.
      *
      * <p><b>File-safety invariant.</b> A candidate file is accepted ONLY if BOTH conditions hold:
-     * its direct parent directory is named {@code target} AND no ancestor segment between
+     * its direct parent directory is named {@code target}, AND no ancestor directory between
      * {@code root} and the candidate is in {@link LocalProjectClasspathProvider#HARVEST_SKIP_DIRS}.
      * This gate keeps the harvester confined to Maven-owned build output even on projects that
      * happen to contain a stray file with the matching name elsewhere in the tree. The harvester
      * NEVER deletes; the next Maven run overwrites the file in place and {@code mvn clean} removes
      * it.
+     *
+     * <p>Uses {@link Files#walkFileTree} with {@code preVisitDirectory} pruning so skip-listed
+     * directories ({@code node_modules}, {@code .git}, {@code .idea}, {@code .gradle}, etc.)
+     * are never descended into — a meaningful saving on large repos where {@code node_modules/}
+     * alone can hold tens of thousands of files. Symlinks are not followed because no
+     * {@link FileVisitOption#FOLLOW_LINKS} is passed.
      */
     private static List<String> harvestOutputFiles(Path root) throws IOException {
         final Set<String> entries = new LinkedHashSet<>();
-        // File-safety: ONLY accept candidates whose direct parent directory is named `target`.
-        // Maven-owned build output, gitignored, wiped by `mvn clean`. A bare match on file name
-        // anywhere in the tree would risk picking up a file we did not create — see the
-        // file-safety policy. Depth-5 covers: <root>/<group>/<module>/target/<file>.
-        try (Stream<Path> walk = Files.walk(root, 5)) {
-            walk.filter(p -> p.getFileName() != null
-                          && OUTPUT_FILE_NAME.equals(p.getFileName().toString())
-                          && p.getParent() != null
-                          && p.getParent().getFileName() != null
-                          && "target".equals(p.getParent().getFileName().toString())
-                          && !hasSkippedAncestor(root, p)
-                          // Symlinks must not be followed: a symlink at target/.jdwp-mcp-classpath
-                          // could point at any file on the host. The harvester is invariant-bound
-                          // to read only Maven-written output it found in-tree.
-                          && Files.isRegularFile(p, LinkOption.NOFOLLOW_LINKS))
-                .forEach(file -> {
-                    try {
-                        final String content = Files.readString(file).trim();
-                        if (content.isEmpty()) {
-                            log.debug("[LocalClasspath] Output file {} was empty", file);
-                            return;
-                        }
-                        int parsed = 0;
-                        // Use the HOST File.pathSeparator: Maven wrote this file on the host, so
-                        // its entries are separated by the host's separator. Splitting on `[;:]`
-                        // would shred `C:\foo` on Windows.
-                        final String separator = Pattern.quote(File.pathSeparator);
-                        for (String part : content.split(separator, -1)) {
-                            final String trimmed = part.trim();
-                            if (!trimmed.isEmpty() && entries.add(trimmed)) {
-                                parsed++;
-                            }
-                        }
-                        log.debug("[LocalClasspath] Harvested {} new entries from {}", parsed, file);
-                        // NO DELETION. The file is in a Maven-owned `target/` directory; the next
-                        // Maven run overwrites it in place, and `mvn clean` removes it. Deleting
-                        // arbitrary files in the project tree is forbidden by the file-safety policy.
-                    } catch (IOException e) {
-                        log.warn("[LocalClasspath] Could not read classpath output {}: {}: {}",
-                            file, e.getClass().getSimpleName(), e.getMessage());
+        Files.walkFileTree(root, EnumSet.noneOf(FileVisitOption.class), 5, new SimpleFileVisitor<Path>() {
+            @Override
+            public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
+                // Don't skip the root itself even if its name happens to match a SKIP_DIR.
+                if (!dir.equals(root)) {
+                    final Path name = dir.getFileName();
+                    if (name != null
+                        && LocalProjectClasspathProvider.HARVEST_SKIP_DIRS.contains(name.toString())) {
+                        return FileVisitResult.SKIP_SUBTREE;
                     }
-                });
-        }
+                }
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+                // Symlinks must not be followed: a symlink at target/.jdwp-mcp-classpath could
+                // point at any file on the host. attrs.isRegularFile() is false for symlinks
+                // because we did NOT pass FOLLOW_LINKS.
+                if (!attrs.isRegularFile()) {
+                    return FileVisitResult.CONTINUE;
+                }
+                final Path name = file.getFileName();
+                if (name == null || !OUTPUT_FILE_NAME.equals(name.toString())) {
+                    return FileVisitResult.CONTINUE;
+                }
+                final Path parent = file.getParent();
+                if (parent == null || parent.getFileName() == null
+                    || !"target".equals(parent.getFileName().toString())) {
+                    return FileVisitResult.CONTINUE;
+                }
+                readOutputFile(file, entries);
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult visitFileFailed(Path file, IOException exc) {
+                // Permission denied / transient I/O on a single entry must not abort the whole
+                // walk — log at debug and continue, matching the "partial classpath beats no
+                // classpath" policy used by the provider's filesystem scan.
+                log.debug("[LocalClasspath] Skipping unreadable path {}: {}", file, exc.getMessage());
+                return FileVisitResult.CONTINUE;
+            }
+        });
         return new ArrayList<>(entries);
     }
 
     /**
-     * Rejects candidates whose path between {@code root} (exclusive) and the candidate's parent
-     * (inclusive) contains a segment listed in
-     * {@link LocalProjectClasspathProvider#HARVEST_SKIP_DIRS}. Shares the provider's skip list so
-     * additions there extend both code paths uniformly.
+     * Reads a Maven-written {@code .jdwp-mcp-classpath} file, splits on the host
+     * {@link File#pathSeparator}, and appends non-blank, non-duplicate entries to {@code entries}.
+     * Maven wrote this file on the host so its entries are separated by the host's separator —
+     * splitting on {@code [;:]} would shred {@code C:\foo} on Windows.
+     *
+     * <p>NO DELETION. The file lives in a Maven-owned {@code target/} directory; the next Maven
+     * run overwrites it in place and {@code mvn clean} removes it. Deleting arbitrary files in
+     * the project tree is forbidden by the file-safety policy.
      */
-    private static boolean hasSkippedAncestor(Path root, Path candidate) {
-        final Path relative;
+    private static void readOutputFile(Path file, Set<String> entries) {
         try {
-            relative = root.relativize(candidate);
-        } catch (IllegalArgumentException e) {
-            // Different filesystem roots; cannot relativize. Fall back to skipping the candidate.
-            return true;
-        }
-        // Iterate every segment except the final file name — only directories count as ancestors.
-        final int segments = relative.getNameCount();
-        for (int i = 0; i < segments - 1; i++) {
-            final String name = relative.getName(i).toString();
-            if (LocalProjectClasspathProvider.HARVEST_SKIP_DIRS.contains(name)) {
-                return true;
+            final String content = Files.readString(file).trim();
+            if (content.isEmpty()) {
+                log.debug("[LocalClasspath] Output file {} was empty", file);
+                return;
             }
+            int parsed = 0;
+            final String separator = Pattern.quote(File.pathSeparator);
+            for (String part : content.split(separator, -1)) {
+                final String trimmed = part.trim();
+                if (!trimmed.isEmpty() && entries.add(trimmed)) {
+                    parsed++;
+                }
+            }
+            log.debug("[LocalClasspath] Harvested {} new entries from {}", parsed, file);
+        } catch (IOException e) {
+            log.warn("[LocalClasspath] Could not read classpath output {}: {}: {}",
+                file, e.getClass().getSimpleName(), e.getMessage());
         }
-        return false;
     }
 
     /**

@@ -1203,8 +1203,14 @@ public class JdiExpressionEvaluator {
             final long mergeStart = System.currentTimeMillis();
             final Set<String> localEntries = localClasspathProvider.discover();
             final String mergedClasspath = mergeClasspaths(remoteClasspath, localEntries);
-            log.info("[LocalClasspath] Merged classpath: {} remote + {} local-only entries in {}ms",
-                countEntries(remoteClasspath), localEntries.size(),
+            // Report three numbers so an operator can see overlap explicitly:
+            // remote + local are the raw source counts; merged is the deduped union actually
+            // handed to the compiler. Some local entries may overlap with remote (live target VM
+            // and local project share JARs) — the overlap shows up as "merged < remote + local".
+            final int remoteCount = countEntries(remoteClasspath);
+            final int mergedCount = countEntries(mergedClasspath);
+            log.info("[LocalClasspath] Merged classpath: {} remote + {} local entries → {} merged in {}ms",
+                remoteCount, localEntries.size(), mergedCount,
                 System.currentTimeMillis() - mergeStart);
 
             if (mergedClasspath.isEmpty()) {
