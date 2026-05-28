@@ -61,8 +61,11 @@ final class JDWPToolsTestSupport {
 	 * path fast and reproducible regardless of what {@code user.dir} happens to contain.
 	 */
 	static LocalProjectClasspathProvider defaultEmptyClasspathProvider() {
+		// Portable non-existent path: tmpdir is platform-correct (e.g. /tmp on Linux,
+		// C:\Users\...\AppData\Local\Temp on Windows); appending a UUID-named child that we
+		// never create gives us a guaranteed-absent root for the depth-5 scan to short-circuit on.
 		return new LocalProjectClasspathProvider(
-			Path.of("/nonexistent/jdwp-mcp-default-empty-" + java.util.UUID.randomUUID()),
+			Path.of(System.getProperty("java.io.tmpdir"), "jdwp-mcp-default-empty-" + java.util.UUID.randomUUID()),
 			name -> null,
 			(command, workingDirectory, timeoutSeconds) -> List.of()
 		);

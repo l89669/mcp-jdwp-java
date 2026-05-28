@@ -313,22 +313,32 @@ public class LocalProjectClasspathProvider {
     }
 
     /**
-     * Picks the Maven executable in priority order: {@code mvnw} (Unix wrapper) when executable,
-     * {@code mvnw.cmd} (Windows wrapper) when running on Windows and the file exists, then plain
-     * {@code mvn} from the PATH. {@code mvnw.cmd} cannot be probed with
-     * {@link Files#isExecutable(Path)} on Windows because the NTFS execute bit isn't a thing —
-     * {@link Files#isRegularFile(Path, LinkOption...)} is the right gate.
+     * Picks the Maven executable in priority order:
+     * <ul>
+     *   <li>On Unix-likes (Linux/macOS): {@code mvnw} when executable, then PATH {@code mvn}.</li>
+     *   <li>On Windows: {@code mvnw.cmd} when present, then PATH {@code mvn} (which Windows
+     *       resolves to {@code mvn.cmd} via {@code PATHEXT}).</li>
+     * </ul>
+     * <p>The Unix-style {@code mvnw} probe is intentionally skipped on Windows: even though
+     * {@link Files#isExecutable(Path)} may still report the Unix shell script as executable (the
+     * Windows check is ACL-based, not extension-based), {@link ProcessBuilder} cannot invoke a
+     * shell script directly on Windows and the launch would fail. {@code mvnw.cmd} is the only
+     * sane wrapper choice there.
+     * <p>{@code mvnw.cmd} cannot be probed with {@link Files#isExecutable(Path)} because the
+     * NTFS executable bit isn't a thing — {@link Files#isRegularFile(Path, LinkOption...)} is the
+     * right gate.
      */
     private String resolveMavenExecutable() {
-        final Path mvnw = workingDirectory.resolve("mvnw");
-        if (Files.isExecutable(mvnw)) {
-            return mvnw.toAbsolutePath().toString();
-        }
         if (isWindows()) {
             final Path mvnwCmd = workingDirectory.resolve("mvnw.cmd");
             if (Files.isRegularFile(mvnwCmd)) {
                 return mvnwCmd.toAbsolutePath().toString();
             }
+            return "mvn";
+        }
+        final Path mvnw = workingDirectory.resolve("mvnw");
+        if (Files.isExecutable(mvnw)) {
+            return mvnw.toAbsolutePath().toString();
         }
         return "mvn";
     }

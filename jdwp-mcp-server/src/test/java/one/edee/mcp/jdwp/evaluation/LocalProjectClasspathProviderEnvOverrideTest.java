@@ -21,12 +21,11 @@ class LocalProjectClasspathProviderEnvOverrideTest {
 	private static final String SEP = java.io.File.pathSeparator;
 	/**
 	 * Guaranteed-non-existent working directory so the depth-5 filesystem scan short-circuits at the
-	 * first {@code isDirectory} probe. A relative {@code /tmp/no-such-project} would be unreliable on
-	 * hosts where that path happens to exist (or where {@code /tmp} contains
-	 * {@code target/classes} subtrees from unrelated tooling).
+	 * first {@code isDirectory} probe. Built from {@code java.io.tmpdir} (platform-correct on every
+	 * host) with a UUID-named child we never create — portable across Linux, macOS, and Windows.
 	 */
 	private static final Path NONEXISTENT_CWD =
-		Path.of("/nonexistent/jdwp-mcp-env-test-" + java.util.UUID.randomUUID());
+		Path.of(System.getProperty("java.io.tmpdir"), "jdwp-mcp-env-test-" + java.util.UUID.randomUUID());
 
 	@Test
 	@DisplayName("parses File.pathSeparator-delimited env var into insertion-ordered entries")

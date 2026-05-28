@@ -23,8 +23,12 @@ final class LocalProjectClasspathProviderTestSupport {
 	 * unrelated {@code target/classes} trees there).
 	 */
 	static LocalProjectClasspathProvider noOpProvider() {
+		// Portable non-existent path: tmpdir is platform-correct (/tmp on Linux,
+		// C:\Users\...\AppData\Local\Temp on Windows); appending a UUID-named child we never
+		// create gives a guaranteed-absent root so the depth-5 scan short-circuits at the first
+		// isDirectory probe.
 		return new LocalProjectClasspathProvider(
-			Path.of("/nonexistent/jdwp-mcp-no-op-" + java.util.UUID.randomUUID()),
+			Path.of(System.getProperty("java.io.tmpdir"), "jdwp-mcp-no-op-" + java.util.UUID.randomUUID()),
 			name -> null,
 			(command, workingDirectory, timeoutSeconds) -> List.of()
 		);

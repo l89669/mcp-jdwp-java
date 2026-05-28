@@ -183,10 +183,11 @@ class JdiExpressionEvaluatorLocalClasspathUnionTest {
 		// this is the exact format the provider's env-override path expects.
 		final String joined = String.join(File.pathSeparator, entries);
 		return new LocalProjectClasspathProvider(
-			// Guaranteed-non-existent path so the depth-5 filesystem scan short-circuits at the
-			// first isDirectory probe. java.io.tmpdir is unsafe — CI machines and dev hosts can
-			// legitimately have target/classes subtrees there from unrelated tooling.
-			Path.of("/nonexistent/jdwp-mcp-union-test-" + java.util.UUID.randomUUID()),
+			// Portable non-existent root: tmpdir is platform-correct on every host; appending a
+			// UUID-named child we never create gives a guaranteed-absent root, so the depth-5
+			// scan short-circuits at the first isDirectory probe and never walks into whatever
+			// tmpdir itself contains.
+			Path.of(System.getProperty("java.io.tmpdir"), "jdwp-mcp-union-test-" + java.util.UUID.randomUUID()),
 			name -> "JDWP_EXTRA_CLASSPATH".equals(name) ? joined : null,
 			(c, d, t) -> List.of()
 		);
