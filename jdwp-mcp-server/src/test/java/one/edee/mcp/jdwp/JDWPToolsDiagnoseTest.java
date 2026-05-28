@@ -296,7 +296,7 @@ class JDWPToolsDiagnoseTest {
 		final String result = toolsWithStub.jdwp_diagnose(null);
 
 		assertThat(result).contains("Local project classpath");
-		assertThat(result).contains("(computed once per JDI connection");
+		assertThat(result).contains("(read from cache; populated on first expression evaluation)");
 		assertThat(result).contains("CWD: " + cwd);
 		// The stub forces Maven to contribute 3 jars; filesystem and env may legitimately add
 		// entries from the running build's tree but the maven count must be exactly 3.

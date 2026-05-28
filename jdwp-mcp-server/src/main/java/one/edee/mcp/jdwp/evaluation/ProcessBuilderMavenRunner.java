@@ -9,6 +9,7 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
@@ -16,7 +17,6 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
-import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 /**
@@ -60,13 +60,6 @@ public class ProcessBuilderMavenRunner implements LocalProjectClasspathProvider.
 
     @Override
     public List<String> run(List<String> command, Path workingDirectory, int timeoutSeconds) {
-        // Snapshot any pre-existing descendant PIDs so the cleanup below only targets processes
-        // that this call spawned. Without the snapshot, an InterruptedException from the executor
-        // would either leak the spawned child (current behaviour) or, worse, race against unrelated
-        // descendant processes started for some other reason.
-        final Set<Long> preExistingDescendants = ProcessHandle.current().descendants()
-            .map(ProcessHandle::pid)
-            .collect(Collectors.toSet());
         try {
             final int exitCode = commandExecutor.execute(new CommandRequest(command, workingDirectory, timeoutSeconds));
             // executeRealCommand already logs WARN with the captured stdout on non-zero/timeout;
@@ -76,38 +69,18 @@ public class ProcessBuilderMavenRunner implements LocalProjectClasspathProvider.
             }
             return harvestOutputFiles(workingDirectory);
         } catch (InterruptedException ie) {
-            // Restore the interrupt flag so callers higher up the stack can observe the cancellation.
-            // Then destroy any descendant process this call spawned — the child holds an OS pipe
-            // open and would block any caller that later tries to drain stdout. Targeted at PIDs
-            // new since the snapshot taken before the executor call.
-            destroyNewDescendants(preExistingDescendants);
+            // executeRealCommand kills its own child process and its descendants before throwing —
+            // process ownership is scoped to whoever spawned it. Restore the interrupt flag and
+            // return so the caller higher up the stack can observe the cancellation. We deliberately
+            // do NOT consult `ProcessHandle.current().descendants()` here: that would forcibly kill
+            // any unrelated subprocess another server component happened to start in the same window.
             Thread.currentThread().interrupt();
-            log.warn("[LocalClasspath] Maven invocation interrupted (cwd={}); destroyed spawned descendants",
-                workingDirectory);
+            log.warn("[LocalClasspath] Maven invocation interrupted (cwd={})", workingDirectory);
             return List.of();
         } catch (Exception e) {
             log.warn("[LocalClasspath] Maven invocation failed: {}: {} (cwd={})",
                 e.getClass().getSimpleName(), e.getMessage(), workingDirectory);
             return List.of();
-        }
-    }
-
-    private static void destroyNewDescendants(Set<Long> preExistingPids) {
-        // Snapshot the new descendants up-front so we can both issue destroy AND await termination
-        // before returning. Issuing destroy without awaiting leaves the caller racing the OS — a
-        // test that checks `isAlive()` immediately after run() can flake. 2s is enough for SIGKILL
-        // to land on a sleep(1)-style process on any sane kernel.
-        final List<ProcessHandle> newDescendants = ProcessHandle.current().descendants()
-            .filter(h -> !preExistingPids.contains(h.pid()))
-            .toList();
-        newDescendants.forEach(ProcessHandle::destroyForcibly);
-        for (ProcessHandle h : newDescendants) {
-            try {
-                h.onExit().get(2, TimeUnit.SECONDS);
-            } catch (Exception ignored) {
-                // Best-effort: a stuck/orphaned process is logged elsewhere; we already issued
-                // destroyForcibly. The caller still gets a timely return.
-            }
         }
     }
 
@@ -135,7 +108,11 @@ public class ProcessBuilderMavenRunner implements LocalProjectClasspathProvider.
                           && p.getParent() != null
                           && p.getParent().getFileName() != null
                           && "target".equals(p.getParent().getFileName().toString())
-                          && !hasSkippedAncestor(root, p))
+                          && !hasSkippedAncestor(root, p)
+                          // Symlinks must not be followed: a symlink at target/.jdwp-mcp-classpath
+                          // could point at any file on the host. The harvester is invariant-bound
+                          // to read only Maven-written output it found in-tree.
+                          && Files.isRegularFile(p, LinkOption.NOFOLLOW_LINKS))
                 .forEach(file -> {
                     try {
                         final String content = Files.readString(file).trim();
@@ -213,13 +190,20 @@ public class ProcessBuilderMavenRunner implements LocalProjectClasspathProvider.
         // project targets Java 17 (virtual threads were finalized in Java 21). The semantics are
         // identical: "drain in the background, don't block the process pipe".
         final ByteArrayOutputStream captured = new ByteArrayOutputStream();
+        // Explicit monitor: ByteArrayOutputStream's per-method synchronization is an OpenJDK
+        // implementation detail and does not give the JMM guarantee we need across "write from
+        // drainer + read from main on the timeout path". A shared lock makes the cap check + write
+        // atomic and the toString() snapshot consistent.
+        final Object capturedLock = new Object();
         final Thread drainer = new Thread(() -> {
             try (var in = process.getInputStream()) {
                 final byte[] buf = new byte[4096];
                 int n;
                 while ((n = in.read(buf)) > 0) {
-                    if (captured.size() < STDOUT_CAPTURE_BYTES) {
-                        captured.write(buf, 0, Math.min(n, STDOUT_CAPTURE_BYTES - captured.size()));
+                    synchronized (capturedLock) {
+                        if (captured.size() < STDOUT_CAPTURE_BYTES) {
+                            captured.write(buf, 0, Math.min(n, STDOUT_CAPTURE_BYTES - captured.size()));
+                        }
                     }
                     // Continue reading even after the cap so the process never blocks on output.
                 }
@@ -229,7 +213,7 @@ public class ProcessBuilderMavenRunner implements LocalProjectClasspathProvider.
         drainer.start();
         try {
             if (!process.waitFor(req.timeoutSeconds(), TimeUnit.SECONDS)) {
-                process.destroyForcibly();
+                destroyProcessTree(process);
                 // Let any in-flight writes from the child reach the drainer before snapshotting
                 // the buffer: otherwise the WARN below would print a truncated tail.
                 try {
@@ -239,13 +223,15 @@ public class ProcessBuilderMavenRunner implements LocalProjectClasspathProvider.
                 }
                 log.warn("[LocalClasspath] Maven invocation timed out after {}s. Captured output (up to {} bytes):\n{}",
                     req.timeoutSeconds(), STDOUT_CAPTURE_BYTES,
-                    captured.toString(StandardCharsets.UTF_8));
+                    snapshotCaptured(captured, capturedLock));
                 return -1;
             }
         } catch (InterruptedException ie) {
-            // waitFor was interrupted — kill the child, restore the interrupt flag, propagate so
-            // the outer run() returns an empty list and surfaces the cancellation to its caller.
-            process.destroyForcibly();
+            // waitFor was interrupted — kill the child AND its descendants (Maven can fork helpers),
+            // restore the interrupt flag, propagate so the outer run() returns empty and surfaces
+            // the cancellation. Only THIS Maven process and its descendants are touched — never
+            // unrelated subprocesses owned by other server components.
+            destroyProcessTree(process);
             Thread.currentThread().interrupt();
             throw ie;
         }
@@ -260,11 +246,48 @@ public class ProcessBuilderMavenRunner implements LocalProjectClasspathProvider.
         if (exit != 0) {
             log.warn("[LocalClasspath] Maven exited with code {}. Captured output (up to {} bytes):\n{}",
                 exit, STDOUT_CAPTURE_BYTES,
-                captured.toString(StandardCharsets.UTF_8));
+                snapshotCaptured(captured, capturedLock));
         } else {
-            log.debug("[LocalClasspath] Maven succeeded ({} bytes of output captured)", captured.size());
+            log.debug("[LocalClasspath] Maven succeeded ({} bytes of output captured)",
+                snapshotSize(captured, capturedLock));
         }
         return exit;
+    }
+
+    /**
+     * Forcibly destroys the given process and every descendant in its tree, then awaits each one's
+     * exit for up to 2s. Bounded to the started process — does NOT touch sibling subprocesses
+     * owned by other components, which a {@code ProcessHandle.current().descendants()} sweep would.
+     */
+    private static void destroyProcessTree(Process process) {
+        final List<ProcessHandle> tree = process.descendants().toList();
+        // Kill children first so the parent can't re-fork during the window between the kill calls.
+        tree.forEach(ProcessHandle::destroyForcibly);
+        process.destroyForcibly();
+        for (ProcessHandle h : tree) {
+            try {
+                h.onExit().get(2, TimeUnit.SECONDS);
+            } catch (Exception ignored) {
+                // Best-effort — we already issued destroyForcibly; nothing more to do here.
+            }
+        }
+        try {
+            process.onExit().get(2, TimeUnit.SECONDS);
+        } catch (Exception ignored) {
+            // Same as above.
+        }
+    }
+
+    private static String snapshotCaptured(ByteArrayOutputStream captured, Object lock) {
+        synchronized (lock) {
+            return captured.toString(StandardCharsets.UTF_8);
+        }
+    }
+
+    private static int snapshotSize(ByteArrayOutputStream captured, Object lock) {
+        synchronized (lock) {
+            return captured.size();
+        }
     }
 
     /** Seam for the actual process execution; returns the child's exit code (or {@code -1} on timeout). */

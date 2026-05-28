@@ -17,13 +17,14 @@ final class LocalProjectClasspathProviderTestSupport {
 
 	/**
 	 * Returns a deterministic provider that contributes zero entries from every source. Working
-	 * directory is the JVM's temp dir — guaranteed to exist but neither a Maven project nor a
-	 * reactor with {@code target/classes} sub-trees, so the filesystem and Maven sources are
-	 * structurally silent.
+	 * directory is a guaranteed-non-existent path so the depth-5 filesystem scan short-circuits
+	 * at the first {@code isDirectory} probe — keeps tests fast and isolated from whatever happens
+	 * to live under {@code java.io.tmpdir} on the running host (CI machines sometimes contain
+	 * unrelated {@code target/classes} trees there).
 	 */
 	static LocalProjectClasspathProvider noOpProvider() {
 		return new LocalProjectClasspathProvider(
-			Path.of(System.getProperty("java.io.tmpdir")),
+			Path.of("/nonexistent/jdwp-mcp-no-op-" + java.util.UUID.randomUUID()),
 			name -> null,
 			(command, workingDirectory, timeoutSeconds) -> List.of()
 		);

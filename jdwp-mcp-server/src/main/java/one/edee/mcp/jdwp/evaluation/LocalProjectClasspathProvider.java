@@ -14,6 +14,7 @@ import java.nio.file.Path;
 import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Objects;
 import java.util.Set;
 import java.util.function.Function;
 import java.util.regex.Pattern;
@@ -119,7 +120,11 @@ public class LocalProjectClasspathProvider {
      */
     @Autowired
     public LocalProjectClasspathProvider(ProcessBuilderMavenRunner mavenRunner) {
-        this(Path.of(System.getProperty("user.dir")), System::getenv, mavenRunner);
+        // `user.dir` is documented as always-present on a normal JVM launch, but a sandboxed
+        // / restricted launch can drop it. Defaulting to "." rather than letting Path.of(null)
+        // NPE keeps the bean constructible — the scan then runs against the process's effective
+        // working directory, which is the same place "." would resolve to anyway.
+        this(Path.of(Objects.toString(System.getProperty("user.dir"), ".")), System::getenv, mavenRunner);
     }
 
     /**
@@ -172,6 +177,25 @@ public class LocalProjectClasspathProvider {
      */
     public boolean isEnvOverrideSet() {
         return envLookup.apply(ENV_NAME) != null;
+    }
+
+    /**
+     * Reports whether the {@code JDWP_EXTRA_CLASSPATH} env var has any non-blank entries after
+     * splitting on the host {@link File#pathSeparator}. Lets the diagnose path render the three-way
+     * "set, no entries" state on a cold cache without triggering full discovery — the answer
+     * depends only on the env var, not on the filesystem or Maven.
+     */
+    public boolean envOverrideHasEntries() {
+        final String raw = envLookup.apply(ENV_NAME);
+        if (raw == null || raw.isBlank()) {
+            return false;
+        }
+        for (String part : raw.split(Pattern.quote(File.pathSeparator), -1)) {
+            if (!part.trim().isEmpty()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -340,17 +364,20 @@ public class LocalProjectClasspathProvider {
      * aborting — a partial classpath beats no classpath.
      */
     private static void scanForClassDirs(Path dir, int depth, Set<String> entries) {
-        if (depth > MAX_SCAN_DEPTH || !Files.isDirectory(dir)) {
+        // NOFOLLOW_LINKS everywhere: a symlink to another tree on the same filesystem could create
+        // walk cycles or pull in jars from outside the project. The documented invariant is that
+        // this scan never follows links — enforce it at every probe.
+        if (depth > MAX_SCAN_DEPTH || !Files.isDirectory(dir, LinkOption.NOFOLLOW_LINKS)) {
             return;
         }
         // At each directory, probe for target/classes and target/test-classes BEFORE recursing — we
         // want a module's classes whether or not it has child modules.
         final Path classes = dir.resolve("target/classes");
-        if (Files.isDirectory(classes)) {
+        if (Files.isDirectory(classes, LinkOption.NOFOLLOW_LINKS)) {
             entries.add(classes.toString());
         }
         final Path testClasses = dir.resolve("target/test-classes");
-        if (Files.isDirectory(testClasses)) {
+        if (Files.isDirectory(testClasses, LinkOption.NOFOLLOW_LINKS)) {
             entries.add(testClasses.toString());
         }
         if (depth == MAX_SCAN_DEPTH) {
@@ -358,7 +385,10 @@ public class LocalProjectClasspathProvider {
         }
         try (Stream<Path> children = Files.list(dir)) {
             children
-                .filter(Files::isDirectory)
+                // `Files::isDirectory` (the method reference) FOLLOWS links — use the explicit
+                // overload with NOFOLLOW_LINKS so a symlinked directory is treated as "not a
+                // directory" and skipped.
+                .filter(p -> Files.isDirectory(p, LinkOption.NOFOLLOW_LINKS))
                 .filter(p -> {
                     final String name = p.getFileName().toString();
                     return !name.startsWith(".") && !SKIP_DIRS.contains(name);

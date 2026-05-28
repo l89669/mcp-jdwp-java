@@ -124,6 +124,51 @@ class LocalProjectClasspathProviderFilesystemScanTest {
 	}
 
 	/**
+	 * Symlinks must not be followed by the filesystem scan: a symlink to a directory outside the
+	 * project tree could pull in unrelated jars (or, in a malicious workspace, escape the project
+	 * root entirely). The documented invariant is "symlinks not followed" — enforce it.
+	 */
+	@Test
+	@org.junit.jupiter.api.condition.EnabledOnOs({
+		org.junit.jupiter.api.condition.OS.LINUX,
+		org.junit.jupiter.api.condition.OS.MAC
+	})
+	@DisplayName("does not traverse symlinked directories during filesystem scan")
+	void shouldNotFollowSymlinkedDirectoriesDuringScan(@TempDir Path tmp) throws Exception {
+		// A module that lives OUTSIDE the project root, in a sibling temp tree.
+		final Path outside = Files.createTempDirectory("jdwp-mcp-outside-tree-");
+		try {
+			Files.createDirectories(outside.resolve("target/classes"));
+
+			// Inside the project tree: a symlinked directory pointing at the outside module.
+			// If symlinks were followed, scanning would descend into it and add
+			// outside/target/classes to the entries — a project-boundary escape.
+			Files.createSymbolicLink(
+				tmp.resolve("linked-module"),
+				outside
+			);
+			// A real (non-symlinked) module for sanity.
+			Files.createDirectories(tmp.resolve("real-module/target/classes"));
+
+			final LocalProjectClasspathProvider provider = new LocalProjectClasspathProvider(
+				tmp, envName -> null, (cmd, cwd, t) -> List.of()
+			);
+
+			final Set<String> entries = provider.discover();
+
+			assertThat(entries)
+				.contains(tmp.resolve("real-module/target/classes").toString())
+				.as("Symlinked directories must not be traversed — symlink-not-followed invariant")
+				.doesNotContain(outside.resolve("target/classes").toString());
+		} finally {
+			// Manual cleanup since the outside dir is not @TempDir-managed.
+			Files.deleteIfExists(outside.resolve("target/classes"));
+			Files.deleteIfExists(outside.resolve("target"));
+			Files.deleteIfExists(outside);
+		}
+	}
+
+	/**
 	 * The scanner skips nested {@code target/} directories — once we enter a {@code target/} we
 	 * never recurse into a {@code target/foo/target/classes}. Anything nested inside the build
 	 * output belongs to Maven and must not contribute to the project's source classpath.

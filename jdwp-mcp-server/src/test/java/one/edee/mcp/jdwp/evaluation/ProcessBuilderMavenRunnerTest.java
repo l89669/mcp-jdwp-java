@@ -77,36 +77,119 @@ class ProcessBuilderMavenRunnerTest {
 	}
 
 	/**
-	 * When the {@link ProcessBuilderMavenRunner.CommandExecutor} lambda throws
-	 * {@link InterruptedException}, the executor must call {@code destroyForcibly()} on the spawned
-	 * process before propagating, otherwise the child process is leaked.
+	 * Process-ownership invariant — the executor is responsible for cleaning up the child process
+	 * IT spawned; the {@code run()} wrapper must NOT consult {@code ProcessHandle.current().descendants()}
+	 * to kill processes by PID diff, since that would forcibly destroy any unrelated subprocess
+	 * another server component happened to start in the same window. This test asserts the
+	 * non-overreach: a sibling subprocess started by the test stays alive even when the
+	 * executor throws {@link InterruptedException}.
+	 *
+	 * <p>The real "destroy MY child on interrupt" behaviour lives in
+	 * {@link ProcessBuilderMavenRunner#executeRealCommand} and is exercised by
+	 * {@link #shouldDestroyOwnedProcessTreeOnTimeout} below using the production code path.
 	 */
 	@Test
-	@DisplayName("destroys the spawned process when waitFor is interrupted")
-	void shouldDestroyProcessOnInterrupt(@TempDir Path tmp) throws Exception {
+	@DisplayName("run() does NOT destroy unrelated sibling subprocesses when the executor throws InterruptedException")
+	void shouldNotOverkillUnrelatedSubprocessesOnInterrupt(@TempDir Path tmp) throws Exception {
 		Files.createDirectories(tmp.resolve("target"));
-		// Stage a sentinel that we can use to confirm the runner did NOT manage to read the
-		// output file (because the executor threw before harvest).
-		Files.writeString(tmp.resolve("target/.jdwp-mcp-classpath"), "/sentinel.jar");
 
-		final AtomicReference<Process> spawned = new AtomicReference<>();
-		final ProcessBuilderMavenRunner runner = new ProcessBuilderMavenRunner(req -> {
-			final Process p = new ProcessBuilder("sleep", "30").redirectErrorStream(true).start();
-			spawned.set(p);
-			throw new InterruptedException("simulated interrupt during waitFor");
-		});
+		// Sibling: a subprocess started by "some other component" before run() is invoked. It
+		// must survive run()'s cleanup — that's the invariant Copilot flagged.
+		final Process sibling = new ProcessBuilder("sleep", "5").redirectErrorStream(true).start();
+		try {
+			final ProcessBuilderMavenRunner runner = new ProcessBuilderMavenRunner(req -> {
+				throw new InterruptedException("simulated interrupt; stub does not spawn anything");
+			});
 
-		// Run shouldn't blow up at the call site — the runner is documented to swallow the
-		// exception, log a WARN, and return an empty list. The bug is in the leak, not the API.
-		final List<String> result = runner.run(List.of("sleep", "30"), tmp, 10);
+			final List<String> result = runner.run(List.of("anything"), tmp, 10);
+
+			assertThat(result).isEmpty();
+			assertThat(sibling.isAlive())
+				.as("Sibling subprocess must NOT be destroyed by run() — process ownership is scoped to the executor")
+				.isTrue();
+			// Interrupt flag must be restored so the caller can observe the cancellation.
+			assertThat(Thread.interrupted())
+				.as("run() must restore the interrupt flag")
+				.isTrue();
+		} finally {
+			sibling.destroyForcibly();
+			sibling.onExit().get(2, java.util.concurrent.TimeUnit.SECONDS);
+		}
+	}
+
+	/**
+	 * The production {@link ProcessBuilderMavenRunner#executeRealCommand} (used via the default,
+	 * no-arg constructor) must destroy the spawned process and its descendants on timeout. This
+	 * exercises the real ProcessBuilder code path with a short timeout against {@code sleep 30}.
+	 */
+	@Test
+	@org.junit.jupiter.api.condition.EnabledOnOs({
+		org.junit.jupiter.api.condition.OS.LINUX,
+		org.junit.jupiter.api.condition.OS.MAC
+	})
+	@DisplayName("executeRealCommand destroys its own process tree on timeout")
+	void shouldDestroyOwnedProcessTreeOnTimeout(@TempDir Path tmp) throws Exception {
+		// Real production runner — exercises executeRealCommand via the default constructor.
+		final ProcessBuilderMavenRunner runner = new ProcessBuilderMavenRunner();
+
+		// Snapshot PIDs of the current JVM's descendants before the call so we can verify
+		// after-state.
+		final java.util.Set<Long> before = ProcessHandle.current().descendants()
+			.map(ProcessHandle::pid)
+			.collect(java.util.stream.Collectors.toSet());
+
+		final long startTime = System.currentTimeMillis();
+		// 1s timeout against a 30s sleep — the runner must terminate the child within a few
+		// seconds of the budget, not 30s later.
+		final List<String> result = runner.run(List.of("sleep", "30"), tmp, 1);
+		final long elapsed = System.currentTimeMillis() - startTime;
 
 		assertThat(result).isEmpty();
-		assertThat(spawned.get())
-			.as("Spawned process must not be leaked when waitFor is interrupted")
-			.isNotNull();
-		assertThat(spawned.get().isAlive())
-			.as("Spawned process must be destroyed on interrupt — currently leaked")
-			.isFalse();
+		assertThat(elapsed)
+			.as("Runner must enforce timeout — should return within ~5s, not wait the full 30")
+			.isLessThan(8_000);
+
+		// All descendants that appeared during the call must be gone (destroyed by executeRealCommand).
+		final java.util.List<ProcessHandle> stillAlive = ProcessHandle.current().descendants()
+			.filter(h -> !before.contains(h.pid()))
+			.filter(ProcessHandle::isAlive)
+			.toList();
+		assertThat(stillAlive)
+			.as("executeRealCommand must destroy every descendant it spawned")
+			.isEmpty();
+	}
+
+	/**
+	 * File-safety: the harvester reads files only when they are regular non-link files. A symlink
+	 * named {@code .jdwp-mcp-classpath} living inside a {@code target/} directory must NOT be
+	 * followed — it could point to any file on the host, breaking the "we only read Maven-written
+	 * output we found in-tree" invariant.
+	 */
+	@Test
+	@org.junit.jupiter.api.condition.EnabledOnOs({
+		org.junit.jupiter.api.condition.OS.LINUX,
+		org.junit.jupiter.api.condition.OS.MAC
+	})
+	@DisplayName("does not follow a symlink at target/.jdwp-mcp-classpath")
+	void shouldNotFollowSymlinkAtHarvestPath(@TempDir Path tmp) throws Exception {
+		// Outside-the-tree file the symlink would point at.
+		final Path elsewhere = tmp.resolve("somewhere-else.txt");
+		Files.writeString(elsewhere, "/from/outside/should-not-be-harvested.jar");
+
+		// target/.jdwp-mcp-classpath is a symlink to the file outside the project.
+		Files.createDirectories(tmp.resolve("target"));
+		Files.createSymbolicLink(
+			tmp.resolve("target/.jdwp-mcp-classpath"),
+			elsewhere
+		);
+
+		final ProcessBuilderMavenRunner runner = new ProcessBuilderMavenRunner(req -> 0);
+
+		final List<String> result = runner.run(List.of("echo"), tmp, 10);
+
+		assertThat(result)
+			.as("Symlinks at the harvest path must not be followed — file-safety invariant")
+			.doesNotContain("/from/outside/should-not-be-harvested.jar");
 	}
 
 	/**

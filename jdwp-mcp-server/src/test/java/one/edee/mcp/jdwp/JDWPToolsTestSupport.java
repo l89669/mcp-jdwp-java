@@ -55,13 +55,14 @@ final class JDWPToolsTestSupport {
 	}
 
 	/**
-	 * Builds a deterministic {@link LocalProjectClasspathProvider} that never shells out to Maven
-	 * or scans the filesystem. Used as the default for tests that do not exercise the local
-	 * classpath surface — keeps the diagnose path fast and reproducible.
+	 * Builds a deterministic {@link LocalProjectClasspathProvider} that contributes zero entries
+	 * from every source. Working directory is a guaranteed-non-existent path so the depth-5
+	 * filesystem scan short-circuits at the first {@code isDirectory} probe — keeps the diagnose
+	 * path fast and reproducible regardless of what {@code user.dir} happens to contain.
 	 */
 	static LocalProjectClasspathProvider defaultEmptyClasspathProvider() {
 		return new LocalProjectClasspathProvider(
-			Path.of(System.getProperty("user.dir")),
+			Path.of("/nonexistent/jdwp-mcp-default-empty-" + java.util.UUID.randomUUID()),
 			name -> null,
 			(command, workingDirectory, timeoutSeconds) -> List.of()
 		);
