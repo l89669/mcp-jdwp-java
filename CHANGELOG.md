@@ -5,6 +5,55 @@ All notable changes to the `jdwp-debugging` plugin are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.9.0] — 2026-05-28
+
+### New — expression evaluation resolves types the remote classpath can't see
+
+Every evaluated expression, logpoint, conditional breakpoint and watcher is
+compiled against the target VM's classpath, which the server discovers by walking
+the live classloader hierarchy. That walk is the source of truth, but it does not
+see everything: Tomcat's webapp loader, Spring Boot's dev-tools restart loader, and
+hand-rolled `URLClassLoader`s routinely hide their JARs from `getURLs()`. When that
+happened, evaluation failed with a bare `X cannot be resolved` and no way forward.
+The server now augments the remote classpath with a **local-project classpath**
+computed from the machine the MCP server runs on, filling exactly those gaps.
+Resolves #32.
+
+- **Three additive sources** — the `JDWP_EXTRA_CLASSPATH` environment variable
+  (verbatim entries you control), a depth-bounded filesystem scan for
+  `target/classes` / `target/test-classes` under the server's working directory,
+  and Maven `dependency:build-classpath` for each `pom.xml` it finds. The result is
+  unioned remote-first, so live target-VM types always win resolution and local
+  entries only fill what the remote walk missed.
+- **Never blocks the debugger** — the cold-cache Maven resolution (which can take
+  1–3 minutes on a fresh `~/.m2`) is never paid on the JDI event thread. The first
+  breakpoint warms only the fast remote discovery; the local fallback, including
+  Maven, is resolved lazily on your first actual evaluation and memoized for the
+  rest of the connection.
+- **Inspectable via `jdwp_diagnose`** — a new "Local project classpath" section
+  reports the working directory, whether a `pom.xml` was found, a per-source entry
+  breakdown, and the three-way `JDWP_EXTRA_CLASSPATH` state
+  (`unset` / `set, no entries` / `set`). The diagnose path is non-blocking — it
+  peeks the cache and never triggers discovery.
+- **Disable it** by launching the server from a directory with no `pom.xml` and no
+  `target/classes`, and leaving `JDWP_EXTRA_CLASSPATH` unset — the merged classpath
+  is then identical to the remote-discovered one.
+
+### Fixed — file-safety and cleanup hardening
+
+The new discovery paths touch the filesystem and shell out to Maven, so they are
+held to a strict safety contract: no file is ever deleted or moved, Maven output
+stays under its own `target/` directory, and symlinks are never followed by either
+the filesystem scan or the Maven-output harvester (a symlinked `target/`, `pom.xml`
+or wrapper script is rejected rather than traversed outside the project tree).
+
+- **Leak-proof Maven subprocess** — a timed-out or interrupted Maven run forcibly
+  destroys the whole process tree it owns (never unrelated siblings), and the wait
+  for the tree to exit is bounded for the tree as a whole rather than per-process.
+- **Robust under restricted environments** — descendant-process enumeration,
+  unreadable directories, and an unset `user.dir` are all tolerated without
+  aborting discovery or failing server startup.
+
 ## [2.8.2] — 2026-05-26
 
 ### Fixed — expression evaluation no longer stalls or misleads after a reconnect
