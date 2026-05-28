@@ -343,13 +343,20 @@ public class LocalProjectClasspathProvider {
     private String resolveMavenExecutable() {
         if (isWindows()) {
             final Path mvnwCmd = workingDirectory.resolve("mvnw.cmd");
-            if (Files.isRegularFile(mvnwCmd)) {
+            // NOFOLLOW_LINKS: a symlinked mvnw.cmd could point at a script outside the working
+            // directory and redirect Maven execution there, defeating the "symlinks never
+            // followed" invariant the rest of this class enforces.
+            if (Files.isRegularFile(mvnwCmd, LinkOption.NOFOLLOW_LINKS)) {
                 return mvnwCmd.toAbsolutePath().toString();
             }
             return "mvn";
         }
         final Path mvnw = workingDirectory.resolve("mvnw");
-        if (Files.isExecutable(mvnw)) {
+        // Same invariant: reject a symlinked wrapper outright. Files.isExecutable() FOLLOWS
+        // symlinks, so we gate on isRegularFile(..., NOFOLLOW_LINKS) first; only when the entry
+        // is a real file do we ask whether it is executable. (isExecutable then follows the link
+        // to query the ACL, but at that point we have already proven it is not a link.)
+        if (Files.isRegularFile(mvnw, LinkOption.NOFOLLOW_LINKS) && Files.isExecutable(mvnw)) {
             return mvnw.toAbsolutePath().toString();
         }
         return "mvn";

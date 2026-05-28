@@ -287,12 +287,32 @@ public class ProcessBuilderMavenRunner implements LocalProjectClasspathProvider.
      * Forcibly destroys the given process and every descendant in its tree, then awaits each one's
      * exit for up to 2s. Bounded to the started process — does NOT touch sibling subprocesses
      * owned by other components, which a {@code ProcessHandle.current().descendants()} sweep would.
+     *
+     * <p>Descendant enumeration is best-effort: {@link Process#descendants()} can throw under
+     * restricted security policies or when handle inspection is unavailable. A failure there must
+     * NOT prevent root-process cleanup — that would leak the Maven invocation we started, the very
+     * thing this method exists to prevent. The root {@code destroyForcibly()} therefore runs in
+     * {@code finally}, after a logged best-effort sweep of descendants.
      */
-    private static void destroyProcessTree(Process process) {
-        final List<ProcessHandle> tree = process.descendants().toList();
-        // Kill children first so the parent can't re-fork during the window between the kill calls.
-        tree.forEach(ProcessHandle::destroyForcibly);
-        process.destroyForcibly();
+    // Package-private so the regression test can exercise the descendants()-throwing path
+    // with a stub Process; production callers use it through the timeout / interrupt branches above.
+    static void destroyProcessTree(Process process) {
+        List<ProcessHandle> tree = List.of();
+        try {
+            tree = process.descendants().toList();
+            // Kill children first so the parent can't re-fork during the window between the kill calls.
+            tree.forEach(ProcessHandle::destroyForcibly);
+        } catch (Exception e) {
+            // Restricted env, unavailable handles, anything else — log and fall through to root
+            // cleanup. The root destroy below still runs because it is in finally.
+            log.warn("[LocalClasspath] Could not enumerate / destroy descendants of Maven process: {}: {}",
+                e.getClass().getSimpleName(), e.getMessage());
+        } finally {
+            // ALWAYS destroy the root — even if descendant enumeration above blew up. Skipping this
+            // would leak the Maven subprocess we own, which is exactly the failure mode the caller
+            // (timeout or interrupt path) is trying to prevent.
+            process.destroyForcibly();
+        }
         for (ProcessHandle h : tree) {
             try {
                 h.onExit().get(2, TimeUnit.SECONDS);

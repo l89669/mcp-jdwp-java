@@ -251,6 +251,46 @@ class ProcessBuilderMavenRunnerTest {
 	}
 
 	/**
+	 * Restricted-environment safety: {@link Process#descendants()} can throw under tight security
+	 * policies or when handle inspection is unavailable. If that happens during a timeout or
+	 * interrupt, the root Maven process must still be destroyed — otherwise the very subprocess
+	 * we are trying to clean up leaks. The fix puts {@code root.destroyForcibly()} in a
+	 * {@code finally} so it runs regardless of how descendant enumeration fails.
+	 */
+	@Test
+	@DisplayName("destroyProcessTree still destroys the root when descendants() throws")
+	void shouldDestroyRootEvenIfDescendantsThrows() {
+		final java.util.concurrent.atomic.AtomicBoolean rootDestroyed = new java.util.concurrent.atomic.AtomicBoolean(false);
+
+		// Stub Process: descendants() blows up to simulate a restricted env where handle inspection
+		// is unavailable. Only the methods destroyProcessTree actually touches are overridden.
+		final Process stub = new Process() {
+			@Override public java.io.OutputStream getOutputStream() { return java.io.OutputStream.nullOutputStream(); }
+			@Override public java.io.InputStream getInputStream() { return java.io.InputStream.nullInputStream(); }
+			@Override public java.io.InputStream getErrorStream() { return java.io.InputStream.nullInputStream(); }
+			@Override public int waitFor() { return 0; }
+			@Override public int exitValue() { return 0; }
+			@Override public void destroy() { /* unused by destroyProcessTree */ }
+			@Override public Process destroyForcibly() {
+				rootDestroyed.set(true);
+				return this;
+			}
+			@Override public java.util.stream.Stream<ProcessHandle> descendants() {
+				throw new SecurityException("simulated restricted environment");
+			}
+			@Override public java.util.concurrent.CompletableFuture<Process> onExit() {
+				return java.util.concurrent.CompletableFuture.completedFuture(this);
+			}
+		};
+
+		ProcessBuilderMavenRunner.destroyProcessTree(stub);
+
+		assertThat(rootDestroyed.get())
+			.as("Root process must be destroyed even when descendants() throws — no leaked Maven subprocess")
+			.isTrue();
+	}
+
+	/**
 	 * On Windows the wrapper script is {@code mvnw.cmd}, not {@code mvnw}. The provider must probe
 	 * for both, preferring {@code mvnw} (Unix) when present and falling back to {@code mvnw.cmd} on
 	 * Windows hosts. This test is meaningful only on a real Windows runner — the

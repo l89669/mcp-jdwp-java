@@ -113,6 +113,42 @@ class LocalProjectClasspathProviderMavenTest {
 		assertThat(capturedTimeout.get()).isEqualTo(180);
 	}
 
+	/**
+	 * Symlink-safety for the Maven wrapper: a {@code mvnw} that is itself a symlink (e.g. to a
+	 * script outside the working directory) must NOT be selected as the executable. The provider
+	 * must fall back to PATH {@code mvn} instead, matching the symlinks-never-followed invariant
+	 * enforced everywhere else in this class. Linux/macOS only — Windows can't create symlinks
+	 * without elevated rights, and the Windows path is exercised by its own test.
+	 */
+	@Test
+	@org.junit.jupiter.api.condition.EnabledOnOs({
+		org.junit.jupiter.api.condition.OS.LINUX,
+		org.junit.jupiter.api.condition.OS.MAC
+	})
+	@DisplayName("rejects a symlinked mvnw wrapper and falls back to PATH 'mvn'")
+	void shouldRejectSymlinkedMvnwAndFallBackToPathMvn(@TempDir Path tmp) throws Exception {
+		Files.writeString(tmp.resolve("pom.xml"), "<project/>");
+
+		// Real wrapper script in a sibling dir; the working directory hosts only a SYMLINK to it.
+		final Path realMvnwDir = tmp.resolve("real-tools");
+		Files.createDirectories(realMvnwDir);
+		final Path realMvnw = realMvnwDir.resolve("mvnw");
+		Files.writeString(realMvnw, "#!/bin/sh\necho 'should not be invoked'\n");
+		realMvnw.toFile().setExecutable(true);
+
+		Files.createSymbolicLink(tmp.resolve("mvnw"), realMvnw);
+
+		final AtomicReference<List<String>> capturedCmd = new AtomicReference<>();
+		final LocalProjectClasspathProvider provider = new LocalProjectClasspathProvider(
+			tmp, envName -> null, (cmd, cwd, t) -> { capturedCmd.set(cmd); return List.of(); }
+		);
+		provider.discover();
+
+		assertThat(capturedCmd.get().get(0))
+			.as("Symlinked mvnw must be rejected — symlinks-not-followed invariant; fall back to PATH 'mvn'")
+			.isEqualTo("mvn");
+	}
+
 	@Test
 	@DisplayName("prefers an executable ./mvnw wrapper over a bare 'mvn'")
 	void shouldPreferMvnwOverMvn(@TempDir Path tmp) throws Exception {
