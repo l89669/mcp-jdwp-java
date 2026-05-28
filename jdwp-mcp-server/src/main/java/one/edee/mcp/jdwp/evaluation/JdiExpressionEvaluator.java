@@ -84,6 +84,16 @@ public class JdiExpressionEvaluator {
      */
     private final Map<String, CachedCompilation> compilationCache = new ConcurrentHashMap<>();
 
+    /**
+     * Whether the (potentially Maven-blocking) local-project classpath has already been merged into
+     * the compiler config for the current connection. Distinct from "JDK path discovered": the
+     * best-effort {@link #prewarmClasspath} warms only the remote classpath + JDK detection and
+     * leaves this {@code false}, so the first real evaluation still completes the local merge.
+     * Reset to {@code false} on the reconnect edge (null JDK path) alongside the other caches.
+     * Guarded by the {@code synchronized} monitor of {@link #configureCompilerClasspath}.
+     */
+    private boolean localClasspathMerged = false;
+
     public JdiExpressionEvaluator(
         InMemoryJavaCompiler compiler,
         JDIConnectionService jdiConnectionService,
@@ -1134,13 +1144,14 @@ public class JdiExpressionEvaluator {
     }
 
     /**
-     * Configures the compiler with the target JVM's classpath. Skips if already configured for the
-     * current connection. Automatically reconfigures after a disconnect/reconnect cycle (detected
-     * via null JDK path): clears the compilation cache AND resets the compiler config because stale
-     * bytecode and a stale classpath may reference classes from a previous connection. Also resets
-     * the {@link LocalProjectClasspathProvider} cache on the same edge so a reconnect into a
-     * different working directory sees the new project layout. Must be called BEFORE any expression
-     * evaluation to avoid nested JDI calls.
+     * Configures the compiler with the target JVM's classpath, including the local-project classpath
+     * fallback. Skips if already fully configured for the current connection. Automatically
+     * reconfigures after a disconnect/reconnect cycle (detected via null JDK path): clears the
+     * compilation cache AND resets the compiler config because stale bytecode and a stale classpath
+     * may reference classes from a previous connection. Also resets the
+     * {@link LocalProjectClasspathProvider} cache on the same edge so a reconnect into a different
+     * working directory sees the new project layout. Must be called BEFORE any expression evaluation
+     * to avoid nested JDI calls.
      *
      * @param suspendedThread a thread already suspended at a breakpoint (REQUIRED)
      * @throws JdiEvaluationException if classpath/JDK discovery fails for the current connection;
@@ -1150,8 +1161,33 @@ public class JdiExpressionEvaluator {
      */
     public synchronized void configureCompilerClasspath(ThreadReference suspendedThread)
         throws JdiEvaluationException {
-        // Self-healing: if JDK path is already set, classpath is already configured for this connection
-        if (jdiConnectionService.getDiscoveredJdkPath() != null) {
+        configureCompilerClasspath(suspendedThread, true);
+    }
+
+    /**
+     * Worker for {@link #configureCompilerClasspath(ThreadReference)} and {@link #prewarmClasspath}.
+     *
+     * <p>{@code includeLocal} controls whether the local-project classpath fallback (env override +
+     * filesystem scan + Maven {@code dependency:build-classpath}) is merged in. The real evaluation
+     * paths pass {@code true}; the speculative {@link #prewarmClasspath} — which runs on the JDI
+     * event-listener thread the instant a breakpoint hits, before the user has asked for anything —
+     * passes {@code false}. The local fallback can shell out to Maven with a multi-minute timeout, so
+     * paying it on the event-listener thread would block event processing (and every other breakpoint)
+     * for minutes even if the user never evaluates an expression. Prewarm therefore warms only the
+     * remote classpath + JDK detection, and {@link #localClasspathMerged} stays {@code false} so the
+     * first actual evaluation/logpoint/condition completes the local merge.
+     *
+     * @param suspendedThread a thread already suspended at a breakpoint (REQUIRED)
+     * @param includeLocal    whether to merge the (possibly Maven-blocking) local-project classpath
+     */
+    private synchronized void configureCompilerClasspath(ThreadReference suspendedThread, boolean includeLocal)
+        throws JdiEvaluationException {
+        final boolean jdkReady = jdiConnectionService.getDiscoveredJdkPath() != null;
+        // Self-healing short-circuit. The remote classpath + JDK are warm once the JDK path is set,
+        // which is all a prewarm (includeLocal=false) cares about. A real evaluation additionally
+        // needs the local fallback merged — so it only short-circuits once localClasspathMerged is
+        // true, otherwise it falls through to complete the merge prewarm deliberately skipped.
+        if (jdkReady && (!includeLocal || localClasspathMerged)) {
             return;
         }
 
@@ -1171,9 +1207,15 @@ public class JdiExpressionEvaluator {
             // The local-classpath provider lives in the same Spring singleton and may hold a
             // memoised view of a *previous* connection's project layout — reset it on the same
             // connection-lifecycle edge so the next discover() sees the current CWD/env/Maven view.
-            compilationCache.clear();
-            compiler.reset();
-            localClasspathProvider.reset();
+            // Guard on !jdkReady: when we fall through here with the JDK already discovered (a real
+            // evaluation finishing the merge a prewarm deferred), the remote discovery is still valid
+            // and must NOT be wiped.
+            if (!jdkReady) {
+                compilationCache.clear();
+                compiler.reset();
+                localClasspathProvider.reset();
+                localClasspathMerged = false;
+            }
 
             final long startTime = System.currentTimeMillis();
 
@@ -1201,7 +1243,11 @@ public class JdiExpressionEvaluator {
             // a stale local entry binds against the remote definition first — desired behaviour
             // for the source/binary-drift risk.
             final long mergeStart = System.currentTimeMillis();
-            final Set<String> localEntries = localClasspathProvider.discover();
+            // includeLocal=false (prewarm) skips the local provider entirely — it can shell out to
+            // Maven with a multi-minute timeout, which must never run on the JDI event-listener
+            // thread. The first real evaluation re-enters with includeLocal=true and completes the
+            // merge below.
+            final Set<String> localEntries = includeLocal ? localClasspathProvider.discover() : Set.of();
             final String mergedClasspath = mergeClasspaths(remoteClasspath, localEntries);
             // Report three numbers so an operator can see overlap explicitly:
             // remote + local are the raw source counts; merged is the deduped union actually
@@ -1209,7 +1255,8 @@ public class JdiExpressionEvaluator {
             // and local project share JARs) — the overlap shows up as "merged < remote + local".
             final int remoteCount = countEntries(remoteClasspath);
             final int mergedCount = countEntries(mergedClasspath);
-            log.info("[LocalClasspath] Merged classpath: {} remote + {} local entries → {} merged in {}ms",
+            log.info("[LocalClasspath] Merged classpath: {} remote + {} local entries → {} merged in {}ms"
+                    + (includeLocal ? "" : " (prewarm — local fallback deferred to first evaluation)"),
                 remoteCount, localEntries.size(), mergedCount,
                 System.currentTimeMillis() - mergeStart);
 
@@ -1228,6 +1275,11 @@ public class JdiExpressionEvaluator {
 
             final int version = jdiConnectionService.getTargetMajorVersion();
             compiler.configure(jdkPath, mergedClasspath, version);
+            // Mark the local fallback merged only on the real-evaluation path. A prewarm leaves this
+            // false so the first actual evaluation falls through the short-circuit and merges it.
+            if (includeLocal) {
+                localClasspathMerged = true;
+            }
             log.info("[Evaluator] Compiler configured in {}ms", System.currentTimeMillis() - startTime);
         } finally {
             evaluationGuard.exit(guardedThreadId);
@@ -1237,9 +1289,16 @@ public class JdiExpressionEvaluator {
     /**
      * Best-effort pre-warm of the compiler classpath at the first thread suspension, so the agent's
      * first {@code evaluate_expression} (or the first logpoint/condition hit) does not pay the
-     * one-time classpath discovery cost — which can take 1-3s while it walks the target VM's
+     * one-time remote classpath discovery cost — which can take 1-3s while it walks the target VM's
      * classloader hierarchy via {@code invokeMethod} — on the critical path. Discovery is paid once
      * per connection; subsequent calls short-circuit on the cached JDK path.
+     * <p>
+     * Warms ONLY the remote classpath + JDK detection (it passes {@code includeLocal=false}). The
+     * local-project fallback is deliberately NOT run here: it can shell out to Maven with a
+     * multi-minute timeout, and this method runs on the JDI event-listener thread the moment a
+     * breakpoint hits — blocking that thread on Maven would stall event processing (and every other
+     * breakpoint) for minutes even if the user never evaluates anything. The first real evaluation
+     * completes the local merge via {@link #configureCompilerClasspath(ThreadReference)}.
      * <p>
      * Unlike {@link #configureCompilerClasspath}, this NEVER throws: it is invoked from the JDI
      * event listener while a thread is parked for inspection, and a warming failure must not disrupt
@@ -1253,7 +1312,7 @@ public class JdiExpressionEvaluator {
             return;
         }
         try {
-            configureCompilerClasspath(suspendedThread);
+            configureCompilerClasspath(suspendedThread, false);
         } catch (Exception e) {
             log.debug("[Evaluator] Classpath pre-warm failed (will retry on first evaluation): {}",
                 e.getMessage());

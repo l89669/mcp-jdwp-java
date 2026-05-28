@@ -286,10 +286,12 @@ public class LocalProjectClasspathProvider {
             if (added > 0) {
                 log.info("[LocalClasspath] Maven contributed {} dependency jars in {}ms", added, elapsed);
             } else {
-                // "Reason-out on empty" — required by the logging policy. The runner already logs the
-                // shell-level failure; this line gives an operator the user-facing context.
-                log.info("[LocalClasspath] Maven contributed 0 jars in {}ms — check earlier WARN lines "
-                    + "for the cause (timeout, non-zero exit, missing output files)", elapsed);
+                // "Reason-out on empty" — required by the logging policy. 0 jars is NOT necessarily a
+                // failure: a project with no runtime dependencies (or a filtered classpath) legitimately
+                // yields nothing. The runner already logs a WARN on a genuine shell-level failure, so
+                // point operators there for the failure case without implying one happened.
+                log.info("[LocalClasspath] Maven contributed 0 jars in {}ms (no runtime deps, or Maven "
+                    + "failed — check earlier WARN lines for timeout / non-zero exit / missing output)", elapsed);
             }
         } catch (Exception e) {
             log.warn("[LocalClasspath] Maven dependency:build-classpath failed after {}ms: {}: {} (cwd={})",

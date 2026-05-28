@@ -178,11 +178,6 @@ class LocalProjectClasspathProviderMavenTest {
 	}
 
 	/**
-	 * A {@code pom.xml} that exists but is structurally empty is a real-world case (e.g. partial
-	 * sync, broken build) — the provider must still invoke Maven (it's the runner's job to deal
-	 * with the failure) and tolerate an empty result list without throwing.
-	 */
-	/**
 	 * Symlink-safety: a {@code pom.xml} that is itself a symbolic link must NOT trigger Maven
 	 * discovery. Maven would resolve the link and pull dependencies from the linked target, which
 	 * may live outside the configured working directory — the provider's documented invariant is
@@ -220,6 +215,11 @@ class LocalProjectClasspathProviderMavenTest {
 			.isFalse();
 	}
 
+	/**
+	 * A {@code pom.xml} that exists but is structurally empty is a real-world case (e.g. partial
+	 * sync, broken build) — the provider must still invoke Maven (it's the runner's job to deal
+	 * with the failure) and tolerate an empty result list without throwing.
+	 */
 	@Test
 	@DisplayName("invokes Maven when pom.xml is present even if empty; tolerates empty result list")
 	void shouldInvokeMavenWhenPomXmlIsEmpty(@TempDir Path tmp) throws Exception {
