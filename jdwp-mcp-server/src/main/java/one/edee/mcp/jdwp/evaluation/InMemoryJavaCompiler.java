@@ -25,8 +25,9 @@ import java.util.stream.Collectors;
  * round-trips through a short-lived temp directory because JDT's standard file-object API requires a real
  * `javax.tools.JavaFileObject` backed by a path. The temp directory is unconditionally deleted in `finally`.
  * <p>
- * Requires {@link #configure(String, String, int)} to be called first with the path to a target-matching JDK
- * (used as {@code --system <jdkPath>} so JDT can resolve {@code java.*} system classes) and the target VM's classpath.
+ * Requires {@link #configure(String, String, int)} to be called first with the path to a target-matching Java
+ * home and the target VM's classpath. Java 8 targets compile against that runtime's boot classpath; Java 9+
+ * targets compile against {@code --system <jdkPath>}.
  * Calling {@link #compile(String, String)} without configuration throws {@link JdiEvaluationException}.
  * <p>
  * Source/target version is derived from the major version: `1.8` for Java 8, the bare number for Java 9+.
@@ -37,7 +38,7 @@ public class InMemoryJavaCompiler {
     private static final Logger log = LoggerFactory.getLogger(InMemoryJavaCompiler.class);
 
     /**
-     * Filesystem path to the target-matching JDK; used as `--system` so JDT can resolve system classes.
+     * Filesystem path to the target-matching Java home; used to resolve target system classes.
      */
     @Nullable
     private String jdkPath;
@@ -50,6 +51,19 @@ public class InMemoryJavaCompiler {
      * Target JVM major version (8, 11, 17, ...); defaults to 8 until {@link #configure} is called.
      */
     private int targetMajorVersion = 8;
+
+    /**
+     * Java 8 runtime jars that make up the useful boot classpath for expression wrappers. Not every
+     * distribution ships every file, so the compiler uses the subset present next to {@code rt.jar}.
+     */
+    private static final List<String> JAVA_8_BOOT_JARS = Arrays.asList(
+        "rt.jar",
+        "resources.jar",
+        "jsse.jar",
+        "jce.jar",
+        "charsets.jar",
+        "jfr.jar"
+    );
 
     /**
      * Materialises the source for {@code className} under {@code tempDir}, creating any required
@@ -85,7 +99,7 @@ public class InMemoryJavaCompiler {
      * concurrent {@link #compile} sees a fully populated state. A non-positive `targetMajorVersion`
      * silently clamps to 8 (the lowest version JDT can target).
      *
-     * @param jdkPath            file path to the root of a JDK matching the target VM's major version
+     * @param jdkPath            file path to a Java home matching the target VM's major version
      * @param classpath          target VM classpath (colon- or semicolon-separated, depending on target OS)
      * @param targetMajorVersion target JVM major version (e.g., 8, 11, 17, 21); 0 or negative falls back to 8
      */
@@ -200,15 +214,68 @@ public class InMemoryJavaCompiler {
     /**
      * Builds the JDT compiler option list from the configured target version, JDK path, and classpath.
      */
-    private List<String> buildCompilerOptions() {
+    private List<String> buildCompilerOptions() throws JdiEvaluationException {
+        final String configuredJdkPath = jdkPath;
+        if (configuredJdkPath == null) {
+            throw new JdiEvaluationException(
+                "Compiler is not configured. Please call configure() with a valid JDK path and classpath."
+            );
+        }
+
         final String versionStr = targetMajorVersion <= 8 ? "1." + targetMajorVersion : String.valueOf(targetMajorVersion);
         final List<String> options = new ArrayList<>(Arrays.asList("-source", versionStr, "-target", versionStr));
         options.add("-g"); // Preserve local variable names
-        options.addAll(Arrays.asList("--system", jdkPath));
+        if (targetMajorVersion <= 8) {
+            addJava8BootClasspath(options, configuredJdkPath);
+        } else {
+            options.addAll(Arrays.asList("--system", configuredJdkPath));
+        }
         if (classpath != null && !classpath.isEmpty()) {
             options.addAll(Arrays.asList("-classpath", classpath));
         }
         return options;
+    }
+
+    /**
+     * ECJ's {@code --system} option is for Java 9+ modular runtimes. Java 8 targets must be
+     * resolved through the classic boot classpath rooted at {@code rt.jar}; otherwise ECJ reports
+     * "invalid location for system libraries" when pointed at a Java 8 JRE/JDK.
+     */
+    private static void addJava8BootClasspath(List<String> options, String javaHome) throws JdiEvaluationException {
+        final Path runtimeLibDir = findJava8RuntimeLibDir(javaHome);
+        final List<String> bootClasspathEntries = JAVA_8_BOOT_JARS.stream()
+            .map(runtimeLibDir::resolve)
+            .filter(Files::isRegularFile)
+            .map(Path::toString)
+            .toList();
+
+        options.addAll(Arrays.asList("-bootclasspath", String.join(File.pathSeparator, bootClasspathEntries)));
+
+        final Path extDir = runtimeLibDir.resolve("ext");
+        if (Files.isDirectory(extDir)) {
+            options.addAll(Arrays.asList("-extdirs", extDir.toString()));
+        }
+    }
+
+    /**
+     * Accepts both target {@code java.home} values that point directly at a Java 8 JRE
+     * ({@code <jre>/lib/rt.jar}) and JDK roots that bundle the JRE under {@code jre/}.
+     */
+    private static Path findJava8RuntimeLibDir(String javaHome) throws JdiEvaluationException {
+        final Path directRuntimeLib = Path.of(javaHome, "lib");
+        if (Files.isRegularFile(directRuntimeLib.resolve("rt.jar"))) {
+            return directRuntimeLib;
+        }
+
+        final Path bundledRuntimeLib = Path.of(javaHome, "jre", "lib");
+        if (Files.isRegularFile(bundledRuntimeLib.resolve("rt.jar"))) {
+            return bundledRuntimeLib;
+        }
+
+        throw new JdiEvaluationException(
+            "Java 8 target requires rt.jar under the discovered Java home; checked "
+                + directRuntimeLib.resolve("rt.jar") + " and " + bundledRuntimeLib.resolve("rt.jar") + "."
+        );
     }
 
     /**

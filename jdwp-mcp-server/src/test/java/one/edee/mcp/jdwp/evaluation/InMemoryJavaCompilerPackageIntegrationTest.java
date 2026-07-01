@@ -13,6 +13,7 @@ import java.util.Map;
 import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * End-to-end compilation tests for {@link InMemoryJavaCompiler} that exercise paths not
@@ -69,24 +70,23 @@ class InMemoryJavaCompilerPackageIntegrationTest {
 	class TargetVersion {
 
 		@Test
-		void shouldCompileWithTargetVersion8Flag() throws JdiEvaluationException {
+		void shouldRejectJava8TargetWhenConfiguredHomeHasNoRtJar() {
 			compiler.configure(System.getProperty("java.home"), "", 8);
 
 			String source = "public class V8 { public static int run() { return 1; } }";
-			Map<String, byte[]> result = compiler.compile("V8", source);
-
-			assertThat(result).containsKey("V8");
-			assertThat(result.get("V8").length).isGreaterThan(4);
+			assertThatThrownBy(() -> compiler.compile("V8", source))
+				.isInstanceOf(JdiEvaluationException.class)
+				.hasMessageContaining("Java 8 target requires rt.jar");
 		}
 
 		@Test
-		void shouldDefaultToVersion8WhenConfiguredWithZero() throws JdiEvaluationException {
+		void shouldDefaultToVersion8WhenConfiguredWithZero() {
 			compiler.configure(System.getProperty("java.home"), "", 0);
 
 			String source = "public class V0 { public static int run() { return 1; } }";
-			Map<String, byte[]> result = compiler.compile("V0", source);
-
-			assertThat(result).containsKey("V0");
+			assertThatThrownBy(() -> compiler.compile("V0", source))
+				.isInstanceOf(JdiEvaluationException.class)
+				.hasMessageContaining("Java 8 target requires rt.jar");
 		}
 	}
 }

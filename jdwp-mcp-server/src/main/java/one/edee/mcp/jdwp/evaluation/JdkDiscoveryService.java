@@ -15,9 +15,9 @@ import java.util.stream.Stream;
 
 /**
  * Discovers a local JDK installation matching the target JVM's Java version. The Eclipse JDT
- * compiler used by {@link InMemoryJavaCompiler} needs {@code --system <jdkPath>} to resolve
- * {@code java.*} system classes when compiling expression-evaluator wrapper classes; without this
- * discovery the compiler can't produce bytecode for the target.
+ * compiler used by {@link InMemoryJavaCompiler} needs local access to the target's system classes
+ * when compiling expression-evaluator wrapper classes; without this discovery the compiler can't
+ * produce bytecode for the target.
  * <p>
  * One-shot, stateful helper: holds {@link #targetMajorVersion} after a successful
  * {@link #discoverMatchingJdk} so callers can read it without re-running discovery. NOT a Spring

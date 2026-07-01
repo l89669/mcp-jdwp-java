@@ -25,8 +25,8 @@ import java.util.*;
  * 3. Tomcat `WebappClassLoaderBase` instances detected the same way.
  * <p>
  * Discovery aborts with {@link JdkDiscoveryService.JdkNotFoundException} if no local JDK matching
- * the target version is found via {@link JdkDiscoveryService} — JDT requires
- * {@code --system <jdkPath>} to compile against the target's system classes.
+ * the target version is found via {@link JdkDiscoveryService} — JDT requires local access to the
+ * target's system classes before it can compile expression wrappers.
  */
 public class ClasspathDiscoverer {
 

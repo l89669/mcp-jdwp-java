@@ -6,6 +6,7 @@ import com.sun.jdi.request.*;
 import one.edee.mcp.jdwp.discovery.DiagnoseReportRenderer;
 import one.edee.mcp.jdwp.discovery.JvmDescriptor;
 import one.edee.mcp.jdwp.discovery.JvmDiscoveryService;
+import one.edee.mcp.jdwp.evaluation.CompiledClassExecutor;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
 import one.edee.mcp.jdwp.evaluation.LocalProjectClasspathProvider;
 import one.edee.mcp.jdwp.marks.MarkInfo;
@@ -25,6 +26,8 @@ import java.io.IOException;
 import java.lang.management.ManagementFactory;
 import java.lang.reflect.Modifier;
 import java.net.SocketException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
@@ -104,6 +107,7 @@ public class JDWPTools {
     private final EvaluationGuard evaluationGuard;
     private final JvmDiscoveryService jvmDiscoveryService;
     private final MarkedInstanceRegistry markedInstances;
+    private final CompiledClassExecutor compiledClassExecutor;
     /**
      * Passive JDI traffic observer + active wedge probe. Surfaced through {@code jdwp_diagnose}
      * (renderer) and the soft-wait envelopes (still-waiting responses cite the current health
@@ -126,6 +130,7 @@ public class JDWPTools {
                      EventHistory eventHistory, EvaluationGuard evaluationGuard,
                      JvmDiscoveryService jvmDiscoveryService,
                      MarkedInstanceRegistry markedInstances,
+                     CompiledClassExecutor compiledClassExecutor,
                      JdiHealthMonitor healthMonitor,
                      LocalProjectClasspathProvider localClasspathProvider) {
         this.jdiService = jdiService;
@@ -136,6 +141,7 @@ public class JDWPTools {
         this.evaluationGuard = evaluationGuard;
         this.jvmDiscoveryService = jvmDiscoveryService;
         this.markedInstances = markedInstances;
+        this.compiledClassExecutor = compiledClassExecutor;
         this.healthMonitor = healthMonitor;
         this.localClasspathProvider = localClasspathProvider;
     }
@@ -1165,6 +1171,80 @@ public class JDWPTools {
                 return vmDisconnectedMessage("jdwp_assert_expression");
             }
             return "Error: " + e.getMessage();
+        }
+    }
+
+    @McpTool(description = "Execute a precompiled .class file inside the target VM by defining it into a suspended application frame's ClassLoader and invoking a static no-argument method. Use this when the application build tool must compile/remap the code first (for example Minecraft Gradle/reobf output). The class name should be unique per reload because already-defined classes cannot be replaced in the same ClassLoader.")
+    public String jdwp_execute_class_file(
+        @McpToolParam(description = "Path to the compiled .class file on the MCP server filesystem. For Minecraft/reobf projects, point this at the class extracted from the built client/server jar, not the pre-reobf build/classes output.") String classFilePath,
+        @McpToolParam(description = "Fully qualified binary class name, e.g. 'com.example.DebugProbe'. Must match the bytecode's internal name.") String className,
+        @McpToolParam(required = false, description = "Static no-argument method to invoke (default: run)") @Nullable String methodName,
+        @McpToolParam(required = false, description = "Thread ID to invoke on. If omitted, uses the last breakpoint thread.") @Nullable Long threadId,
+        @McpToolParam(required = false, description = "Frame index whose declaring classloader should receive the class (default: 0). Pick an application frame, not a bootstrap/JDK frame.") @Nullable Integer frameIndex) {
+        try {
+            final String trimmedClassName = className.trim();
+            if (trimmedClassName.isEmpty()) {
+                return "Error: className must not be blank.";
+            }
+
+            final String targetMethod = methodName == null || methodName.isBlank()
+                ? "run"
+                : methodName.trim();
+
+            final Path classFile = Path.of(classFilePath).toAbsolutePath().normalize();
+            if (!Files.isRegularFile(classFile)) {
+                return "Error: classFilePath is not a regular file: " + classFile;
+            }
+            if (!classFile.getFileName().toString().endsWith(".class")) {
+                return "Error: classFilePath must point to a .class file: " + classFile;
+            }
+
+            final VirtualMachine vm = jdiService.getVM();
+            final ThreadReference thread;
+            if (threadId != null) {
+                thread = findThread(vm, threadId);
+                if (thread == null) {
+                    return "Error: Thread not found with ID " + threadId;
+                }
+            } else {
+                thread = breakpointTracker.getLastBreakpointThread();
+                if (thread == null) {
+                    return "Error: No suspended thread available. Provide a threadId or hit a breakpoint first.";
+                }
+            }
+            if (!thread.isSuspended()) {
+                return "Error: Thread is not suspended.";
+            }
+            final String invokeGuard = checkSafeToInvoke(thread);
+            if (invokeGuard != null) {
+                return invokeGuard;
+            }
+
+            final StackFrame frame = thread.frame(frameIndex != null ? frameIndex : 0);
+            final long guardedThreadId = thread.uniqueID();
+            final Value result;
+            evaluationGuard.enter(guardedThreadId);
+            try {
+                result = compiledClassExecutor.executeClassFile(
+                    vm,
+                    thread,
+                    frame,
+                    classFile,
+                    trimmedClassName,
+                    targetMethod
+                );
+            } finally {
+                evaluationGuard.exit(guardedThreadId);
+            }
+
+            return String.format("Executed %s.%s() from %s: %s",
+                trimmedClassName, targetMethod, classFile, formatValue(result));
+        } catch (Exception e) {
+            if (isVmGone(e)) {
+                return vmDisconnectedMessage("jdwp_execute_class_file");
+            }
+            final String msg = e.getMessage() != null ? e.getMessage() : e.toString();
+            return "Error executing class file: " + msg;
         }
     }
 

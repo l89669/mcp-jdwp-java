@@ -1,6 +1,7 @@
 package one.edee.mcp.jdwp;
 
 import one.edee.mcp.jdwp.discovery.JvmDiscoveryService;
+import one.edee.mcp.jdwp.evaluation.CompiledClassExecutor;
 import one.edee.mcp.jdwp.evaluation.JdiExpressionEvaluator;
 import one.edee.mcp.jdwp.evaluation.LocalProjectClasspathProvider;
 import one.edee.mcp.jdwp.marks.MarkedInstanceRegistry;
@@ -49,6 +50,7 @@ final class JDWPToolsTestSupport {
 			new EvaluationGuard(),
 			mock(JvmDiscoveryService.class),
 			new MarkedInstanceRegistry(),
+			mock(CompiledClassExecutor.class),
 			new JdiHealthMonitor(),
 			defaultEmptyClasspathProvider()
 		);
@@ -94,6 +96,7 @@ final class JDWPToolsTestSupport {
 			evaluationGuard,
 			jvmDiscoveryService,
 			new MarkedInstanceRegistry(),
+			mock(CompiledClassExecutor.class),
 			new JdiHealthMonitor(),
 			defaultEmptyClasspathProvider()
 		);
@@ -123,6 +126,7 @@ final class JDWPToolsTestSupport {
 			evaluationGuard,
 			jvmDiscoveryService,
 			new MarkedInstanceRegistry(),
+			mock(CompiledClassExecutor.class),
 			new JdiHealthMonitor(),
 			localClasspathProvider
 		);
@@ -151,6 +155,7 @@ final class JDWPToolsTestSupport {
 			evaluationGuard,
 			jvmDiscoveryService,
 			markedInstances,
+			mock(CompiledClassExecutor.class),
 			new JdiHealthMonitor(),
 			defaultEmptyClasspathProvider()
 		);
@@ -180,7 +185,33 @@ final class JDWPToolsTestSupport {
 			evaluationGuard,
 			jvmDiscoveryService,
 			markedInstances,
+			mock(CompiledClassExecutor.class),
 			healthMonitor,
+			defaultEmptyClasspathProvider()
+		);
+	}
+
+	static JDWPTools newTools(
+		JDIConnectionService jdiService,
+		BreakpointTracker breakpointTracker,
+		WatcherManager watcherManager,
+		JdiExpressionEvaluator expressionEvaluator,
+		EventHistory eventHistory,
+		EvaluationGuard evaluationGuard,
+		JvmDiscoveryService jvmDiscoveryService,
+		CompiledClassExecutor compiledClassExecutor
+	) {
+		return new JDWPTools(
+			jdiService,
+			breakpointTracker,
+			watcherManager,
+			expressionEvaluator,
+			eventHistory,
+			evaluationGuard,
+			jvmDiscoveryService,
+			new MarkedInstanceRegistry(),
+			compiledClassExecutor,
+			new JdiHealthMonitor(),
 			defaultEmptyClasspathProvider()
 		);
 	}

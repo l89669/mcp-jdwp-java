@@ -133,8 +133,8 @@ public class JDIConnectionService {
     private volatile String cachedClasspath;
     /**
      * Filesystem path to a local JDK matching the target JVM version. Populated as a side effect of
-     * {@link #discoverClasspath} and consumed by {@link InMemoryJavaCompiler}
-     * for the `--system` argument; cleared on disconnect.
+     * {@link #discoverClasspath} and consumed by {@link InMemoryJavaCompiler} to resolve system
+     * classes; cleared on disconnect.
      */
     @Nullable
     private volatile String discoveredJdkPath;

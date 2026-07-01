@@ -1,12 +1,18 @@
 package one.edee.mcp.jdwp.evaluation;
 
+import one.edee.mcp.jdwp.TestReflectionUtils;
 import one.edee.mcp.jdwp.evaluation.exceptions.JdiEvaluationException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
+import java.io.File;
 import java.lang.reflect.Field;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -61,6 +67,64 @@ class InMemoryJavaCompilerConfigureTest {
 			Field field = InMemoryJavaCompiler.class.getDeclaredField("targetMajorVersion");
 			field.setAccessible(true);
 			return (int) field.get(compiler);
+		}
+	}
+
+	@Nested
+	@DisplayName("Compiler options")
+	class CompilerOptions {
+
+		@Test
+		@DisplayName("Java 8 JRE home uses bootclasspath instead of --system")
+		void shouldUseBootClasspathForJava8JreHome(@TempDir Path javaHome) throws Exception {
+			final Path libDir = Files.createDirectories(javaHome.resolve("lib"));
+			final Path rtJar = Files.createFile(libDir.resolve("rt.jar"));
+
+			compiler.configure(javaHome.toString(), "", 8);
+
+			final List<String> options = buildCompilerOptions();
+			assertThat(options).doesNotContain("--system");
+			assertThat(options).containsSubsequence("-bootclasspath", rtJar.toString());
+		}
+
+		@Test
+		@DisplayName("Java 8 JDK root uses bundled JRE bootclasspath and extdirs")
+		void shouldUseBundledJreBootClasspathForJava8JdkRoot(@TempDir Path jdkHome) throws Exception {
+			final Path runtimeLib = Files.createDirectories(jdkHome.resolve("jre").resolve("lib"));
+			final Path rtJar = Files.createFile(runtimeLib.resolve("rt.jar"));
+			final Path jceJar = Files.createFile(runtimeLib.resolve("jce.jar"));
+			final Path extDir = Files.createDirectories(runtimeLib.resolve("ext"));
+
+			compiler.configure(jdkHome.toString(), "", 8);
+
+			final List<String> options = buildCompilerOptions();
+			assertThat(options).doesNotContain("--system");
+			final String bootClasspath = optionValueAfter(options, "-bootclasspath");
+			assertThat(bootClasspath.split(java.util.regex.Pattern.quote(File.pathSeparator), -1))
+				.containsExactly(rtJar.toString(), jceJar.toString());
+			assertThat(options).containsSubsequence("-extdirs", extDir.toString());
+		}
+
+		@Test
+		@DisplayName("Java 9+ targets still use --system")
+		void shouldUseSystemForJava9PlusTargets() throws Exception {
+			final String jdkHome = System.getProperty("java.home");
+			compiler.configure(jdkHome, "", 17);
+
+			final List<String> options = buildCompilerOptions();
+			assertThat(options).doesNotContain("-bootclasspath");
+			assertThat(options).containsSubsequence("--system", jdkHome);
+		}
+
+		private List<String> buildCompilerOptions() throws Exception {
+			return TestReflectionUtils.invokePrivate(compiler, "buildCompilerOptions", new Class[]{});
+		}
+
+		private String optionValueAfter(List<String> options, String optionName) {
+			final int index = options.indexOf(optionName);
+			assertThat(index).isGreaterThanOrEqualTo(0);
+			assertThat(index + 1).isLessThan(options.size());
+			return options.get(index + 1);
 		}
 	}
 
