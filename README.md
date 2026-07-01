@@ -432,7 +432,7 @@ jdwp_set_field_logpoint(
 )
 ```
 
-Each hit records a `FIELD_LOGPOINT` entry to `jdwp_get_events`; failures surface as `FIELD_LOGPOINT_ERROR`. Filters (`threadFilterId`, `objectFilterId`) and trigger chaining (`triggerBreakpointId`, `oneShot`) work the same as for line and exception BPs. Deferred activation is supported — the watchpoint installs the moment the declaring class loads, so static-initializer writes are caught.
+Each hit records a `FIELD_LOGPOINT` entry to `jdwp_get_events`; failures surface as `FIELD_LOGPOINT_ERROR`. Filters (`threadFilterId`, `objectFilterId`), standalone `oneShot`, and trigger chaining (`triggerBreakpointId`, `oneShot`) work the same as for line and exception BPs. Deferred activation is supported — the watchpoint installs the moment the declaring class loads, so static-initializer writes are caught.
 
 Hard errors (no silent fallback): invalid `mode`, ambiguous or missing field, `objectFilterId` on a static field. The deferred path can't validate static-ness until class load, so it surfaces a warning Note in the response.
 
@@ -453,14 +453,16 @@ jdwp_set_breakpoint(
 
 Make one breakpoint depend on another. The dependent BP stays disabled until its trigger fires; from then on it's armed and behaves normally. Use this when a hit is uninteresting unless reached via a specific code path — e.g., suspend at the order-pricing line only after a "VIP customer" path has been entered, or break inside a generic utility only when called from a specific feature.
 
-Two modes:
+Two chain modes:
 
 - **Sticky** (default, `oneShot=false`) — once the trigger fires, the dependent stays armed forever. Use when you want to filter by an early gate but observe every subsequent hit.
-- **One-shot** (`oneShot=true`) — the dependent self-disarms after firing, so the next hit requires the trigger to fire again. Matches IntelliJ's "Remove once hit" behavior.
+- **Chain one-shot** (`oneShot=true` with `triggerBreakpointId`) — the dependent self-disarms after firing, so the next hit requires the trigger to fire again. Use this when a loop should yield one dependent hit per trigger hit.
+
+Without `triggerBreakpointId`, `oneShot=true` means ordinary one-shot: the line, exception, or field breakpoint is removed after its first meaningful hit. Condition-false and reentrancy-suppressed events do not consume it.
 
 Chains compose: a trigger BP can itself be a dependent of an earlier trigger. Cycles are rejected at registration time with the offending path in the error message. Pending (not-yet-loaded) BPs are first-class participants — a chained dependent registered against a class that hasn't loaded yet is promoted with the chain bit intact, so the very first event after class load can't fire before the trigger has. Trigger fires that happen while the dependent is still pending are remembered, so a deferred dependent isn't penalised for arriving late.
 
-Both line breakpoints and exception breakpoints can be chain dependents and chain triggers; mix them freely.
+Line, exception, and field breakpoints/logpoints can be chain dependents and chain triggers; mix them freely.
 
 Manage chains with:
 
@@ -643,13 +645,13 @@ Each step is one round-trip, so prefer a breakpoint at the destination + `jdwp_r
 
 | Tool                              | Parameters                                                | Description                                         |
 |-----------------------------------|-----------------------------------------------------------|-----------------------------------------------------|
-| `jdwp_set_breakpoint`             | `className`, `lineNumber`, `suspendPolicy?`, `condition?`, `triggerBreakpointId?`, `oneShot?`, `forceLoad?` | Set line breakpoint (conditions, deferred-by-default, trigger chaining; `forceLoad=true` binds immediately and runs `<clinit>`) |
+| `jdwp_set_breakpoint`             | `className`, `lineNumber`, `suspendPolicy?`, `condition?`, `triggerBreakpointId?`, `oneShot?`, `forceLoad?` | Set line breakpoint (conditions, deferred-by-default, standalone one-shot, trigger chaining; `forceLoad=true` binds immediately and runs `<clinit>`) |
 | `jdwp_set_logpoint`               | `className`, `lineNumber`, `expression`, `condition?`, `forceLoad?` | Non-stopping line breakpoint that logs expression result |
 | `jdwp_clear_breakpoint`           | `breakpointId`                                            | Remove a breakpoint by ID — routes by kind across line, exception, and field BPs |
-| `jdwp_set_exception_breakpoint`   | `exceptionClass`, `caught?`, `uncaught?`, `triggerBreakpointId?`, `oneShot?` | Suspend on exception throw (supports deferred and trigger chaining) |
-| `jdwp_set_exception_logpoint`     | `exceptionClass`, `expression`, `condition?`, `caught?`, `uncaught?`, `triggerBreakpointId?`, `oneShot?` | Non-stopping exception breakpoint with `$exception` bound |
-| `jdwp_set_field_breakpoint`       | `className`, `fieldName`, `mode`, `condition?`, `threadFilterId?`, `objectFilterId?`, `triggerBreakpointId?`, `oneShot?` | Suspend on field access/modification/both (supports conditions, filters, deferred, chaining) |
-| `jdwp_set_field_logpoint`         | `className`, `fieldName`, `mode`, `expression`, `condition?`, `threadFilterId?`, `objectFilterId?`, `triggerBreakpointId?`, `oneShot?` | Non-stopping field watchpoint with `$oldValue`/`$newValue`/`$object`/`$fieldName`/`$mode` bound |
+| `jdwp_set_exception_breakpoint`   | `exceptionClass`, `caught?`, `uncaught?`, `triggerBreakpointId?`, `oneShot?` | Suspend on exception throw (supports deferred, standalone one-shot, and trigger chaining) |
+| `jdwp_set_exception_logpoint`     | `exceptionClass`, `expression`, `condition?`, `caught?`, `uncaught?`, `triggerBreakpointId?`, `oneShot?` | Non-stopping exception breakpoint with `$exception` bound (supports standalone one-shot and chaining) |
+| `jdwp_set_field_breakpoint`       | `className`, `fieldName`, `mode`, `condition?`, `threadFilterId?`, `objectFilterId?`, `triggerBreakpointId?`, `oneShot?` | Suspend on field access/modification/both (supports conditions, filters, deferred, standalone one-shot, chaining) |
+| `jdwp_set_field_logpoint`         | `className`, `fieldName`, `mode`, `expression`, `condition?`, `threadFilterId?`, `objectFilterId?`, `triggerBreakpointId?`, `oneShot?` | Non-stopping field watchpoint with `$oldValue`/`$newValue`/`$object`/`$fieldName`/`$mode` bound (supports standalone one-shot and chaining) |
 
 (For listing or bulk-clearing breakpoints across any combination of kinds, see `jdwp_overview` and `jdwp_clear` in the Debug state section below.)
 

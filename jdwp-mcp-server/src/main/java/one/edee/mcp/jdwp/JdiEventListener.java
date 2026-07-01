@@ -14,6 +14,7 @@ import org.springframework.stereotype.Service;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -165,6 +166,37 @@ public class JdiEventListener {
                 log.debug("[JDI] Failed to arm dependent BP #{} on trigger #{}: {}",
                     depId, firingBpId, e.getMessage());
             }
+        }
+    }
+
+    /**
+     * Removes a standalone one-shot breakpoint after a meaningful hit. This is intentionally not
+     * part of {@link #applyChainEffectsAfterHit}: chain one-shot means "re-disarm and wait for the
+     * next trigger", while standalone one-shot means "delete this logical breakpoint after one hit".
+     */
+    private void consumeStandaloneOneShotAfterHit(int bpId) {
+        if (!breakpointTracker.isStandaloneOneShot(bpId)) {
+            return;
+        }
+        try {
+            final boolean removed = breakpointTracker.consumeStandaloneOneShot(bpId);
+            if (!removed) {
+                return;
+            }
+
+            final Set<Integer> detachedDependents = breakpointTracker.clearDependentsOfTrigger(bpId);
+            for (Integer depId : detachedDependents) {
+                eventHistory.record(new EventHistory.DebugEvent("CHAIN_BROKEN",
+                    String.format("BP #%d trigger (#%d) was consumed as one-shot — dependent armed unconditionally",
+                        depId, bpId),
+                    Map.of("breakpointId", String.valueOf(depId),
+                        "triggerId", String.valueOf(bpId))));
+            }
+            eventHistory.record(new EventHistory.DebugEvent("ONE_SHOT_CLEARED",
+                String.format("BP #%d consumed after first hit", bpId),
+                Map.of("breakpointId", String.valueOf(bpId))));
+        } catch (Exception e) {
+            log.debug("[JDI] Failed to consume standalone one-shot BP #{}: {}", bpId, e.getMessage());
         }
     }
 
@@ -503,6 +535,7 @@ public class JdiEventListener {
                 }
                 evaluateLogpoint(event, bpId, logpointExpr, className, lineNumber, threadName);
                 applyChainEffectsAfterHit(bpId, request);
+                consumeStandaloneOneShotAfterHit(bpId);
                 return false;
             }
 
@@ -524,6 +557,7 @@ public class JdiEventListener {
             log.info("[JDI] Breakpoint {} hit on thread {} at {}:{}", bpId, threadName, className, lineNumber);
             breakpointTracker.fireNextEvent();
             applyChainEffectsAfterHit(bpId, request);
+            consumeStandaloneOneShotAfterHit(bpId);
             return true;
 
         } catch (Exception e) {
@@ -663,6 +697,7 @@ public class JdiEventListener {
                     throwInfo, catchInfo, threadName);
                 if (firingId != null) {
                     applyChainEffectsAfterHit(firingId, firingRequest);
+                    consumeStandaloneOneShotAfterHit(firingId);
                 }
                 return false;
             }
@@ -682,6 +717,7 @@ public class JdiEventListener {
 
             if (firingId != null) {
                 applyChainEffectsAfterHit(firingId, firingRequest);
+                consumeStandaloneOneShotAfterHit(firingId);
             }
         } catch (Exception e) {
             log.warn("[JDI] Error handling exception event: {}", e.getMessage());
@@ -837,6 +873,7 @@ public class JdiEventListener {
             if (spec.logOnly()) {
                 evaluateFieldLogpoint(event, bpId, spec, modeStr, className, fieldName, threadName, bindings);
                 applyChainEffectsAfterHit(bpId, request);
+                consumeStandaloneOneShotAfterHit(bpId);
                 return false;
             }
 
@@ -851,6 +888,7 @@ public class JdiEventListener {
             log.info("[JDI] Field {} {} on {} (BP #{})", fieldName, modeStr, threadName, bpId);
             breakpointTracker.fireNextEvent();
             applyChainEffectsAfterHit(bpId, request);
+            consumeStandaloneOneShotAfterHit(bpId);
             return true;
         } catch (Exception e) {
             log.warn("[JDI] Error handling watchpoint event: {}", e.getMessage());

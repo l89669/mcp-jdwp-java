@@ -259,7 +259,7 @@ A noisy method fires repeatedly throughout the run; you only want to stop on it 
 3. `jdwp_resume_until_event` — runs through every pre-login call to `CartService:99` without stopping. As soon as the login flow hits BP `#A`, the dependent is armed (you'll see a `CHAIN_ARMED` event in `jdwp_get_events`).
 4. The very next `CartService:99` call after that stops as a normal BP — inspect away.
 5. **Sticky default:** once armed, the dependent stays armed for the rest of the session. To catch the *next* run of the flow fresh again, call `jdwp_disarm_until_trigger(<dependentId>)` — this re-engages the chain without rebuilding the BP.
-6. **`oneShot=true` mode** is also available — the dependent re-disarms itself after each hit (IntelliJ-style). Use this when you want the noisy BP to fire exactly once per trigger event in a loop.
+6. **`oneShot=true` with a trigger** is also available — the dependent re-disarms itself after each hit. Use this when you want the noisy BP to fire exactly once per trigger event in a loop. Without a trigger, `oneShot=true` is ordinary one-shot: remove the BP after its first meaningful hit.
 
 Chains can be retrofitted to existing BPs via `jdwp_set_breakpoint_dependency(dependentId, triggerId)`, removed via `jdwp_clear_breakpoint_dependency(dependentId)`, and they survive `jdwp_reset` only if the BPs themselves do (reset clears everything). Removing the trigger BP collapses the chain — every dependent gets armed and a `CHAIN_BROKEN` event is recorded.
 

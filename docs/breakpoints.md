@@ -160,10 +160,16 @@ The chain mechanism lets one breakpoint stay disabled until another fires. The d
 - `dependentsByTrigger: Map<Integer, Set<Integer>>` (line 167) — reverse index for fast cascade.
 - `triggersFiredAtLeastOnce: Set<Integer>` (line 176) — memory of "this trigger has fired at least once in this session".
 
-### Sticky versus one-shot
+### Sticky versus chain one-shot
 
 - **`oneShot = false`** (default, "sticky") — once the trigger fires, the dependent stays armed for the rest of the session. Use when you want to filter "only count hits after the gate", but observe every hit thereafter.
-- **`oneShot = true`** — the dependent self-disarms after firing. Matches IntelliJ's "Remove once hit" behaviour. After it fires, the trigger has to fire again before the dependent re-arms.
+- **`oneShot = true` with a trigger** — the dependent self-disarms after firing. After it fires, the trigger has to fire again before the dependent re-arms.
+
+### Standalone one-shot
+
+When `oneShot = true` is supplied without `triggerBreakpointId`, it is not a chain mode. The logical line, exception, or field breakpoint is removed after its first meaningful hit and a `ONE_SHOT_CLEARED` event is recorded. Condition-false hits, constructor-excluded field hits, and reentrancy-suppressed events do not consume the breakpoint.
+
+The marker is stored by breakpoint ID so deferred breakpoints keep the one-shot behavior when they promote from pending to active and across reconnect snapshot/restore.
 
 To manually re-disarm a sticky chain that already fired, the agent uses `jdwp_disarm_until_trigger` (`JDWPTools.java:2206-2223`), which just calls `setBreakpointEnabledById(false)`.
 
@@ -181,7 +187,7 @@ The opposite case is also handled: a brand-new dependent registered via `jdwp_se
 
 ### Chain effects after a hit
 
-`applyChainEffectsAfterHit` (`JdiEventListener.java:116-161`) is what runs after a real, suspending hit (not a logpoint, not a condition-false skip):
+`applyChainEffectsAfterHit` (`JdiEventListener.java:116-161`) is what runs after a meaningful hit (including logpoints, excluding condition-false skips):
 
 - Emit `CHAIN_DISARMED` for any one-shot dependent that just self-disarmed (lines 131-135).
 - Emit `CHAIN_ARMED` for any dependent that just got armed for the first time (lines 152-155).

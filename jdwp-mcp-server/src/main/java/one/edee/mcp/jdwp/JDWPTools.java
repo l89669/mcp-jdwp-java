@@ -2442,7 +2442,7 @@ public class JDWPTools {
         @McpToolParam(required = false, description = "Suspend policy: 'all' (default), 'thread', 'none'") @Nullable String suspendPolicy,
         @McpToolParam(required = false, description = "Optional condition — only suspend when this evaluates to true (e.g., 'i > 100') — supports `{ ...; return X; }` block syntax") @Nullable String condition,
         @McpToolParam(required = false, description = "Optional ID of a trigger breakpoint — this BP stays disarmed until the trigger fires. Sticky by default: once armed it stays so unless re-disarmed via jdwp_disarm_until_trigger or oneShot=true.") @Nullable Integer triggerBreakpointId,
-        @McpToolParam(required = false, description = "If true, re-disarm this BP after each hit so the next trigger fire re-arms it (IntelliJ-style). Default: false (sticky).") @Nullable Boolean oneShot,
+        @McpToolParam(required = false, description = "If true without triggerBreakpointId, remove this BP after its first meaningful hit. If a trigger is set, re-disarm after each hit so the next trigger fire re-arms it. Default: false.") @Nullable Boolean oneShot,
         @McpToolParam(required = false, description = "If true, force-load the class via Class.forName in the target VM when it isn't already loaded. Default: false (passive — defer via ClassPrepareRequest). Force-load triggers `<clinit>`, cascades dependent loads, and can mask lazy-init / classloader-leak diagnostics — use sparingly.") @Nullable Boolean forceLoad) {
         // Track the pending ID outside the try so the catch can clean it up if locationsOfLine
         // (or any later step) throws after the pending entry has already been registered.
@@ -2487,6 +2487,7 @@ public class JDWPTools {
             final String chainInfo = triggerBreakpointId != null
                 ? String.format(", chain: trigger=#%d%s",
                     triggerBreakpointId, effectiveOneShot ? " (one-shot)" : " (sticky)") : "";
+            final String oneShotInfo = triggerBreakpointId == null && effectiveOneShot ? ", one-shot" : "";
 
             if (classes.isEmpty()) {
                 final int pendingId = breakpointTracker.registerPendingBreakpoint(className, lineNumber, jdiPolicy, policyLabel);
@@ -2496,6 +2497,8 @@ public class JDWPTools {
                 }
                 if (triggerBreakpointId != null) {
                     breakpointTracker.registerDependency(pendingId, triggerBreakpointId, effectiveOneShot);
+                } else if (effectiveOneShot) {
+                    breakpointTracker.registerStandaloneOneShot(pendingId);
                 }
 
                 if (!breakpointTracker.hasClassPrepareRequest(className)) {
@@ -2532,7 +2535,7 @@ public class JDWPTools {
                             }
                             return String.format("Breakpoint set at %s:%d (ID: %d, suspend: %s%s%s) " +
                                     "(bound by a concurrent activation path)",
-                                className, lineNumber, pendingId, policyLabel, conditionInfo, chainInfo);
+                                className, lineNumber, pendingId, policyLabel, conditionInfo, chainInfo + oneShotInfo);
                         }
                         if (triggerBreakpointId == null) {
                             bpRequest.setEnabled(true);
@@ -2542,14 +2545,14 @@ public class JDWPTools {
                         // lambda-bearing lines silently miss depending on whether the class loaded
                         // before or after BP registration.
                         return String.format("Breakpoint set at %s:%d (ID: %d, suspend: %s%s%s%s)",
-                            className, lineNumber, pendingId, policyLabel, conditionInfo, chainInfo,
+                            className, lineNumber, pendingId, policyLabel, conditionInfo, chainInfo + oneShotInfo,
                             multiLocationDiagnostic(pendingId, className, lineNumber, locations, boundLocation, "BP"));
                     }
                 }
 
                 return String.format("Breakpoint deferred for %s:%d (ID: %d, suspend: %s%s%s). " +
                         "Class not yet loaded — will activate automatically when the JVM loads it.",
-                    className, lineNumber, pendingId, policyLabel, conditionInfo, chainInfo)
+                    className, lineNumber, pendingId, policyLabel, conditionInfo, chainInfo + oneShotInfo)
                     + deferredClassSuggestion(vm, className);
             }
 
@@ -2575,6 +2578,10 @@ public class JDWPTools {
             if (triggerBreakpointId != null) {
                 breakpointTracker.registerDependency(breakpointId, triggerBreakpointId, effectiveOneShot);
                 // Stays disabled — the chain will arm it when the trigger fires.
+            } else if (effectiveOneShot) {
+                breakpointTracker.registerStandaloneOneShot(breakpointId);
+                // No chain: now safe to publish the request to the target VM.
+                bpRequest.setEnabled(true);
             } else {
                 // No chain: now safe to publish the request to the target VM.
                 bpRequest.setEnabled(true);
@@ -2584,7 +2591,7 @@ public class JDWPTools {
             // line with multiple Locations (typical for lambdas) only gets a BP at the first
             // one; the other code paths through the same line silently miss.
             return String.format("Breakpoint set at %s:%d (ID: %d, suspend: %s%s%s%s)",
-                className, lineNumber, breakpointId, policyLabel, conditionInfo, chainInfo,
+                className, lineNumber, breakpointId, policyLabel, conditionInfo, chainInfo + oneShotInfo,
                 multiLocationDiagnostic(breakpointId, className, lineNumber, locations, boundLocation, "BP"));
         } catch (AbsentInformationException e) {
             cleanupOrphanPendingBreakpoint(pendingIdForCleanup);
@@ -3024,7 +3031,7 @@ public class JDWPTools {
         @McpToolParam(required = false, description = "Break on caught exceptions (default: true)") @Nullable Boolean caught,
         @McpToolParam(required = false, description = "Break on uncaught exceptions (default: true)") @Nullable Boolean uncaught,
         @McpToolParam(required = false, description = "Optional ID of a trigger breakpoint — this exception BP stays disarmed until the trigger fires. Sticky by default.") @Nullable Integer triggerBreakpointId,
-        @McpToolParam(required = false, description = "If true, re-disarm this BP after each hit so the next trigger fire re-arms it. Default: false (sticky).") @Nullable Boolean oneShot,
+        @McpToolParam(required = false, description = "If true without triggerBreakpointId, remove this exception BP after its first meaningful hit. If a trigger is set, re-disarm after each hit so the next trigger fire re-arms it. Default: false.") @Nullable Boolean oneShot,
         @McpToolParam(required = false, description = "If true, force-load the exception class via Class.forName when it isn't already loaded. Default: false (passive — defer via ClassPrepareRequest). Useful for JDK exception classes the application has never referenced (ClassPrepareEvent is not delivered for bootstrap classes, so the deferred path will never activate).") @Nullable Boolean forceLoad) {
         return registerExceptionBreakpointInternal(
             exceptionClass, caught, uncaught,
@@ -3050,7 +3057,7 @@ public class JDWPTools {
         @McpToolParam(required = false, description = "Log caught exceptions (default: true)") @Nullable Boolean caught,
         @McpToolParam(required = false, description = "Log uncaught exceptions (default: true)") @Nullable Boolean uncaught,
         @McpToolParam(required = false, description = "Optional ID of a trigger breakpoint — this logpoint stays disarmed until the trigger fires. Sticky by default.") @Nullable Integer triggerBreakpointId,
-        @McpToolParam(required = false, description = "If true, re-disarm after each hit so the next trigger fire re-arms it. Default: false (sticky).") @Nullable Boolean oneShot,
+        @McpToolParam(required = false, description = "If true without triggerBreakpointId, remove this exception logpoint after its first meaningful hit. If a trigger is set, re-disarm after each hit so the next trigger fire re-arms it. Default: false.") @Nullable Boolean oneShot,
         @McpToolParam(required = false, description = "If true, force-load the exception class via Class.forName when it isn't already loaded. Default: false (passive — defer via ClassPrepareRequest). Useful for JDK exception classes the application has never referenced.") @Nullable Boolean forceLoad) {
         if (expression == null || expression.isBlank()) {
             return "Error: expression is required for jdwp_set_exception_logpoint. "
@@ -3088,6 +3095,7 @@ public class JDWPTools {
             final String chainInfo = triggerBreakpointId != null
                 ? String.format("\n  Chain: trigger=#%d%s",
                     triggerBreakpointId, effectiveOneShot ? " (one-shot)" : " (sticky)") : "";
+            final String oneShotLine = triggerBreakpointId == null && effectiveOneShot ? "\n  One-shot: true" : "";
             final boolean isLogpoint = expression != null;
             final String normalisedCondition = (condition == null || condition.isBlank()) ? null : condition;
             final String expressionLine = isLogpoint ? "\n  Expression: " + expression : "";
@@ -3115,6 +3123,8 @@ public class JDWPTools {
                 }
                 if (triggerBreakpointId != null) {
                     breakpointTracker.registerDependency(pendingId, triggerBreakpointId, effectiveOneShot);
+                } else if (effectiveOneShot) {
+                    breakpointTracker.registerStandaloneOneShot(pendingId);
                 }
 
                 if (!breakpointTracker.hasClassPrepareRequest(exceptionClass)) {
@@ -3130,13 +3140,14 @@ public class JDWPTools {
                           Exception: %s
                           Caught: %s
                           Uncaught: %s
-                          Mode: %s%s%s%s
+                          Mode: %s%s%s%s%s
                         Class not yet loaded — will activate automatically when the JVM loads it.""",
                     pendingId, exceptionClass, effectiveCaught, effectiveUncaught,
                     isLogpoint ? "log-only" : "suspend",
                     expressionLine,
                     conditionLine,
-                    chainInfo)
+                    chainInfo,
+                    oneShotLine)
                     + deferredClassSuggestion(vm, exceptionClass)
                     + (isLogpoint ? LOGPOINT_READBACK_HINT : "");
             }
@@ -3157,16 +3168,20 @@ public class JDWPTools {
             if (triggerBreakpointId != null) {
                 breakpointTracker.registerDependency(id, triggerBreakpointId, effectiveOneShot);
                 // Stays disabled — the chain will arm it when the trigger fires.
+            } else if (effectiveOneShot) {
+                breakpointTracker.registerStandaloneOneShot(id);
+                exReq.setEnabled(true);
             } else {
                 exReq.setEnabled(true);
             }
 
-            return String.format("Exception breakpoint set (ID: %d)\n  Exception: %s\n  Caught: %s\n  Uncaught: %s\n  Mode: %s%s%s%s",
+            return String.format("Exception breakpoint set (ID: %d)\n  Exception: %s\n  Caught: %s\n  Uncaught: %s\n  Mode: %s%s%s%s%s",
                 id, exceptionClass, effectiveCaught, effectiveUncaught,
                 isLogpoint ? "log-only" : "suspend",
                 expressionLine,
                 conditionLine,
-                chainInfo)
+                chainInfo,
+                oneShotLine)
                 + (isLogpoint ? LOGPOINT_READBACK_HINT : "");
         } catch (Exception e) {
             return "Error: " + e.getMessage();
@@ -3189,7 +3204,7 @@ public class JDWPTools {
         @McpToolParam(required = false, description = "Optional thread filter — only fire when this thread (uniqueID) hits the field") @Nullable Long threadFilterId,
         @McpToolParam(required = false, description = "Optional object filter — only fire on the given instance (object ID from jdwp_get_locals/jdwp_get_fields). Must be omitted for static fields.") @Nullable Long objectFilterId,
         @McpToolParam(required = false, description = "Optional ID of a trigger breakpoint — this field BP stays disarmed until the trigger fires. Sticky by default.") @Nullable Integer triggerBreakpointId,
-        @McpToolParam(required = false, description = "If true, re-disarm this BP after each hit so the next trigger fire re-arms it. Default: false (sticky).") @Nullable Boolean oneShot,
+        @McpToolParam(required = false, description = "If true without triggerBreakpointId, remove this field BP after its first meaningful hit. If a trigger is set, re-disarm after each hit so the next trigger fire re-arms it. Default: false.") @Nullable Boolean oneShot,
         @McpToolParam(required = false, description = "If true, force-load the declaring class via Class.forName when it isn't already loaded. Default: false (passive — defer via ClassPrepareRequest). Force-load triggers `<clinit>` and may mask lazy-init / classloader-leak diagnostics — use sparingly.") @Nullable Boolean forceLoad,
         @McpToolParam(required = false, description = "If true, suppress writes that happen inside the declaring class's `<init>` / `<clinit>` so the BP only fires on post-construction mutations. Skips the event, the condition, the suspend, and chain triggers. Use when constructor-storm noise drowns the interesting later writes. Default: false.") @Nullable Boolean excludeConstructors) {
         return registerFieldBreakpointInternal(
@@ -3217,7 +3232,7 @@ public class JDWPTools {
         @McpToolParam(required = false, description = "Optional thread filter — only fire when this thread (uniqueID) hits the field") @Nullable Long threadFilterId,
         @McpToolParam(required = false, description = "Optional object filter — only fire on the given instance. Must be omitted for static fields.") @Nullable Long objectFilterId,
         @McpToolParam(required = false, description = "Optional ID of a trigger breakpoint — this logpoint stays disarmed until the trigger fires. Sticky by default.") @Nullable Integer triggerBreakpointId,
-        @McpToolParam(required = false, description = "If true, re-disarm after each hit so the next trigger fire re-arms it. Default: false (sticky).") @Nullable Boolean oneShot,
+        @McpToolParam(required = false, description = "If true without triggerBreakpointId, remove this field logpoint after its first meaningful hit. If a trigger is set, re-disarm after each hit so the next trigger fire re-arms it. Default: false.") @Nullable Boolean oneShot,
         @McpToolParam(required = false, description = "If true, force-load the declaring class via Class.forName when it isn't already loaded. Default: false (passive — defer via ClassPrepareRequest). Force-load triggers `<clinit>` and may mask lazy-init diagnostics — use sparingly.") @Nullable Boolean forceLoad,
         @McpToolParam(required = false, description = "If true, suppress writes that happen inside the declaring class's `<init>` / `<clinit>` so the logpoint only records post-construction mutations. Default: false.") @Nullable Boolean excludeConstructors) {
         if (expression == null || expression.isBlank()) {
@@ -3296,6 +3311,7 @@ public class JDWPTools {
             final String chainInfo = triggerBreakpointId != null
                 ? String.format("\n  Chain: trigger=#%d%s",
                     triggerBreakpointId, effectiveOneShot ? " (one-shot)" : " (sticky)") : "";
+            final String oneShotLine = triggerBreakpointId == null && effectiveOneShot ? "\n  One-shot: true" : "";
             final String expressionLine = isLogpoint ? "\n  Expression: " + expression : "";
             final String conditionLine = normalisedCondition != null ? "\n  Condition: " + normalisedCondition : "";
             final String excludeLine = effectiveExcludeConstructors
@@ -3314,6 +3330,8 @@ public class JDWPTools {
                 }
                 if (triggerBreakpointId != null) {
                     breakpointTracker.registerDependency(pendingId, triggerBreakpointId, effectiveOneShot);
+                } else if (effectiveOneShot) {
+                    breakpointTracker.registerStandaloneOneShot(pendingId);
                 }
                 if (!breakpointTracker.hasClassPrepareRequest(className)) {
                     final ClassPrepareRequest cpr = erm.createClassPrepareRequest();
@@ -3335,11 +3353,12 @@ public class JDWPTools {
                         Field breakpoint deferred (ID: %d)
                           Class: %s
                           Field: %s
-                          Mode: %s (%s)%s%s%s%s%s%s
+                          Mode: %s (%s)%s%s%s%s%s%s%s
                         Class not yet loaded — will activate automatically when the JVM loads it.""",
                     pendingId, className, fieldName, watchMode.name().toLowerCase(Locale.ROOT),
                     isLogpoint ? "log-only" : "suspend",
-                    expressionLine, conditionLine, filterLine, chainInfo, excludeLine, objectFilterWarning)
+                    expressionLine, conditionLine, filterLine, chainInfo, oneShotLine,
+                    excludeLine, objectFilterWarning)
                     + deferredClassSuggestion(vm, className)
                     + (isLogpoint ? LOGPOINT_READBACK_HINT : "");
             }
@@ -3401,6 +3420,14 @@ public class JDWPTools {
             if (triggerBreakpointId != null) {
                 breakpointTracker.registerDependency(id, triggerBreakpointId, effectiveOneShot);
                 // Stays disabled — the chain will arm it when the trigger fires.
+            } else if (effectiveOneShot) {
+                breakpointTracker.registerStandaloneOneShot(id);
+                if (accessReq != null) {
+                    accessReq.setEnabled(true);
+                }
+                if (modReq != null) {
+                    modReq.setEnabled(true);
+                }
             } else {
                 if (accessReq != null) {
                     accessReq.setEnabled(true);
@@ -3414,10 +3441,10 @@ public class JDWPTools {
                     Field breakpoint set (ID: %d)
                       Class: %s
                       Field: %s
-                      Mode: %s (%s)%s%s%s%s%s""",
+                      Mode: %s (%s)%s%s%s%s%s%s""",
                 id, className, fieldName, watchMode.name().toLowerCase(Locale.ROOT),
                 isLogpoint ? "log-only" : "suspend",
-                expressionLine, conditionLine, filterLine, chainInfo, excludeLine)
+                expressionLine, conditionLine, filterLine, chainInfo, oneShotLine, excludeLine)
                 + (isLogpoint ? LOGPOINT_READBACK_HINT : "");
         } catch (Exception e) {
             return "Error: " + e.getMessage();
@@ -3787,6 +3814,10 @@ public class JDWPTools {
             armed ? "ARMED" : "WAITING");
     }
 
+    private String oneShotSuffix(int id) {
+        return breakpointTracker.isStandaloneOneShot(id) ? "  oneShot=true" : "";
+    }
+
     /**
      * Renders the line-breakpoint section. When {@code logpoints} is true, only entries with a
      * logpoint expression are included; otherwise plain breakpoints (no logpoint expression) are
@@ -3809,6 +3840,7 @@ public class JDWPTools {
                         id, className, loc.lineNumber(),
                         expr != null ? "  expr=\"" + expr + "\"" : "",
                         cond != null ? "  cond=\"" + cond + "\"" : "",
+                        oneShotSuffix(id) +
                         chainSuffix(id, bp.isEnabled())));
                 }
             }
@@ -3822,6 +3854,7 @@ public class JDWPTools {
                     rows.add(String.format("  #%d  %s:%d  [%s]%s",
                         id, pb.getClassName(), pb.getLineNumber(),
                         pb.getFailureReason() != null ? "FAILED: " + pb.getFailureReason() : "PENDING",
+                        oneShotSuffix(id) +
                         chainSuffix(id, null)));
                 }
             }
@@ -3858,6 +3891,7 @@ public class JDWPTools {
                     info.isLogOnly() ? "log-only" : "suspend",
                     expr != null ? "  expr=\"" + expr + "\"" : "",
                     cond != null ? "  cond=\"" + cond + "\"" : "",
+                    oneShotSuffix(id) +
                     chainSuffix(id, info.getRequest().isEnabled())));
             }
         }
@@ -3866,7 +3900,7 @@ public class JDWPTools {
             final BreakpointTracker.PendingExceptionBreakpoint pb = e.getValue();
             if (matchesFilter(needle, pb.getExceptionClass(), null)) {
                 rows.add(String.format("  #%d  %s  [PENDING]%s",
-                    id, pb.getExceptionClass(), chainSuffix(id, null)));
+                    id, pb.getExceptionClass(), oneShotSuffix(id) + chainSuffix(id, null)));
             }
         }
         if (rows.isEmpty() && !showEmpty) {
@@ -3899,6 +3933,7 @@ public class JDWPTools {
                     spec.logOnly() ? "  [log-only]" : "",
                     spec.expression() != null ? "  expr=\"" + spec.expression() + "\"" : "",
                     cond != null ? "  cond=\"" + cond + "\"" : "",
+                    oneShotSuffix(id) +
                     chainSuffix(id, req != null && req.isEnabled())));
             }
         }
@@ -3915,7 +3950,7 @@ public class JDWPTools {
                 final String state = pf.getFailureReason() != null
                     ? "FAILED: " + pf.getFailureReason() : "PENDING";
                 rows.add(String.format("  #%d  %s  mode=%s  [%s]%s",
-                    id, label, spec.mode(), state, chainSuffix(id, null)));
+                    id, label, spec.mode(), state, oneShotSuffix(id) + chainSuffix(id, null)));
             }
         }
         if (rows.isEmpty() && !showEmpty) {

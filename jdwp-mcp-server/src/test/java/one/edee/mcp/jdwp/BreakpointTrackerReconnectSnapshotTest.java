@@ -108,6 +108,20 @@ class BreakpointTrackerReconnectSnapshotTest {
 		assertThat(tracker.hasTriggerFired(triggerId)).isTrue();
 	}
 
+	@Test
+	@DisplayName("standalone one-shot markers survive reconnect")
+	void shouldPreserveStandaloneOneShotMarkers() {
+		final int id = tracker.registerPendingBreakpoint("com.example.OneShot", 30,
+			EventRequest.SUSPEND_EVENT_THREAD, "thread");
+		tracker.registerStandaloneOneShot(id);
+
+		final BreakpointTracker.ReconnectSnapshot snapshot = tracker.snapshotForReconnect();
+		tracker.restoreFromSnapshotAsPending(snapshot);
+
+		assertThat(tracker.getPendingBreakpoint(id)).isNotNull();
+		assertThat(tracker.isStandaloneOneShot(id)).isTrue();
+	}
+
 	private int registerActiveLineBp(String className, int lineNumber) {
 		final BreakpointRequest req = mock(BreakpointRequest.class);
 		final Location loc = mock(Location.class);

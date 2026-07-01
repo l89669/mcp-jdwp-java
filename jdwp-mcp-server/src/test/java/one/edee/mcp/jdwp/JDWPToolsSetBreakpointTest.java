@@ -156,6 +156,36 @@ class JDWPToolsSetBreakpointTest {
 		}
 
 		@Test
+		@DisplayName("oneShot=true without trigger registers standalone one-shot")
+		void shouldRegisterStandaloneOneShotWhenNoTriggerIsProvided() throws Exception {
+			final BreakpointRequest req = wireEagerSet("com.example.Foo", 10);
+
+			final String result = tools.jdwp_set_breakpoint("com.example.Foo", 10, "all", null, null, true, null);
+
+			final Integer id = tracker.findIdByRequest(req);
+			assertThat(id).isNotNull();
+			assertThat(result).contains("one-shot");
+			assertThat(tracker.isStandaloneOneShot(id)).isTrue();
+			verify(req).setEnabled(true);
+		}
+
+		@Test
+		@DisplayName("oneShot=true with trigger registers chain one-shot, not standalone one-shot")
+		void shouldRegisterChainOneShotWhenTriggerIsProvided() throws Exception {
+			final int triggerId = tracker.registerBreakpoint(mock(BreakpointRequest.class));
+			final BreakpointRequest req = wireEagerSet("com.example.Foo", 10);
+
+			final String result = tools.jdwp_set_breakpoint("com.example.Foo", 10, "all", null, triggerId, true, null);
+
+			final Integer id = tracker.findIdByRequest(req);
+			assertThat(id).isNotNull();
+			assertThat(result).contains("chain: trigger=#" + triggerId + " (one-shot)");
+			assertThat(tracker.isStandaloneOneShot(id)).isFalse();
+			assertThat(tracker.getDependencyOfDependent(id).oneShot()).isTrue();
+			verify(req, org.mockito.Mockito.never()).setEnabled(true);
+		}
+
+		@Test
 		@DisplayName("deferred path — registers a ClassPrepareRequest when class not yet loaded")
 		void shouldDeferWhenClassNotLoaded() throws Exception {
 			final ClassPrepareRequest cpr = mock(ClassPrepareRequest.class);
@@ -168,6 +198,21 @@ class JDWPToolsSetBreakpointTest {
 			assertThat(result).startsWith("Breakpoint deferred for com.example.Foo:10");
 			verify(cpr).addClassFilter("com.example.Foo");
 			verify(cpr).enable();
+		}
+
+		@Test
+		@DisplayName("deferred oneShot=true without trigger preserves standalone one-shot marker")
+		void shouldRegisterStandaloneOneShotForDeferredBreakpoint() throws Exception {
+			final ClassPrepareRequest cpr = mock(ClassPrepareRequest.class);
+			when(jdiService.findLoadedClass("com.example.Foo")).thenReturn(null);
+			when(vm.classesByName("com.example.Foo")).thenReturn(List.of());
+			when(erm.createClassPrepareRequest()).thenReturn(cpr);
+
+			final String result = tools.jdwp_set_breakpoint("com.example.Foo", 10, "thread", null, null, true, null);
+
+			final Integer id = tracker.getAllPendingBreakpoints().keySet().iterator().next();
+			assertThat(result).contains("one-shot");
+			assertThat(tracker.isStandaloneOneShot(id)).isTrue();
 		}
 
 		/**

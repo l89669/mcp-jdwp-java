@@ -197,6 +197,12 @@ public class BreakpointTracker {
      * wipe resets the chain memory; per-BP cleanup is handled inline (see {@link #removeBreakpoint}).
      */
     private final Set<Integer> triggersFiredAtLeastOnce = ConcurrentHashMap.newKeySet();
+    /**
+     * Logical breakpoint IDs created with {@code oneShot=true} and no trigger dependency. Unlike
+     * chain one-shot BPs (which re-disarm and wait for their trigger again), these are consumed
+     * after the first meaningful hit and removed from the tracker.
+     */
+    private final Set<Integer> standaloneOneShotBreakpointIds = ConcurrentHashMap.newKeySet();
 
     // ── Active breakpoint operations ──
 
@@ -249,6 +255,7 @@ public class BreakpointTracker {
                 // VM may already be disconnected
             }
             breakpointMetadata.remove(id);
+            standaloneOneShotBreakpointIds.remove(id);
             clearDependency(id);
             triggersFiredAtLeastOnce.remove(id);
             return true;
@@ -259,6 +266,7 @@ public class BreakpointTracker {
         if (pending != null) {
             cleanupClassPrepareRequestIfNeeded(pending.getClassName());
             breakpointMetadata.remove(id);
+            standaloneOneShotBreakpointIds.remove(id);
             clearDependency(id);
             triggersFiredAtLeastOnce.remove(id);
             return true;
@@ -282,6 +290,7 @@ public class BreakpointTracker {
         if (id != null) {
             breakpointsById.remove(id);
             breakpointMetadata.remove(id);
+            standaloneOneShotBreakpointIds.remove(id);
             clearDependency(id);
         }
     }
@@ -373,6 +382,7 @@ public class BreakpointTracker {
         dependencyByDependent.clear();
         dependentsByTrigger.clear();
         triggersFiredAtLeastOnce.clear();
+        standaloneOneShotBreakpointIds.clear();
         lastBreakpoint = null;
         // Drop any unconsumed "pending fire" signal — a state wipe invalidates the snapshot it
         // was about to be processed against.
@@ -447,7 +457,8 @@ public class BreakpointTracker {
             List.copyOf(fieldEntries),
             Map.copyOf(metadataSnapshot),
             Map.copyOf(dependencyByDependent),
-            Set.copyOf(triggersFiredAtLeastOnce)
+            Set.copyOf(triggersFiredAtLeastOnce),
+            Set.copyOf(standaloneOneShotBreakpointIds)
         );
     }
 
@@ -501,6 +512,7 @@ public class BreakpointTracker {
         }
 
         triggersFiredAtLeastOnce.addAll(snapshot.triggersFiredAtLeastOnce());
+        standaloneOneShotBreakpointIds.addAll(snapshot.standaloneOneShotBreakpointIds());
 
         idCounter.set(maxId + 1);
     }
@@ -559,6 +571,7 @@ public class BreakpointTracker {
         if (removed != null) {
             cleanupClassPrepareRequestIfNeeded(removed.getClassName());
             breakpointMetadata.remove(id);
+            standaloneOneShotBreakpointIds.remove(id);
             clearDependency(id);
             return true;
         }
@@ -775,6 +788,8 @@ public class BreakpointTracker {
             } catch (Exception e) {
                 // VM may already be disconnected
             }
+            breakpointMetadata.remove(id);
+            standaloneOneShotBreakpointIds.remove(id);
             clearDependency(id);
             triggersFiredAtLeastOnce.remove(id);
             return true;
@@ -782,6 +797,8 @@ public class BreakpointTracker {
         final PendingExceptionBreakpoint pending = pendingExceptionBreakpointsById.remove(id);
         if (pending != null) {
             cleanupClassPrepareRequestIfNeeded(pending.getExceptionClass());
+            breakpointMetadata.remove(id);
+            standaloneOneShotBreakpointIds.remove(id);
             clearDependency(id);
             triggersFiredAtLeastOnce.remove(id);
             return true;
@@ -993,6 +1010,8 @@ public class BreakpointTracker {
             if (info.getModificationRequest() != null) {
                 tearDownFieldRequestQuietly(info.getModificationRequest());
             }
+            breakpointMetadata.remove(id);
+            standaloneOneShotBreakpointIds.remove(id);
             clearDependency(id);
             triggersFiredAtLeastOnce.remove(id);
             return true;
@@ -1000,6 +1019,8 @@ public class BreakpointTracker {
         final PendingFieldBreakpoint pending = pendingFieldBreakpointsById.remove(id);
         if (pending != null) {
             cleanupClassPrepareRequestIfNeeded(pending.getSpec().className());
+            breakpointMetadata.remove(id);
+            standaloneOneShotBreakpointIds.remove(id);
             clearDependency(id);
             triggersFiredAtLeastOnce.remove(id);
             return true;
@@ -1413,6 +1434,7 @@ public class BreakpointTracker {
         if (cyclePath != null) {
             throw ChainRegistrationException.cycle(cyclePath);
         }
+        standaloneOneShotBreakpointIds.remove(dependentId);
         final TriggerLink previous = dependencyByDependent.put(dependentId, new TriggerLink(triggerId, oneShot));
         if (previous != null && previous.triggerId() != triggerId) {
             removeReverseIndexEntry(previous.triggerId(), dependentId);
@@ -1673,6 +1695,36 @@ public class BreakpointTracker {
      */
     public boolean hasTriggerFired(int triggerId) {
         return triggersFiredAtLeastOnce.contains(triggerId);
+    }
+
+    /**
+     * Marks a logical breakpoint as a standalone one-shot: after its first meaningful hit the
+     * listener removes it entirely. This is deliberately separate from {@link TriggerLink#oneShot()},
+     * whose meaning is "re-disarm after each dependent hit".
+     */
+    public void registerStandaloneOneShot(int id) {
+        standaloneOneShotBreakpointIds.add(id);
+    }
+
+    /**
+     * Returns true when the id is currently registered for standalone one-shot consumption.
+     */
+    public boolean isStandaloneOneShot(int id) {
+        return standaloneOneShotBreakpointIds.contains(id);
+    }
+
+    /**
+     * Consumes and removes a standalone one-shot breakpoint after a meaningful hit. The method is
+     * kind-agnostic because line, exception, and field breakpoints share one ID space.
+     *
+     * @return {@code true} when a standalone one-shot marker existed and a tracked breakpoint was
+     *         removed; {@code false} when the id was not standalone one-shot or was already gone
+     */
+    public synchronized boolean consumeStandaloneOneShot(int id) {
+        if (!standaloneOneShotBreakpointIds.remove(id)) {
+            return false;
+        }
+        return removeBreakpoint(id) || removeExceptionBreakpoint(id) || removeFieldBreakpoint(id);
     }
 
     // ── Thread tracking ──
@@ -1939,6 +1991,7 @@ public class BreakpointTracker {
      * @param metadata                   per-BP condition / logpoint metadata, keyed by synthetic ID
      * @param dependencies               chain edges — dependent ID → {@link TriggerLink}
      * @param triggersFiredAtLeastOnce   set of trigger IDs that have already fired at least once
+     * @param standaloneOneShotBreakpointIds breakpoint IDs consumed after their first meaningful hit
      */
     public record ReconnectSnapshot(
         List<LineBreakpointEntry> lineBreakpoints,
@@ -1946,7 +1999,8 @@ public class BreakpointTracker {
         List<FieldBreakpointEntry> fieldBreakpoints,
         Map<Integer, MetadataSnapshot> metadata,
         Map<Integer, TriggerLink> dependencies,
-        Set<Integer> triggersFiredAtLeastOnce
+        Set<Integer> triggersFiredAtLeastOnce,
+        Set<Integer> standaloneOneShotBreakpointIds
     ) {}
 
     /**

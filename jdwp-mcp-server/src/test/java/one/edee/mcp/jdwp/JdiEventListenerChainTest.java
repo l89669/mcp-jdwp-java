@@ -432,6 +432,68 @@ class JdiEventListenerChainTest {
 		assertThat(hasEventOfType("CHAIN_ARMED")).isFalse();
 	}
 
+	@Test
+	@DisplayName("Standalone one-shot line BP is removed after first meaningful hit")
+	void standaloneOneShotLineBreakpointRemovesItselfAfterHit() throws Exception {
+		BreakpointRequest bp = mock(BreakpointRequest.class);
+		int bpId = tracker.registerBreakpoint(bp);
+		tracker.registerStandaloneOneShot(bpId);
+
+		ThreadReference thread = mockThread("worker-standalone-oneshot", 1100L);
+		BreakpointEvent event = mockBreakpointEvent(thread, bp, "com.Foo", 70);
+		runListenerWith(listener, mockEventSet(event));
+
+		assertThat(tracker.getBreakpoint(bpId)).isNull();
+		assertThat(tracker.isKnownBreakpointId(bpId)).isFalse();
+		assertThat(hasEventOfType("BREAKPOINT")).isTrue();
+		assertThat(hasEventOfType("ONE_SHOT_CLEARED")).isTrue();
+	}
+
+	@Test
+	@DisplayName("Standalone one-shot line BP is not consumed when condition is false")
+	void standaloneOneShotLineBreakpointSurvivesConditionFalse() throws Exception {
+		BreakpointRequest bp = mock(BreakpointRequest.class);
+		int bpId = tracker.registerBreakpoint(bp);
+		tracker.registerStandaloneOneShot(bpId);
+		tracker.setCondition(bpId, "i > 100");
+
+		ThreadReference thread = mockThread("worker-standalone-oneshot-cond", 1101L);
+		StackFrame frame = mock(StackFrame.class);
+		when(thread.frame(0)).thenReturn(frame);
+		com.sun.jdi.BooleanValue falseVal = mock(com.sun.jdi.BooleanValue.class);
+		when(falseVal.value()).thenReturn(false);
+		when(evaluator.evaluate(any(), anyString(), any())).thenReturn(falseVal);
+
+		BreakpointEvent event = mockBreakpointEvent(thread, bp, "com.Foo", 71);
+		EventSet eventSet = mockEventSet(event);
+		runListenerWith(listener, eventSet);
+
+		verify(eventSet).resume();
+		assertThat(tracker.getBreakpoint(bpId)).isSameAs(bp);
+		assertThat(tracker.isStandaloneOneShot(bpId)).isTrue();
+		assertThat(hasEventOfType("BREAKPOINT")).isFalse();
+		assertThat(hasEventOfType("ONE_SHOT_CLEARED")).isFalse();
+	}
+
+	@Test
+	@DisplayName("Standalone one-shot exception BP is removed after first meaningful hit")
+	void standaloneOneShotExceptionBreakpointRemovesItselfAfterHit() throws Exception {
+		ExceptionRequest exReq = mock(ExceptionRequest.class);
+		int exId = tracker.registerExceptionBreakpoint(exReq,
+			ExceptionBreakpointSpec.suspending("java.lang.RuntimeException", true, true));
+		tracker.registerStandaloneOneShot(exId);
+
+		ThreadReference thread = mockThread("worker-ex-standalone-oneshot", 1102L);
+		ObjectReference exception = mockException("java.lang.RuntimeException");
+		ExceptionEvent event = mockExceptionEvent(exReq, thread, exception, "com.Foo", 72);
+		runListenerWith(listener, mockEventSet(event));
+
+		assertThat(tracker.getAllExceptionBreakpoints()).doesNotContainKey(exId);
+		assertThat(tracker.isKnownBreakpointId(exId)).isFalse();
+		assertThat(hasEventOfType("EXCEPTION")).isTrue();
+		assertThat(hasEventOfType("ONE_SHOT_CLEARED")).isTrue();
+	}
+
 	// ── Helpers ──
 
 	private boolean hasEventOfType(String type) {
